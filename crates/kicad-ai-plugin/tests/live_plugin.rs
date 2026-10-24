@@ -139,6 +139,6 @@ async fn plugin_registers_and_gui_session_connects() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("toolbar button"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("toolbar button"));
     editor.close(true).await.unwrap();
 }

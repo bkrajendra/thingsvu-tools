@@ -34,9 +34,8 @@ New-Item -ItemType Directory -Force (Join-Path $target 'icons') | Out-Null
 Copy-Item $binary (Join-Path $target 'kicad-ai-plugin.exe') -Force
 Copy-Item (Join-Path $repo 'plugin-package\icons\*.png') (Join-Path $target 'icons') -Force
 
-$entrypoint = (Join-Path $target 'kicad-ai-plugin.exe') -replace '\\', '\\'
-$manifest = (Get-Content (Join-Path $repo 'plugin-package\plugin.json.template') -Raw) -replace '@ENTRYPOINT@', $entrypoint
-[System.IO.File]::WriteAllText((Join-Path $target 'plugin.json'), $manifest, (New-Object System.Text.UTF8Encoding $false))
+# KiCad only accepts an entrypoint relative to the plugin folder (absolute paths are skipped).
+Copy-Item (Join-Path $repo 'plugin-package\plugin.json') (Join-Path $target 'plugin.json') -Force
 
 Write-Host "Installed KiCad AI plugin to $target"
 Write-Host 'Restart KiCad, open your project in the Schematic Editor, and press the "KiCad AI: connect" toolbar button.'

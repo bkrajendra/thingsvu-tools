@@ -323,7 +323,7 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 The action process exits immediately, so KiCad's handling of long-running executable actions does not matter.
 
 ### 6.2 Manifest
-`plugin-package/plugin.json.template`, filled in by `scripts/install-plugin.ps1` with the absolute path of the installed binary, plus toolbar icons. It is valid against `api.v1.schema.json` from the pinned build. KiCad 10 does not support the `schematic` scope, so the installer refuses versions below 10.99.
+`plugin-package/plugin.json`, copied with the binary and toolbar icons by `scripts/install-plugin.ps1`. The `entrypoint` must be relative to the plugin folder: KiCad skips actions whose entrypoint is an absolute path (`common/api/api_plugin.cpp`), without any visible message. It is valid against `api.v1.schema.json` from the pinned build. KiCad 10 does not support the `schematic` scope, so the installer refuses versions below 10.99.
 
 ### 6.3 Behavior of `register`
 1. Read `KICAD_API_SOCKET` (strip `ipc://`) and `KICAD_API_TOKEN`; if missing, explain that the plugin runs from a KiCad toolbar button.

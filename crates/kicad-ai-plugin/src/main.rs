@@ -6,7 +6,9 @@
 //! (see `kicad_session::registry`) so `kicad-ai-mcp` can connect to exactly this KiCad. The
 //! process exits right away; nothing keeps running inside or beside KiCad.
 //!
-//! Output goes to stdout, which KiCad shows in its message area.
+//! KiCad reports an action only when it fails (non-zero exit, with stderr as detail); output on
+//! stderr after a success would be shown as an error, so success is silent apart from stdout,
+//! which KiCad ignores (useful when run by hand).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,7 +42,8 @@ fn main() {
         other => Err(format!("unknown command '{other}'\n{USAGE}")),
     };
     if let Err(message) = result {
-        println!("KiCad AI: {message}");
+        // KiCad shows a failing action's stderr as the error detail; stdout is not shown.
+        eprintln!("KiCad AI: {message}");
         std::process::exit(1);
     }
 }
