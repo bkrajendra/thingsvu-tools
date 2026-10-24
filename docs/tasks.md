@@ -136,13 +136,15 @@ Exit criteria (plan §14): all Tier 1 acceptance criteria. The demo works live i
 - [x] **4.4 MCP** — `session_open` takes `provider: "gui"` (schematic path optional); `session_status` lists `gui_editors` (version and projects).
 - [x] **4.5 Packaging** — `plugin-package/plugin.json` (schema-valid for the 10.99 build: `exec` runtime, `schematic` and `pcb` scopes), toolbar icons (light/dark, 24/48 px), `scripts/install-plugin.ps1` (resolves the real Documents folder, e.g. OneDrive; refuses KiCad < 10.99), and `scripts/uninstall-plugin.ps1`. Installed into the nightly's plugin folder on the development machine.
 - [x] **4.6 Automated test of the plugin path** — `kicad-ai-plugin/tests/live_plugin.rs`: a headless KiCad stands in for the editor (it has a socket and a token, as KiCad gives a plugin). Covers the real plugin binary registering and unregistering; the GUI provider opening by path and by default; refusal of an unopened path and of a wrong token; closing without stopping KiCad; and the explanatory message when run outside KiCad.
-- [~] **4.7 Live GUI check** — run on 24 Oct 2026 against the nightly Schematic Editor (`gui_editor_demo`, `THINGSVU_GUI=1`), project `D:projectskicad-demo` (saving approved by the project owner):
+- [x] **4.7 Live GUI check** — run on 24 Oct 2026 against the nightly Schematic Editor (`gui_editor_demo`, `THINGSVU_GUI=1`), project `D:projectskicad-demo` (saving approved by the project owner):
   - The toolbar button registered the editor; `session_status` listed it; `session_open` with `provider: gui` found `kicad-demo.kicad_sch` on its own.
   - The demo applied live and was verified pin for pin; `undo_steps: 2`.
   - **Values persist in the GUI** with the masked update (R1 and R2 are `10k`). This closes the attention item from 3.5.
   - ERC on a snapshot: 0 errors, 2 expected warnings. `sch_render` returned a PNG.
   - **`sch_save` works in the GUI** (`SaveDocument`). The saved file, checked with `kicad-cli`: nets `/INPUT`=R1.1, `/MID`=R1.2+R2.1, `/OUTPUT`=R2.2; values `10k`; one library symbol.
-  - Pending: the project owner checks that two Ctrl+Z steps undo the demo in the editor.
+  - Undo confirmed by the project owner: two Ctrl+Z steps remove the demo (values and connections, then placement).
+
+Phase 4 exit check: met. The demo works live in the Schematic Editor with undo, and through the headless provider.
   - **Finding (fixed, 24 Oct 2026):** the first install did not show the button. KiCad (`common/api/api_plugin.cpp`) **skips any action whose `entrypoint` is an absolute path**, and only logs it in API trace mode. The manifest now uses the plugin-relative `kicad-ai-plugin.exe`, and the template is shipped as `plugin-package/plugin.json`.
   - **Finding — plugin output:** for an async action, KiCad shows only a failing action (non-zero exit, with stderr as detail); stdout is never shown, and stderr after a success is shown as an error. Failures therefore go to stderr with exit code 1. Success shows a small Windows message box ("KiCad AI — Connected …"), chosen by the project owner on 24 Oct 2026. It blocks only the plugin process, and `THINGSVU_NO_DIALOG` turns it off for tests.
   - Where to find it: Schematic Editor top toolbar, after "Switch to PCB Editor" and the variant selector; also **Tools → External Plugins** (which has **Refresh Plugins**).
