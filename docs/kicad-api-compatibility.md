@@ -39,34 +39,40 @@ Probe tool: `scripts/probe-kicad.ps1`. Fixtures produced along the way: `tests/f
 
 | Probe | Nightly headless | Nightly GUI | 10.0.7 GUI |
 |---|---|---|---|
-| `api-server --socket <path>` | ✅ honored: pipe `\\.\pipe\<path>` (verified with `…\run\k.sock`). One earlier attempt with `…\run\api.sock` never became reachable; cause not yet known. With stdout redirected the server prints nothing (no "listening" line), so readiness must be detected by connect-and-`Ping` polling | — | — |
+| `api-server --socket <path>` | ✅ honored: pipe `\\.\pipe\<path>` (verified with `…\run\k.sock`). One earlier attempt with `…\run\api.sock` never became reachable; cause not yet known. With stdout redirected the server prints nothing (no "listening" line), so readiness must be detected by polling | — | — |
 | `api-server` with a hand-written minimal `.kicad_sch` | `Failed to load schematic` — use KiCad-authored fixtures | — | — |
-| Default endpoint (no `--socket`) | `ipc://C:\Users\<user>\AppData\Local\Temp\kicad\api.sock` → named pipe `\\.\pipe\C:\Users\<user>\AppData\Local\Temp\kicad\api.sock` (24 Oct) | _todo_ | _todo_ |
-| Endpoint visible in `\\.\pipe\` listing | Not listed by `Directory.GetFiles('\\.\pipe\')` — the name contains backslashes. Discovery must derive the name from the socket path, not enumerate pipes | _todo_ | _todo_ |
-| NNG handshake (SP header, REQ0 ↔ REP0) | ✅ peer replies `00 53 50 00 00 31 00 00` (REP0) (24 Oct) | _todo_ | _todo_ |
-| NNG ipc framing | ✅ `0x01` + u64 big-endian length + body; REQ body prefixed with 4-byte request id (high bit set), echoed in reply | _todo_ | _todo_ |
-| `GetVersion` | ✅ `AS_OK`; `major=10 minor=99 patch=0`, `full_version="10.99.0-5896-gd033635628"` | _todo_ | _todo_ |
-| `Ping` | ✅ `AS_OK`; reply `google.protobuf.Empty` | _todo_ | _todo_ |
-| Token behavior (empty / pinned / mismatch) | Empty token accepted. Reply header carries instance token (UUID form, stable across calls and connections). Pinned / mismatch: _todo_ | _todo_ | _todo_ |
-| `GetOpenDocuments` (SCHEMATIC / PCB / PROJECT) | Without a loaded file: `AS_UNHANDLED` for all types. With `api-server <file>.kicad_sch`: SCHEMATIC ✅ returns `DocumentSpecifier{type=SCHEMATIC, project{name, path}}` (no sheet path); PCB still `AS_UNHANDLED` (24 Oct) | _todo_ | _todo_ |
-| Instance token | Differs per server instance (`2757…` → `2e39…` after restart): usable to pin a session | _todo_ | _todo_ |
-| `GetSchematicHierarchy` | ✅ root `SheetInstance{path=[root KIID], "/", name, filename, page "1"}`. Root KIID equals the file's top-level `(uuid …)` — file UUIDs and IPC KIIDs are the same identity | _todo_ | _todo (expect `AS_UNHANDLED`)_ |
-| `GetSchematicNetlist` | ✅ empty schematic → no nets. After placing R1: nets `unconnected-(R1-Pad1)`, `unconnected-(R1-Pad2)`, each listing the **pin KIIDs** per sheet (not symbol/pin-number pairs — map via the symbol's pins) | _todo_ | _todo_ |
-| `PlaceSymbolFromLibrary` before library load | `AS_BAD_REQUEST` "symbol 'Device:R' not found" — headless does not preload libraries | — | — |
-| `LoadAllLibraries{LT_SYMBOL}` | ✅ `LibraryCommandStatus{LCS_OK}`, returns immediately (async); 223 symbol libraries in the table. `GetLibraryStatuses` reported `Device` as status 1 (`LLS_INVALID`) yet placement succeeded 1 s later — re-check status decoding/semantics | no-op in GUI per proto docs | — |
-| `PlaceSymbolFromLibrary` (Device:R, 25.4 mm, 25.4 mm, ref R1) | ✅ returns `PlaceFromLibraryResponse` with a full `SchematicSymbolInstance`: new KIID, sheet path, position in nm, library symbol (pins 1/2 at local y = ∓3.81 mm with their own KIIDs), fields (Reference = "R1", Value = "R", Footprint, Datasheet, Description). In-memory only; file on disk unchanged | _todo_ | _todo (expect unsupported)_ |
-| Unknown command type | `AS_UNHANDLED` with message "no handler available for request of type …" | _todo_ | _todo_ |
-| Server robustness | Repeated connect/handshake/close cycles left the server responsive | _todo_ | _todo_ |
-| `UpdateItems` (SchematicSymbolInstance with edited `value_field.text`) | ✅ `ISC_OK` per item; returned instances show Value = "10k". Full-object replace from the placed instance's bytes (no field mask) | _todo_ | _todo_ |
-| `CreateItems` (SchematicLine wire, 3× LocalLabel) | ✅ `ISC_OK` per item; each returned with a new KIID and default stroke/text attributes | _todo_ | _todo (expect unsupported)_ |
-| `BeginCommit` / `EndCommit` | ❌ `BeginCommit` → `AS_UNHANDLED` in headless; edits apply immediately per request. Re-test in GUI (undo grouping) | _todo_ | _todo_ |
-| Connectivity read-back after edits | ✅ `GetSchematicNetlist`: `/INPUT` = {R1.1, label}; `/MID` = {wire, R1.2, label, R2.1}; `/OUTPUT` = {R2.2, label}. Labels placed exactly on pin endpoints connect | _todo_ | _todo_ |
-| `SaveCopyOfDocument` (`include_project=true`) | ✅ writes `.kicad_sch`, `.kicad_pro`, `.kicad_prl` to the target; loaded document unchanged. Target directory must exist ("could not be opened" otherwise) | _todo_ | _todo_ |
-| `SaveDocument`, `RevertDocument` | _todo_ | _todo_ | _todo_ |
-| Saved copy verified by `kicad-cli` 10.99 | ✅ netlist matches fixture intent; ERC 2 warnings (`isolated_pin_label`, expected) | — | — |
+| Default endpoint (no `--socket`) | `ipc://C:\Users\<user>\AppData\Local\Temp\kicad\api.sock` → named pipe `\\.\pipe\C:\Users\<user>\AppData\Local\Temp\kicad\api.sock` | ✅ same default endpoint | ✅ same default endpoint (when it is the only KiCad running) |
+| Two GUI instances at once (nightly started 15:17:13, 10.0.7 at 15:17:29, both with the API server enabled) | — | The first instance (nightly) owns `api.sock`; 10 of 10 connections reached it | **No reachable endpoint** for the second instance: not `api.sock`, not `api-<pid>.sock`. Multi-instance discovery cannot rely on per-instance socket names on Windows |
+| Endpoint visible in `\\.\pipe\` listing | Not listed by `Directory.GetFiles('\\.\pipe\')` — the name contains backslashes. Discovery must derive the name from the socket path, not enumerate pipes | same | same |
+| NNG handshake (SP header, REQ0 ↔ REP0) | ✅ peer replies `00 53 50 00 00 31 00 00` (REP0) | ✅ | ✅ |
+| NNG ipc framing | ✅ `0x01` + u64 big-endian length + body; REQ body prefixed with 4-byte request id (high bit set), echoed in reply | ✅ | ✅ |
+| `GetVersion` | ✅ `major=10 minor=99 patch=0`, `full_version="10.99.0-5896-gd033635628"` | ✅ same | ✅ `major=10 minor=0`, `full_version="10.0.7"`, decoded with the KiCad 11 protos |
+| `Ping` | ✅ reply `google.protobuf.Empty` | ✅ | _not run_ |
+| Token: empty token | Accepted; reply header carries the instance token (UUID form, stable across calls and connections) | Accepted | Accepted; reply header carries the instance token |
+| Token: mismatch | _not tested_ | ✅ wrong pinned token → `AS_TOKEN_MISMATCH` "the provided kicad_token did not match this KiCad instance's token" | _not run_ |
+| Instance token per instance | Differs per server instance (`2757…` → `2e39…` after restart): usable to pin a session | — | — |
+| `GetOpenDocuments` (SCHEMATIC / PCB / PROJECT) | Without a loaded file: `AS_UNHANDLED` for all types. With `api-server <file>.kicad_sch`: SCHEMATIC ✅ `DocumentSpecifier{type=SCHEMATIC, project{name, path}}` (no sheet path); PCB `AS_UNHANDLED` | SCHEMATIC ✅ (schematic editor open) | SCHEMATIC ✅ but identifies the document **only by filename** (field 4, e.g. `kicad-demo10.1.kicad_sch`), with **no project block**; PCB `AS_UNHANDLED` |
+| `GetSchematicHierarchy` | ✅ root `SheetInstance{path=[root KIID], "/", name, filename, page "1"}`. Root KIID equals the file's top-level `(uuid …)` — file UUIDs and IPC KIIDs are the same identity | _not run_ | `AS_UNHANDLED` |
+| `GetSchematicNetlist` | ✅ nets list **pin KIIDs** per sheet (map to REF.PIN via each instance's pins); unconnected pins appear as `unconnected-(R1-Pad1)` | ✅ | `AS_UNHANDLED` |
+| `LoadAllLibraries{LT_SYMBOL}` | ✅ `LCS_OK`, async; 223 symbol libraries. `GetLibraryStatuses` reported `Device` as status 1 (`LLS_INVALID`) yet placement succeeded 1 s later — re-check | ❌ `AS_UNIMPLEMENTED` "LoadAllLibraries is not available in GUI mode" (the proto comment says no-op; send it only in headless sessions) | `AS_UNHANDLED` |
+| `PlaceSymbolFromLibrary` before library load | `AS_BAD_REQUEST` "symbol 'Device:R' not found" | — (GUI preloads; placement immediate) | — |
+| `PlaceSymbolFromLibrary` | ✅ full `SchematicSymbolInstance`: new KIID, sheet path, position (nm), library symbol with per-instance pin KIIDs (pins 1/2 at local y = ∓3.81 mm), fields (Reference as requested, Value = "R") | ✅ | `AS_UNHANDLED` |
+| `UpdateItems` (instance with edited `value_field.text`) | ✅ `ISC_OK`; Value = "10k". Full-object replace, no field mask | ✅ | _not run_ (no schematic item commands) |
+| `CreateItems` (SchematicLine wire, 3× LocalLabel) | ✅ `ISC_OK` per item, new KIIDs, default stroke/text attributes | ✅ | _not run_ (KiCad 10 has no `SchematicLine` type) |
+| `BeginCommit` / `EndCommit` | ❌ `BeginCommit` → `AS_UNHANDLED`; edits apply immediately per request | ✅ commit opened and closed around place + update + create. **Commits are owned by `client_name`**: another client gets `AS_BAD_REQUEST` "the client … does not has a commit in progress". A commit left open by a crashed client did not block a new client's commit. **One commit = one undo step**: a single Ctrl+Z removed the whole demo (user-verified) | `BeginCommit`/`EndCommit(CMA_DROP)` ✅ answered, but no schematic item commands exist to use inside a commit |
+| Connectivity read-back after edits | ✅ `/INPUT` = {R1.1}, `/MID` = {R1.2, R2.1}, `/OUTPUT` = {R2.2}; labels exactly on pin endpoints connect | ✅ same | — |
+| `SaveCopyOfDocument` (`include_project=true`) | ✅ writes `.kicad_sch`, `.kicad_pro`, `.kicad_prl`; loaded document unchanged. Target directory must exist | ✅; open document and file on disk unchanged | `AS_UNHANDLED` |
+| `RunSchematicJobExportNetlist` (KiCad s-expr) | _not run_ | ✅ `JS_SUCCESS`, netlist identical to the read-back | — |
+| `RunSchematicJobExportSvg` | _not run_ | ✅ `JS_SUCCESS`, output dir → `<project>.svg` | — |
+| ERC over IPC | No ERC job exists in `schematic_jobs.proto` (exports only: SVG, DXF, PDF, PS, PNG, netlist, BOM). ERC stays on `kicad-cli` | same | — |
+| `SaveDocument` (in `project_commands.proto` in KiCad 11) | ✅ writes the document to its path; modified state → `DMS_UNMODIFIED` | _not run_ | _not run_ |
+| `RevertDocument` | ✅ discards unsaved edits (R2 gone, R1 kept); state → `DMS_UNMODIFIED` | _not run_ | _not run_ |
+| Saved copy verified by `kicad-cli` 10.99 | ✅ netlist matches intent; ERC 2 warnings (`isolated_pin_label`, expected) | — | — |
 | KiCad 11 file read by 10.0.7 `kicad-cli` | ❌ "Failed to load schematic" (exit 3), as expected from format `20261015` | — | — |
-| Native Rust transport + client (`crates/kicad-ipc`, `examples/probe.rs`) | ✅ full two-resistor demo from a fresh empty fixture: typed protobuf messages, token pinned from first reply, pin KIIDs mapped to `R1.1` etc.; netlist and ERC of the saved copy identical to the PowerShell run | _todo_ | _todo_ |
-| Readiness by bare pipe connect/close (no NNG handshake) | Server stayed healthy and served the probe immediately after | _todo_ | _todo_ |
-| Schematic ERC/export job over IPC | _todo_ | _todo_ | — |
-| v11 generated protos decode v10 replies | — | — | _todo_ |
-| Exec plugin lifetime, schematic scope | — | _todo_ | — |
+| Native Rust transport + client (`crates/kicad-ipc`, `examples/probe.rs`) | ✅ full demo from a fresh empty fixture | ✅ full `gui` scenario | ✅ `basic` |
+| Unknown command type | `AS_UNHANDLED` "no handler available for request of type …" | — | `AS_UNHANDLED`, same message format |
+| Robustness | Repeated connect/handshake/close and bare pipe connect/close left the server responsive | Interrupted client with an open commit did not affect later clients | — |
+| v11 generated protos decode v10 replies | — | — | ✅ envelope, status, `GetVersion`, `GetOpenDocuments`, commit replies |
+| Exec plugin lifetime, schematic scope | — | _deferred to Phase 4_ (the headless path does not depend on it) | — |
+| Headless document lifecycle (server started without a file) | ✅ `CreateDocument` (schematic, in memory; no file until saved) → `GetDocumentModifiedState` `DMS_UNMODIFIED` → edit → `DMS_MODIFIED` → `SaveDocument` → `RevertDocument` → `CloseDocument` (document commands then `AS_UNHANDLED` again) | — | — |
+| Generic editor commands in the schematic editor | — | — | `GetItems`, `GetSelection`, `SaveCopyOfDocument` → `AS_UNHANDLED`. Live KiCad 10 schematic access is limited to version, open-document filename, and commits |

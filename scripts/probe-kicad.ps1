@@ -19,7 +19,7 @@
 param(
     [string]$PipePath = (Join-Path $env:TEMP 'kicad\api.sock'),   # KiCad's default socket path
     [int]$TimeoutMs = 5000,
-    [ValidateSet('basic', 'schematic', 'demo', 'save')][string]$Scenario = 'basic',
+    [ValidateSet('basic', 'schematic', 'demo', 'save', 'generic')][string]$Scenario = 'basic',
     [string]$SaveCopyPath = '',         # demo scenario: SaveCopyOfDocument target (empty = skip)
     [switch]$Place                      # schematic scenario: also place Device:R in memory (no save)
 )
@@ -244,6 +244,24 @@ if ($Scenario -eq 'demo') {
     }
 }
 
+if ($Scenario -eq 'generic') {
+    # Which generic editor commands the schematic editor answers (KiCad 10 fallback capability check).
+    $r = Call 'kiapi.common.commands.GetOpenDocuments' (FieldVarint 1 1) -Quiet
+    $doc = [byte[]](GetFields (AnyValue $r) 1)[0]
+    $hdr = FieldBytes 1 $doc
+    $types = [byte[]]((FieldVarint 2 23) + (FieldVarint 2 30) + (FieldVarint 2 35))   # SCH_LINE, SCH_LABEL, SCH_SYMBOL
+    [void](Call 'kiapi.common.commands.GetItems' ([byte[]]((FieldBytes 1 $hdr) + $types)))
+    [void](Call 'kiapi.common.commands.GetSelection' (FieldBytes 1 $hdr))
+    $c = Call 'kiapi.common.commands.BeginCommit' (FieldBytes 1 $hdr)
+    $ids = GetFields (AnyValue $c) 1
+    if ($ids.Count -gt 0) {   # drop it again from this same client, which owns it
+        [void](Call 'kiapi.common.commands.EndCommit' ([byte[]]((FieldBytes 1 ([byte[]]$ids[0])) + (FieldVarint 2 2) + (FieldBytes 4 $hdr))))
+    }
+    if ($SaveCopyPath) {
+        $opts = [byte[]]((FieldVarint 1 0) + (FieldVarint 2 1))
+        [void](Call 'kiapi.common.commands.SaveCopyOfDocument' ([byte[]]((FieldBytes 1 $doc) + (FieldStr 2 $SaveCopyPath) + (FieldBytes 3 $opts))))
+    }
+}
 if ($Scenario -eq 'save') {
     $r = Call 'kiapi.common.commands.GetOpenDocuments' (FieldVarint 1 1) -Quiet
     $doc = [byte[]](GetFields (AnyValue $r) 1)[0]

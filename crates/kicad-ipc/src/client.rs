@@ -97,6 +97,12 @@ impl Client {
         (!self.token.is_empty()).then_some(self.token.as_str())
     }
 
+    /// Pins a previously observed instance token, e.g. when reconnecting to a known session.
+    /// KiCad rejects later requests with `AS_TOKEN_MISMATCH` if another instance answers.
+    pub fn pin_instance_token(&mut self, token: impl Into<String>) {
+        self.token = token.into();
+    }
+
     /// Sends `request` and decodes the reply as `Resp`.
     pub async fn call<Req: Name, Resp: Name + Default>(&mut self, request: &Req) -> Result<Resp, Error> {
         let name = Req::full_name();

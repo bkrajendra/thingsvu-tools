@@ -156,9 +156,12 @@ Rules:
 - Never attach to a socket the current user does not own.
 - Never open a raw stream connection to an NNG endpoint for discovery. A connection that does not complete the NNG handshake can wedge KiCad's server; Windows named pipes also consume a server instance.
 - The headless child is owned by the MCP process: killed on MCP exit, deadline, or provider shutdown; never orphaned.
-- Headless sessions do not preload libraries. Session start issues `LoadAllLibraries` (symbol type) and the session reports "libraries loading" until the libraries a plan needs are available; placement before that fails with `AS_BAD_REQUEST` ("symbol … not found"). In GUI sessions the command is a no-op.
+- Headless sessions do not preload libraries. Session start issues `LoadAllLibraries` (symbol type) and the session reports "libraries loading" until the libraries a plan needs are available; placement before that fails with `AS_BAD_REQUEST` ("symbol … not found"). GUI sessions must not send it: the GUI preloads libraries and answers `AS_UNIMPLEMENTED`.
+- A headless session does not need a fixture file: start `api-server` without a file, then `CreateDocument` (new schematic in memory), or `OpenDocument` for an existing one. `SaveDocument`, `RevertDocument`, `GetDocumentModifiedState`, and `CloseDocument` / `CloseAllDocuments` manage the document lifecycle; one server can switch documents without a restart.
 - The headless server prints no readiness line when its output is redirected. The provider detects readiness by polling connect + `Ping` within a deadline.
-- Headless sessions do not handle `BeginCommit`/`EndCommit` (observed on the pinned nightly). Each request applies immediately, so a plan applied headless is not atomic: the apply step records every created/updated KIID as it goes; on a mid-plan failure it removes the items it created, reports `result_state: partial` with the applied and not-applied operations, and requires read-back before anything else runs. GUI sessions use a commit when KiCad supports it.
+- Headless sessions do not handle `BeginCommit`/`EndCommit` (observed on the pinned nightly). Each request applies immediately, so a plan applied headless is not atomic: the apply step records every created/updated KIID as it goes; on a mid-plan failure it removes the items it created, reports `result_state: partial` with the applied and not-applied operations, and requires read-back before anything else runs. GUI sessions wrap each apply in one commit, which is one undo step in the editor (verified on the nightly).
+- Commits are owned by the request's `client_name`; no other client can end them. Each session uses one stable `client_name` for its lifetime, and every error path inside an apply ends its open commit with `CMA_DROP` before reporting.
+- On Windows only one GUI instance gets an API endpoint: with two KiCad GUIs running (one 10.99, one 10.0.7), the second had no reachable socket at all. `session_status` must report which instance answered (version + token) and never assume the endpoint belongs to the KiCad the user means; the plugin provider (which receives the socket from KiCad) and the headless provider (own socket) avoid the ambiguity.
 - One provider per target document at a time. A document open in a GUI must not also be mutated through a headless server or the file backend.
 
 ### 3.2 Backends and capability model
@@ -183,13 +186,14 @@ Capabilities are probed at session start (`GetVersion`, then a harmless request 
 
 | Capability | KiCad 11 | KiCad 10 |
 |---|---|---|
-| `session.status`, `session.open_documents` | IPC | IPC (GUI, API server enabled) |
+| `session.status`, `session.open_documents` | IPC | IPC (GUI, API server enabled); the open schematic is identified by filename only, with no project path |
 | `sch.read_symbols`, `sch.read_pins`, `sch.read_labels` | IPC | File (saved state only) |
 | `sch.netlist` | IPC (`GetSchematicNetlist`) | CLI (`sch export netlist`) |
 | `sch.place_symbol`, `sch.add_wire`, `sch.add_label`, `sch.set_field` | IPC | File, only if the document is not open in any editor (later phase) |
 | `sch.save` | IPC | File writer (atomic) |
-| `sch.erc` | IPC job or CLI | CLI |
-| `sch.render` | IPC job or CLI | CLI (SVG/PDF) |
+| `sch.erc` | CLI (KiCad 11 has no ERC job over IPC) | CLI |
+| `sch.render` | IPC job (SVG/PDF/PNG) or CLI | CLI (SVG/PDF) |
+| `sch.export_netlist` | IPC job or CLI | CLI |
 | `sch.diff` | CLI | Unavailable |
 | Live co-editing with undo | Plugin provider | Unavailable |
 
@@ -272,7 +276,7 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 ### 5.2 KiCad IPC adapter (`kicad-ipc`)
 - `prost` / `prost-build` code generated from the vendored protos. Record commit and SHA-256 per file.
 - NNG transport implemented natively in Rust (decision from Phase 0): KiCad needs only the REQ0 side of NNG's ipc transport, which is small and was verified on the wire — an 8-byte SP header exchange (`00 'S' 'P' 00 00 30 00 00` ↔ `… 00 31 …`), then frames of `0x01` + u64 big-endian length + body, where the body starts with a 4-byte request ID (high bit set) that the reply echoes. Windows: `tokio` named pipe `\\.\pipe\<socket path>`; Unix: Unix domain socket at the socket path. One outstanding request per connection. This removes the C NNG library and CMake from the build. Keep it behind a `Transport` trait so a binding to the C library can be swapped in if a KiCad version needs NNG features beyond this subset.
-- Typed envelope with `client_name` (`thingsvu-kicad-ai-<pid>`) and pinned `kicad_token` after the first reply.
+- Typed envelope with a stable per-session `client_name` (`thingsvu-kicad-ai-<session id>`; commits are owned by it) and the `kicad_token` pinned from the first reply (a wrong token is refused with `AS_TOKEN_MISMATCH`).
 - Map every `ApiStatusCode` to a typed error: `AS_BUSY`/`AS_NOT_READY` → retryable; `AS_UNHANDLED`/`AS_UNIMPLEMENTED` → `FEATURE_UNAVAILABLE`; `AS_TOKEN_MISMATCH` → `KICAD_INSTANCE_CHANGED`; `AS_BAD_REQUEST` → non-retryable.
 - One serialized request channel per session with a bounded queue; a deadline on every request; no blind retries of mutations.
 - Unit conversion (mm ↔ KiCad internal units) lives only here; the pinned proto definitions are the authority on units.
@@ -655,7 +659,14 @@ Probe matrix:
 
 Exit criteria: every row recorded as supported / unsupported / failing, with captured request/response logs; proto commit and checksums recorded; license confirmed as GPL-3.0-or-later. **Do not proceed** to Phase 2 until the headless column passes.
 
-**Status (24 Oct 2026): nightly headless column complete.** The two-resistor demo runs end to end on the headless server, both from `scripts/probe-kicad.ps1` and from the Rust client (`crates/kicad-ipc`, `examples/probe.rs`) with the native NNG transport: place, set values, wire, labels, netlist read-back, save copy; the saved copy's `kicad-cli` netlist matches the intent. Design changes recorded: native transport (§5.2), library loading, readiness polling and non-atomic headless applies (§3.1). Remaining Phase 0 work: the nightly GUI column (including commits/undo and the schematic-scope plugin), the 10.0.7 GUI column, token mismatch, `SaveDocument`/`RevertDocument`, and IPC ERC/export jobs. Details in `docs/kicad-api-compatibility.md`.
+**Status (24 Oct 2026): Phase 0 complete**, except the executable-plugin lifetime check, which moves to Phase 4 (the headless path does not depend on it).
+
+- **Nightly headless:** two-resistor demo end to end (PowerShell probe and Rust client with the native NNG transport); full document lifecycle (`CreateDocument`, modified state, `SaveDocument`, `RevertDocument`, `CloseDocument`); the saved copy's `kicad-cli` netlist matches the intent.
+- **Nightly GUI:** same demo inside one commit, which a single undo removes; token mismatch refused; IPC netlist and SVG export jobs succeed. No ERC job exists over IPC.
+- **KiCad 10.0.7 GUI:** KiCad 11 protos decode its replies; all schematic commands and generic item/selection/save commands are unhandled; open documents are reported by filename only. Confirms the file + CLI fallback design.
+- **Design changes recorded:** native transport (§5.2); library loading, document lifecycle, readiness polling, non-atomic headless applies, commit ownership, and single GUI endpoint on Windows (§3.1); ERC via CLI on both versions (§3.3).
+
+Details in `docs/kicad-api-compatibility.md`.
 
 ### Phase 1 — Foundations
 `kicad-domain` (IR, plans, result states, capabilities), `kicad-ipc` (envelope, status mapping, serialized client), `kicad-ipc-mock`, `kicad-cli-runner` (install discovery, ERC JSON, netlist). Headless provider lifecycle. MCP skeleton with `session_status` and `session_open`.
