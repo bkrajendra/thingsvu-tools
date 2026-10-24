@@ -1,0 +1,31 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.thingsvu.kicad-ai",
+  "name": "KiCad AI",
+  "description": "Makes this KiCad editor available to the thingsvu-tools KiCad AI tools (MCP).",
+  "runtime": {
+    "type": "exec"
+  },
+  "actions": [
+    {
+      "identifier": "register",
+      "name": "KiCad AI: connect",
+      "description": "Let the KiCad AI tools work with this editor.",
+      "show-button": true,
+      "scopes": ["schematic", "pcb"],
+      "entrypoint": "@ENTRYPOINT@",
+      "args": ["register"],
+      "icons-light": ["icons/kicad-ai-light-24.png", "icons/kicad-ai-light-48.png"],
+      "icons-dark": ["icons/kicad-ai-dark-24.png", "icons/kicad-ai-dark-48.png"]
+    },
+    {
+      "identifier": "unregister",
+      "name": "KiCad AI: disconnect",
+      "description": "Stop the KiCad AI tools from using this editor.",
+      "show-button": false,
+      "scopes": ["schematic", "pcb"],
+      "entrypoint": "@ENTRYPOINT@",
+      "args": ["unregister"]
+    }
+  ]
+}

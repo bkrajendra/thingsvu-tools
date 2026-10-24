@@ -1,0 +1,22 @@
+[package]
+name = "kicad-ai-plugin"
+description = "KiCad 11 executable plugin: registers the running editor for the KiCad AI MCP tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kicad-ai-plugin"
+path = "src/main.rs"
+
+[dependencies]
+kicad-ipc = { path = "../kicad-ipc" }
+kicad-session = { path = "../kicad-session" }
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+kicad-cli-runner = { path = "../kicad-cli-runner" }
+kicad-domain = { path = "../kicad-domain" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

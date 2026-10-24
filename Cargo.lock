@@ -373,6 +373,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kicad-ai-plugin"
+version = "0.0.1"
+dependencies = [
+ "kicad-cli-runner",
+ "kicad-domain",
+ "kicad-ipc",
+ "kicad-session",
+ "tokio",
+]
+
+[[package]]
 name = "kicad-cli-runner"
 version = "0.0.1"
 dependencies = [

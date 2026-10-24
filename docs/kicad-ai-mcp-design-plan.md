@@ -26,7 +26,7 @@
 Build the first version as separate layers with clear process boundaries:
 
 1. **`kicad-ai-mcp`**: a Rust MCP server launched by an MCP host over stdio. It exposes validated, intent-oriented tools, selects a backend by capability probing, and owns the headless `kicad-cli api-server` child process when that provider is used.
-2. **`kicad-ai-plugin` / bridge**: a Rust executable IPC plugin launched from KiCad 11's Schematic Editor (and PCB Editor). It receives the KiCad-provided socket and token, owns that GUI connection, and exposes a small local-only control endpoint to the MCP process. **KiCad 11 only** — KiCad 10 has no schematic plugin scope.
+2. **`kicad-ai-plugin`**: a Rust executable IPC plugin run from a KiCad 11 Schematic (or PCB) Editor toolbar button. It receives the KiCad-provided socket and instance token, confirms the instance answers, records it in a user-private registry, and exits. The MCP server then connects to exactly that instance with the token pinned (revision 3: registrar instead of a relaying bridge; see `docs/tasks.md` 4.1). **KiCad 11 only**: KiCad 10 has no schematic plugin scope.
 3. **`kicad-domain`**: a shared library containing the circuit intermediate representation, tool argument types, validation, layout rules, operation planning, and the capability model. It is a library, not a process, and has no KiCad transport types.
 
 Supporting library crates: `kicad-ipc` (protobuf + NNG adapter), `kicad-sexpr` (lossless `.kicad_sch` engine for the KiCad 10 fallback and offline reads), `kicad-cli-runner` (ERC/export/diff jobs).
@@ -149,7 +149,7 @@ flowchart TB
 | Provider | KiCad | How the instance is chosen | Use |
 |---|---|---|---|
 | `HeadlessSessionProvider` | 11 | MCP spawns `kicad-cli api-server --socket <private path> <project>` with a fixed argument array; the socket path is in a private runtime directory | **First IPC path.** Deterministic automation, CI, and generation of designs not open in a GUI |
-| `PluginSessionProvider` | 11 | The user clicks the Schematic/PCB Editor action; KiCad launches the bridge with `KICAD_API_SOCKET` and `KICAD_API_TOKEN` | Live co-editing with the user; changes appear in the editor with undo |
+| `PluginSessionProvider` (`provider: gui`) | 11 | The user presses the "KiCad AI: connect" toolbar button; the plugin registers the instance (socket + token) and the MCP server connects to it with the token pinned | Live co-editing with the user; changes appear in the editor with undo |
 | `DirectSocketProvider` | 10 and 11 | Explicit configuration only. Attach to a configured or discovered socket, pin the instance token from the first reply, and require the target document in `GetOpenDocuments` | KiCad 10 GUI liveness/open-document checks and PCB work; KiCad 11 GUI without the plugin |
 
 Rules:
@@ -306,40 +306,35 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 - Stable error codes: `NO_SESSION`, `BRIDGE_DISCONNECTED`, `KICAD_BUSY`, `KICAD_INSTANCE_CHANGED`, `FEATURE_UNAVAILABLE`, `DOCUMENT_NOT_OPEN`, `DOCUMENT_OPEN_ELSEWHERE`, `FILE_CHANGED_ON_DISK`, `STALE_PLAN`, `SYMBOL_NOT_FOUND`, `INVALID_GRID_COORDINATE`, `INVALID_ARGUMENT`, `AMBIGUOUS_TIMEOUT`, `ERC_UNAVAILABLE`, `READ_ONLY_MODE`.
 - Group tools by prefix (`session_`, `sch_`, later `pcb_`, `lib_`, `mech_`) so tool groups can be enabled on demand later via `notifications/tools/list_changed`. Do not hide tools behind a generic `execute_tool` proxy.
 
-### 5.6 Local bridge transport (`kicad-ai-bridge/v1`)
-- **Windows named pipe first** (`\\.\pipe\thingsvu-kicad-ai-<user-sid-hash>-<session>`), created with a security descriptor restricting access to the current user. Unix domain socket in a `0700` runtime directory with a `0600` socket on Linux/macOS.
-- No TCP listener.
-- Newline-delimited JSON; every message has `protocol_version`, `request_id`, `operation`, `payload`; every reply has `request_id`, `ok`, and `result` or a typed `error`.
-- Frame size limits; reject malformed JSON and unknown protocol versions.
-- The bridge advertises its session (KiCad version, capability set, open documents, non-secret instance fingerprint) through a discovery file in the private runtime directory; the MCP server reads it rather than scanning pipes.
-- Never include `KICAD_API_TOKEN` in replies or logs.
+### 5.6 GUI instance registry (replaces the bridge protocol)
+- The plugin writes one JSON record per KiCad endpoint to a user-private folder (`%LOCALAPPDATA%\thingsvu\kicad-ai\instances` on Windows; `$XDG_STATE_HOME` or `~/.local/state` elsewhere): socket path, instance token, KiCad version, open projects, timestamp, plugin version.
+- The MCP server lists records, checks each by connecting with the token pinned (`GetVersion`), and removes records whose instance no longer answers.
+- The token is never included in tool results or logs; `session_status` shows only version and projects.
+- No local listener of our own: the only endpoints are KiCad's.
 
 ---
 
 ## 6. Executable plugin specification (KiCad 11)
 
 ### 6.1 Actions
-- **Start / reconnect AI bridge** (`start-ai-bridge`), scopes `schematic` and `pcb`.
-- **Stop AI bridge** (`stop-ai-bridge`) after lifecycle behavior is validated; sends a local shutdown request rather than killing processes by name.
+- **KiCad AI: connect** (`register`), toolbar button, scopes `schematic` and `pcb`.
+- **KiCad AI: disconnect** (`unregister`), no toolbar button by default.
 
-Whether KiCad keeps a long-running executable action alive must be tested on the pinned nightly. If not, the action is a launcher that starts a managed bridge process and returns. The bridge exits when its KiCad connection closes.
+The action process exits immediately, so KiCad's handling of long-running executable actions does not matter.
 
 ### 6.2 Manifest
-See `plugin.json.example`. KiCad 10 does not support the `schematic` scope; the plugin package targets KiCad 11 only and is installed into the version-specific plugin directory (`<KiCad documents>\10.99\plugins` for the nightly — on this machine under OneDrive). Validate the manifest against the schema shipped with the pinned build.
+`plugin-package/plugin.json.template`, filled in by `scripts/install-plugin.ps1` with the absolute path of the installed binary, plus toolbar icons. It is valid against `api.v1.schema.json` from the pinned build. KiCad 10 does not support the `schematic` scope, so the installer refuses versions below 10.99.
 
-### 6.3 Startup behavior
-1. Read `KICAD_API_SOCKET` and `KICAD_API_TOKEN`; fail fast if missing.
-2. Connect, `GetVersion`, probe capabilities.
-3. Record a non-secret fingerprint, KiCad version, and PID.
-4. Create the private local endpoint and discovery file.
-5. Serve requests serially.
-6. On connection loss or `AS_TOKEN_MISMATCH`, transition to `DISCONNECTED`; require reconnect.
-7. On stop request or KiCad exit, shut down and remove only its own endpoint and discovery file.
+### 6.3 Behavior of `register`
+1. Read `KICAD_API_SOCKET` (strip `ipc://`) and `KICAD_API_TOKEN`; if missing, explain that the plugin runs from a KiCad toolbar button.
+2. Connect, pin the token, `GetVersion`, and `GetOpenDocuments` for schematics and boards.
+3. Write the registry record atomically.
+4. Print one line (KiCad shows it in its message area) and exit.
 
 ### 6.4 User experience
-- Report startup failures through stdout/stderr (KiCad 10.0.1+ shows executable-plugin console output in its warning-message system; confirm on 11) and the bridge log.
+- Report results and failures as one stdout line (KiCad 10.0.1+ shows executable-plugin console output in its message area; confirm on 11).
 - Never show modal UI on the request path.
-- Batch related mutations into one commit so a tool call is one undo step.
+- Group mutations into commits: an apply is two undo steps (placement, then values and connections; see §3.1).
 - Never write outside the project directory unless the user supplied the destination.
 
 ---

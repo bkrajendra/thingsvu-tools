@@ -95,6 +95,10 @@ impl HeadlessServer {
         .retryable())
     }
 
+    pub fn socket(&self) -> &std::path::Path {
+        &self.socket
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }

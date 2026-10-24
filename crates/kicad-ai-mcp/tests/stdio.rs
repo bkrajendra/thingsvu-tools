@@ -425,3 +425,84 @@ async fn read_only_mode_refuses_changes() {
         assert_eq!(r["error"]["code"], "READ_ONLY_MODE", "{tool}: {r}");
     }
 }
+
+/// Against a real KiCad 11 editor: open a disposable, empty project in the nightly Schematic
+/// Editor, press "KiCad AI: connect", then run with THINGSVU_GUI=1.
+#[tokio::test]
+async fn gui_editor_demo() {
+    if std::env::var("THINGSVU_GUI").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI=1 with a registered KiCad editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let status = mcp.call("session_status", json!({})).await;
+    println!("GUI EDITORS {}", status["result"]["gui_editors"]);
+    assert!(
+        !status["result"]["gui_editors"].as_array().unwrap().is_empty(),
+        "press the KiCad AI button first"
+    );
+
+    let opened = mcp.call("session_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    println!(
+        "GUI SESSION {} document {}",
+        opened["result"]["kicad_version"], opened["result"]["document"]
+    );
+    println!("GUI CAPABILITIES {}", opened["result"]["capabilities"]);
+    assert_eq!(opened["provenance"][0]["provider"], "gui");
+
+    let before = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert_eq!(before["result"]["count"], 0, "use an empty project: {before}");
+
+    let applied = mcp
+        .call("sch_create_demo_circuit", json!({ "session_id": id, "apply": true, "confirm": true, "idempotency_key": format!("gui-{}", std::process::id()) }))
+        .await;
+    println!("GUI APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(applied["result"]["undo_steps"], 2);
+
+    // Values must persist in the editor (the full-object update did not in Phase 0).
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    let values: Vec<_> = symbols["result"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["reference"].as_str().unwrap().to_owned(),
+                s["value"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        [("R1".to_owned(), "10k".to_owned()), ("R2".to_owned(), "10k".to_owned())]
+    );
+
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!(
+        "GUI ERC ok={} errors={} warnings={}",
+        erc["ok"], erc["result"]["errors"], erc["result"]["warnings"]
+    );
+    let render = mcp
+        .request(
+            "tools/call",
+            json!({ "name": "sch_render", "arguments": { "session_id": id } }),
+        )
+        .await;
+    let has_image = render["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["type"] == "image");
+    println!("GUI RENDER image={has_image}");
+
+    // Saving in the GUI: recorded, not asserted (SaveDocument support in the editor is unverified).
+    let saved = mcp.call("sch_save", json!({ "session_id": id })).await;
+    println!("GUI SAVE {saved}");
+
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: check the editor (two Ctrl+Z steps should remove the demo)");
+}

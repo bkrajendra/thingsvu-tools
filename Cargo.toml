@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kicad-ai-mcp", "crates/kicad-cli-runner", "crates/kicad-domain", "crates/kicad-ipc", "crates/kicad-ipc-mock", "crates/kicad-session"]
+members = ["crates/kicad-ai-mcp", "crates/kicad-ai-plugin", "crates/kicad-cli-runner", "crates/kicad-domain", "crates/kicad-ipc", "crates/kicad-ipc-mock", "crates/kicad-session"]
 
 [workspace.package]
 version = "0.0.1"

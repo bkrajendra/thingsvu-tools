@@ -9,7 +9,7 @@ use kicad_domain::{Capability, CapabilitySet, ErrorCode, ToolError};
 use kicad_ipc::capabilities;
 use kicad_ipc::proto::kiapi::common::commands::{
     CreateDocument, DocumentModifiedState, GetDocumentModifiedState, GetDocumentModifiedStateResponse,
-    LoadAllLibraries, OpenDocument, OpenDocumentResponse, Ping,
+    GetOpenDocuments, GetOpenDocumentsResponse, LoadAllLibraries, OpenDocument, OpenDocumentResponse, Ping,
 };
 use kicad_ipc::proto::kiapi::common::types::{DocumentSpecifier, DocumentType, LibraryType};
 use kicad_ipc::Client;
@@ -23,7 +23,10 @@ use crate::headless::HeadlessServer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    /// A `kicad-cli api-server` started and owned by this process.
     Headless,
+    /// A KiCad GUI that registered itself through the `kicad-ai-plugin` toolbar action.
+    Gui,
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +86,8 @@ pub struct Session {
 /// Everything that talks to KiCad sits behind one lock, so requests are strictly serialized.
 pub(crate) struct Inner {
     pub(crate) client: Client,
-    server: HeadlessServer,
+    /// The owned headless server; `None` for a GUI session.
+    server: Option<HeadlessServer>,
 }
 
 fn new_session_id() -> String {
@@ -252,8 +256,119 @@ impl Session {
             document,
             capabilities,
             cli: Some(cli),
-            inner: Mutex::new(Inner { client, server }),
+            inner: Mutex::new(Inner {
+                client,
+                server: Some(server),
+            }),
         })
+    }
+
+    /// Connects to a KiCad GUI that registered itself through the plugin. `schematic` selects the
+    /// open project whose root schematic it is; without it, the instance must have exactly one
+    /// schematic open. Nothing is started or stopped.
+    pub async fn open_gui(
+        config: &SessionConfig,
+        installs: &[KicadInstall],
+        registration: &crate::registry::Registration,
+        schematic: Option<&Path>,
+    ) -> Result<Self, ToolError> {
+        let id = new_session_id();
+        let client_name = format!("thingsvu-kicad-ai-{id}");
+        let mut client = Client::connect(&registration.socket_path, &client_name, config.request_timeout)
+            .await
+            .map_err(|e| {
+                ToolError::new(
+                    ErrorCode::NoSession,
+                    format!("the registered KiCad is not reachable ({e}); press the KiCad AI button in KiCad again"),
+                )
+            })?;
+        client.pin_instance_token(registration.token.clone());
+
+        let docs: GetOpenDocumentsResponse = client
+            .call(&GetOpenDocuments {
+                r#type: DocumentType::DoctypeSchematic as i32,
+            })
+            .await
+            .map_err(|e| {
+                let mut err = from_ipc_error(&e, false);
+                if err.code == ErrorCode::FeatureUnavailable {
+                    err = ToolError::new(
+                        ErrorCode::DocumentNotOpen,
+                        "no schematic is open in that KiCad; open it in the Schematic Editor",
+                    );
+                }
+                err
+            })?;
+        let root_of = |d: &DocumentSpecifier| {
+            d.project
+                .as_ref()
+                .map(|p| PathBuf::from(&p.path).join(format!("{}.kicad_sch", p.name)))
+        };
+        let candidates: Vec<(DocumentSpecifier, PathBuf)> = docs
+            .documents
+            .iter()
+            .filter_map(|d| root_of(d).map(|p| (d.clone(), p)))
+            .collect();
+        let (document, document_path) = match schematic {
+            Some(wanted) => {
+                let wanted = std::path::absolute(wanted)
+                    .map_err(|e| ToolError::new(ErrorCode::InvalidArgument, e.to_string()))?;
+                candidates
+                    .into_iter()
+                    .find(|(_, root)| same_path(root, &wanted))
+                    .ok_or_else(|| {
+                        ToolError::new(
+                            ErrorCode::DocumentNotOpen,
+                            format!(
+                                "{} is not the root schematic of a project open in that KiCad",
+                                wanted.display()
+                            ),
+                        )
+                    })?
+            }
+            None => match candidates.len() {
+                1 => candidates.into_iter().next().expect("one candidate"),
+                0 => {
+                    return Err(ToolError::new(
+                        ErrorCode::DocumentNotOpen,
+                        "no schematic is open in that KiCad",
+                    ))
+                }
+                n => {
+                    return Err(ToolError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("{n} schematics are open in that KiCad; pass schematic_path to choose one"),
+                    ))
+                }
+            },
+        };
+
+        let report = capabilities::probe(&mut client)
+            .await
+            .map_err(|e| from_ipc_error(&e, false))?;
+        let version = kicad_cli_runner::KicadVersion::parse(&report.kicad_version);
+        let cli = installs
+            .iter()
+            .filter(|i| version.as_ref().is_some_and(|v| v.series() == i.version.series()))
+            .max_by_key(|i| (i.version.major, i.version.minor, i.version.patch))
+            .cloned();
+        let capabilities = capabilities_from_probe(&report, false, cli.as_ref());
+        tracing::info!(session = %id, kicad = %report.kicad_version, document = %document_path.display(), "GUI session ready");
+        Ok(Self {
+            id,
+            provider: Provider::Gui,
+            kicad_version: report.kicad_version,
+            fingerprint: Some(fingerprint(&registration.token)),
+            document_path,
+            document,
+            capabilities,
+            cli,
+            inner: Mutex::new(Inner { client, server: None }),
+        })
+    }
+
+    pub fn provider(&self) -> Provider {
+        self.provider
     }
 
     pub fn id(&self) -> &str {
@@ -269,6 +384,12 @@ impl Session {
     #[doc(hidden)]
     pub async fn raw_client(&self) -> tokio::sync::MappedMutexGuard<'_, Client> {
         tokio::sync::MutexGuard::map(self.inner.lock().await, |inner| &mut inner.client)
+    }
+
+    /// The socket of the session's own headless server, for tests that act as a KiCad plugin.
+    #[doc(hidden)]
+    pub async fn headless_socket(&self) -> Option<PathBuf> {
+        self.inner.lock().await.server.as_ref().map(|s| s.socket().to_owned())
     }
 
     /// The document identifier KiCad assigned when the session opened.
@@ -308,7 +429,7 @@ impl Session {
     /// Current state, re-checked against the server (liveness and unsaved changes).
     pub async fn status(&self) -> SessionStatus {
         let mut inner = self.inner.lock().await;
-        let running = inner.server.is_running();
+        let running = inner.server.as_mut().is_none_or(|s| s.is_running());
         let connected = running && inner.client.call_any(&Ping {}).await.is_ok();
         let unsaved = if connected && self.capabilities.is_available(Capability::DocumentLifecycle) {
             Self::unsaved_changes(&mut inner, &self.document).await
@@ -321,7 +442,7 @@ impl Session {
             kicad_version: self.kicad_version.clone(),
             instance_fingerprint: self.fingerprint.clone(),
             document: Some(self.document_path.clone()),
-            server_pid: inner.server.pid(),
+            server_pid: inner.server.as_ref().and_then(|s| s.pid()),
             connected,
             unsaved_changes: unsaved,
             cli: self.cli.as_ref().map(|c| c.cli.display().to_string()),
@@ -329,10 +450,16 @@ impl Session {
         }
     }
 
-    /// Stops the session. Refuses while there are unsaved changes unless `discard_unsaved`.
+    /// Ends the session. A headless session stops its server and refuses while there are unsaved
+    /// changes unless `discard_unsaved`. A GUI session only disconnects: the editor, its document,
+    /// and any unsaved changes stay with the user.
     pub async fn close(&self, discard_unsaved: bool) -> Result<bool, ToolError> {
         let mut inner = self.inner.lock().await;
-        let unsaved = if inner.server.is_running() {
+        let Some(server) = inner.server.as_mut() else {
+            tracing::info!(session = %self.id, "GUI session disconnected");
+            return Ok(false);
+        };
+        let unsaved = if server.is_running() {
             Self::unsaved_changes(&mut inner, &self.document).await
         } else {
             None
@@ -343,8 +470,23 @@ impl Session {
                 "the document has unsaved changes; save it first or pass discard_unsaved: true",
             ));
         }
-        inner.server.stop().await;
+        if let Some(server) = inner.server.as_mut() {
+            server.stop().await;
+        }
         tracing::info!(session = %self.id, discarded = unsaved == Some(true), "session closed");
         Ok(unsaved == Some(true))
     }
+}
+
+/// Compares paths the way the file system does (case-insensitively on Windows).
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.components().collect::<PathBuf>().display().to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    norm(a) == norm(b)
 }

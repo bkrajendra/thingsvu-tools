@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use kicad_cli_runner::KicadInstall;
 use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, LibraryId, Origin, Provenance, ResultState, ToolError};
-use kicad_session::{OpenTarget, Session, SessionConfig};
+use kicad_session::registry::{self, Registration};
+use kicad_session::{OpenTarget, Provider, Session, SessionConfig};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
@@ -63,14 +64,19 @@ pub enum ProviderArg {
     /// A KiCad API server started and owned by this MCP server (KiCad 11 / 10.99).
     #[default]
     Headless,
+    /// The KiCad 11 editor the user has open, after they pressed the "KiCad AI" toolbar button
+    /// (kicad-ai-plugin). Changes appear live in the editor and can be undone there.
+    Gui,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OpenArgs {
-    /// Absolute path of the .kicad_sch file.
-    pub schematic_path: String,
-    /// Create a new schematic at schematic_path instead of opening an existing one.
+    /// Absolute path of the .kicad_sch file. Required for headless; for gui, it selects the
+    /// project (root schematic) when the editor has more than one open.
+    #[serde(default)]
+    pub schematic_path: Option<String>,
+    /// Headless only: create a new schematic at schematic_path instead of opening an existing one.
     #[serde(default)]
     pub create: bool,
     #[serde(default)]
@@ -167,11 +173,18 @@ struct InstallInfo<'a> {
     found_via: kicad_cli_runner::InstallSource,
 }
 
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Headless => "headless",
+        Provider::Gui => "gui",
+    }
+}
+
 fn provenance(status: &kicad_session::SessionStatus) -> Provenance {
     Provenance {
         origin: Origin::KicadIpc,
         kicad_version: Some(status.kicad_version.clone()),
-        provider: Some("headless".into()),
+        provider: Some(provider_name(status.provider).into()),
         document: status.document.as_ref().map(|d| d.display().to_string()),
         revision: None,
     }
@@ -182,7 +195,7 @@ fn live(session: &Session) -> Vec<Provenance> {
     vec![Provenance {
         origin: Origin::KicadIpc,
         kicad_version: Some(session.kicad_version().to_owned()),
-        provider: Some("headless".into()),
+        provider: Some(provider_name(session.provider()).into()),
         document: Some(session.document_path().display().to_string()),
         revision: None,
     }]
@@ -219,6 +232,54 @@ impl KicadAiServer {
                 format!("no session '{id}'; call session_status to list sessions"),
             )
         })
+    }
+
+    /// Registered KiCad GUIs that still answer. Records of instances that are gone are removed.
+    async fn live_registrations(&self) -> Vec<Registration> {
+        let dir = registry::registry_dir();
+        let mut live = Vec::new();
+        for r in registry::list(&dir) {
+            if registry::is_reachable(&r, std::time::Duration::from_secs(3)).await {
+                live.push(r);
+            } else {
+                let _ = registry::remove(&dir, &r.socket_path);
+            }
+        }
+        live
+    }
+
+    /// The registered GUI to use: the one with `schematic`'s project open, or the only one.
+    async fn pick_registration(&self, schematic: Option<&std::path::Path>) -> Result<Registration, ToolError> {
+        let live = self.live_registrations().await;
+        if live.is_empty() {
+            return Err(ToolError::new(
+                ErrorCode::NoSession,
+                "no KiCad editor is registered: open the project in KiCad 11 and press the \"KiCad AI\" toolbar button",
+            ));
+        }
+        if let Some(schematic) = schematic {
+            let folder = schematic.parent().map(|p| p.to_string_lossy().to_lowercase());
+            let stem = schematic.file_stem().map(|s| s.to_string_lossy().to_lowercase());
+            let matches = |r: &&Registration| {
+                r.documents.iter().any(|d| {
+                    d.project.as_ref().map(|p| p.to_lowercase()) == stem
+                        && d.project_path
+                            .as_ref()
+                            .map(|p| p.trim_end_matches(['\\', '/']).to_lowercase())
+                            == folder
+                })
+            };
+            if let Some(r) = live.iter().find(matches) {
+                return Ok(r.clone());
+            }
+        }
+        match live.as_slice() {
+            [only] => Ok(only.clone()),
+            _ => Err(ToolError::new(
+                ErrorCode::InvalidArgument,
+                "several KiCad editors are registered; pass schematic_path to choose one",
+            )),
+        }
     }
 
     fn refuse_if_read_only(&self) -> Result<(), ToolError> {
@@ -395,11 +456,24 @@ liveness, unsaved changes, and the capability matrix (which features are availab
         } else {
             vec!["no KiCad 11 (or 10.99 nightly) install found: headless sessions are unavailable".to_owned()]
         };
+        // Registered KiCad editors (the token is never shown).
+        let gui_editors: Vec<_> = self
+            .live_registrations()
+            .await
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "kicad_version": r.kicad_version,
+                    "projects": r.documents.iter().filter(|d| d.kind == "schematic").map(|d| serde_json::json!({ "project": d.project, "folder": d.project_path })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
         envelope::ok(
             &cid,
             serde_json::json!({
                 "server": { "name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION") },
                 "kicad_installs": installs,
+                "gui_editors": gui_editors,
                 "sessions": statuses,
             }),
             vec![],
@@ -415,21 +489,51 @@ editor has open. Returns the session status, including its capability matrix."
     )]
     pub async fn session_open(&self, Parameters(args): Parameters<OpenArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
-        let path = PathBuf::from(&args.schematic_path);
-        if !path.is_absolute() {
+        let path = args.schematic_path.as_ref().map(PathBuf::from);
+        if path.as_ref().is_some_and(|p| !p.is_absolute()) {
             return envelope::error(
                 &cid,
                 &ToolError::new(ErrorCode::InvalidArgument, "schematic_path must be an absolute path"),
             );
         }
-        let target = if args.create {
-            OpenTarget::New(path)
-        } else {
-            OpenTarget::Existing(path)
-        };
-        let ProviderArg::Headless = args.provider;
         let installs = self.installs().await.to_vec();
-        match Session::open_headless(&self.state.options.session, &installs, target).await {
+        let opened = match args.provider {
+            ProviderArg::Headless => {
+                let Some(path) = path else {
+                    return envelope::error(
+                        &cid,
+                        &ToolError::new(
+                            ErrorCode::InvalidArgument,
+                            "schematic_path is required for headless sessions",
+                        ),
+                    );
+                };
+                let target = if args.create {
+                    OpenTarget::New(path)
+                } else {
+                    OpenTarget::Existing(path)
+                };
+                Session::open_headless(&self.state.options.session, &installs, target).await
+            }
+            ProviderArg::Gui => {
+                if args.create {
+                    return envelope::error(
+                        &cid,
+                        &ToolError::new(
+                            ErrorCode::InvalidArgument,
+                            "create is only for headless sessions; create the project in KiCad",
+                        ),
+                    );
+                }
+                match self.pick_registration(path.as_deref()).await {
+                    Ok(registration) => {
+                        Session::open_gui(&self.state.options.session, &installs, &registration, path.as_deref()).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        match opened {
             Ok(session) => {
                 let session = Arc::new(session);
                 let status = session.status().await;

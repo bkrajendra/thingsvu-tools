@@ -11,6 +11,7 @@ mod headless;
 #[cfg(windows)]
 mod job;
 mod mutate;
+pub mod registry;
 mod schematic;
 mod session;
 
