@@ -1,0 +1,20 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "kicad-ai-bridge",
+  "name": "KiCad AI Bridge",
+  "description": "Connects the KiCad 11 Schematic and PCB editors to a local AI/MCP design service.",
+  "runtime": {
+    "type": "exec"
+  },
+  "actions": [
+    {
+      "identifier": "start-ai-bridge",
+      "name": "Start / reconnect AI bridge",
+      "description": "Starts the local Rust IPC bridge for AI design tools.",
+      "show-button": true,
+      "scopes": ["schematic", "pcb"],
+      "entrypoint": "C:\\ABSOLUTE\\PATH\\TO\\kicad-ai-plugin.exe",
+      "args": ["start-bridge"]
+    }
+  ]
+}
