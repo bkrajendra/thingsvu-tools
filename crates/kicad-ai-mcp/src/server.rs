@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! MCP tools. Phase 1: session management only.
+//! MCP tools: sessions, schematic reads, and planned schematic changes.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use kicad_cli_runner::KicadInstall;
-use kicad_domain::{ErrorCode, Origin, Provenance, ToolError};
+use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, LibraryId, Origin, Provenance, ResultState, ToolError};
 use kicad_session::{OpenTarget, Session, SessionConfig};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -17,23 +17,30 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::envelope;
+use crate::plans::{plan_view, PlanStore, StoredPlan};
 
 const INSTRUCTIONS: &str = "KiCad schematic tools. Start with session_status to see the KiCad installs \
 and what each session can do, then session_open on a .kicad_sch file (or create: true for a new one). \
 Every result has ok, result_state, and provenance; a check that could not run is reported as not_run, \
-never as passing. Close sessions with session_close when done.";
+never as passing. To change a schematic, describe the circuit as components and nets, call \
+sch_plan_changes, show the plan to the user, then call sch_apply_plan with confirm: true and a fresh \
+idempotency_key. sch_apply_plan reads connectivity back from KiCad and reports any mismatch. Save with \
+sch_save; check with sch_run_erc and sch_render. Close sessions with session_close when done.";
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// Explicitly configured kicad-cli paths, tried before automatic discovery.
     pub configured_cli: Vec<PathBuf>,
     pub session: SessionConfig,
+    /// Reject every tool that changes a schematic or writes files into a project.
+    pub read_only: bool,
 }
 
 struct State {
     options: Options,
     installs: OnceCell<Vec<KicadInstall>>,
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
+    plans: Mutex<PlanStore>,
 }
 
 #[derive(Clone)]
@@ -94,6 +101,63 @@ pub struct SymbolPinsArgs {
     pub symbol: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanArgs {
+    pub session_id: String,
+    /// Electrical intent: {"schema_version": 1, "name": "...", "components": [{"id", "library_id"
+    /// (e.g. "Device:R"), "value", optional "reference_preference", "footprint", "fields"}], "nets":
+    /// [{"name", "pins": [{"component_id", "pin_number"}]}]}. Coordinates are chosen by the layout.
+    pub circuit: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyArgs {
+    pub session_id: String,
+    pub plan_id: String,
+    /// Must be true: the user has reviewed the plan.
+    pub confirm: bool,
+    /// A new value per intended apply (8–128 characters). Repeating a key returns the earlier
+    /// result instead of applying twice.
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportArgs {
+    pub session_id: String,
+    /// Absolute path of the .net file to write, inside the schematic's folder.
+    pub output_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RenderArgs {
+    pub session_id: String,
+    /// Resolution, 72–600 (default 150).
+    #[serde(default)]
+    pub dpi: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DemoArgs {
+    pub session_id: String,
+    /// Apply the plan as well. Without it, only the plan is returned.
+    #[serde(default)]
+    pub apply: bool,
+    /// Required with apply: true.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Required with apply: true.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// The circuit `sch_create_demo_circuit` builds.
+const DEMO_CIRCUIT: &str = include_str!("../../../docs/examples/two-resistor-series-chain.json");
+
 #[derive(Serialize)]
 struct InstallInfo<'a> {
     cli: String,
@@ -131,6 +195,7 @@ impl KicadAiServer {
                 options,
                 installs: OnceCell::new(),
                 sessions: Mutex::new(BTreeMap::new()),
+                plans: Mutex::new(PlanStore::default()),
             }),
             tool_router: Self::tool_router(),
         }
@@ -154,6 +219,137 @@ impl KicadAiServer {
                 format!("no session '{id}'; call session_status to list sessions"),
             )
         })
+    }
+
+    fn refuse_if_read_only(&self) -> Result<(), ToolError> {
+        if self.state.options.read_only {
+            Err(ToolError::new(
+                ErrorCode::ReadOnlyMode,
+                "the server runs in read-only mode",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A private scratch folder for one tool call (ERC copies, renders).
+    fn scratch_dir(&self, session_id: &str, purpose: &str, cid: &str) -> Result<PathBuf, ToolError> {
+        let dir = self
+            .state
+            .options
+            .session
+            .runtime_dir
+            .join(session_id)
+            .join(format!("{purpose}-{cid}"));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot create {}: {e}", dir.display())))?;
+        Ok(dir)
+    }
+
+    /// Validates, lays out, and stores a plan; returns its client view.
+    async fn make_plan(&self, session: &Arc<Session>, spec: CircuitSpec) -> Result<serde_json::Value, ToolError> {
+        let mut ids: Vec<LibraryId> = spec.components.iter().map(|c| c.library_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        let library = session.library_symbols(&ids).await?;
+        let existing = session.existing_document().await?;
+        let plan = plan_circuit(&spec, &library, &existing);
+        let fingerprint = session.fingerprint().await?;
+        let mut plans = self.state.plans.lock().await;
+        let stored = StoredPlan {
+            session_id: session.id().to_owned(),
+            plan,
+            fingerprint,
+            applied_with: None,
+        };
+        let view_plan = stored.plan.clone();
+        let id = plans.insert(stored);
+        Ok(plan_view(&id, &view_plan))
+    }
+
+    /// Applies a stored plan once per idempotency key.
+    async fn apply_planned(&self, cid: &str, session: &Arc<Session>, plan_id: &str, key: &str) -> CallToolResult {
+        if !(8..=128).contains(&key.len()) {
+            return envelope::error(
+                cid,
+                &ToolError::new(ErrorCode::InvalidArgument, "idempotency_key must be 8–128 characters"),
+            );
+        }
+        let (plan, fingerprint) = {
+            let plans = self.state.plans.lock().await;
+            if let Some((previous_plan, envelope)) = plans.previous_apply(key) {
+                if previous_plan == plan_id {
+                    let mut replay = envelope.clone();
+                    if let Some(w) = replay.get_mut("warnings").and_then(|w| w.as_array_mut()) {
+                        w.push("replayed: this idempotency key was already applied; nothing was changed".into());
+                    }
+                    return CallToolResult::structured(replay);
+                }
+                return envelope::error(
+                    cid,
+                    &ToolError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("idempotency_key was already used for {previous_plan}"),
+                    ),
+                );
+            }
+            let Some(stored) = plans.get(plan_id) else {
+                return envelope::error(
+                    cid,
+                    &ToolError::new(ErrorCode::StalePlan, format!("no plan '{plan_id}'; make a new plan")),
+                );
+            };
+            if stored.session_id != session.id() {
+                return envelope::error(
+                    cid,
+                    &ToolError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("{plan_id} belongs to another session"),
+                    ),
+                );
+            }
+            if let Some(used) = &stored.applied_with {
+                return envelope::error(
+                    cid,
+                    &ToolError::new(
+                        ErrorCode::StalePlan,
+                        format!("{plan_id} was already applied (key {used}); make a new plan"),
+                    ),
+                );
+            }
+            (stored.plan.clone(), stored.fingerprint.clone())
+        };
+
+        let result = session.apply_plan(&plan, &fingerprint).await;
+        let envelope = match &result {
+            Ok(report) => {
+                let (state, warnings) = if report.verified {
+                    (ResultState::Done, vec![])
+                } else {
+                    (
+                        ResultState::Partial,
+                        vec!["applied, but KiCad's connectivity differs from the plan; see verification".to_owned()],
+                    )
+                };
+                envelope::ok_with_state(cid, state, report, live(session), warnings)
+            }
+            Err(e) => envelope::error(cid, e),
+        };
+        // A refusal before anything changed may be retried with the same key; anything else is final.
+        let final_outcome = match &result {
+            Ok(_) => true,
+            Err(e) => e.mutation_state != kicad_domain::MutationState::NotStarted,
+        };
+        if final_outcome {
+            let mut plans = self.state.plans.lock().await;
+            if let Some(stored) = plans.get_mut(plan_id) {
+                stored.applied_with = Some(key.to_owned());
+            }
+            if let Some(value) = envelope::structured(&envelope) {
+                plans.record_apply(key.to_owned(), plan_id.to_owned(), value.clone());
+            }
+        }
+        envelope
     }
 }
 
@@ -263,6 +459,7 @@ changes unless discard_unsaved is true."
         match session.close(args.discard_unsaved).await {
             Ok(discarded) => {
                 self.state.sessions.lock().await.remove(&args.session_id);
+                self.state.plans.lock().await.forget_session(&args.session_id);
                 envelope::ok(
                     &cid,
                     serde_json::json!({ "session_id": args.session_id, "closed": true, "discarded_unsaved_changes": discarded }),
@@ -349,6 +546,315 @@ intended connections really exist."
             },
             Err(e) => envelope::error(&cid, &e),
         }
+    }
+
+    #[tool(
+        name = "sch_plan_changes",
+        description = "Turn a circuit (components and the nets connecting their pins) into an exact plan: \
+which symbols are placed where, which references they get, and which wires and labels connect them. \
+Nothing is changed. Returns a plan_id for sch_apply_plan, the operations in mm, the nets that must exist \
+afterwards, and findings (errors block applying)."
+    )]
+    pub async fn sch_plan_changes(&self, Parameters(args): Parameters<PlanArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let spec: CircuitSpec = match serde_json::from_value(args.circuit) {
+            Ok(spec) => spec,
+            Err(e) => {
+                return envelope::error(
+                    &cid,
+                    &ToolError::new(ErrorCode::InvalidArgument, format!("circuit: {e}")),
+                )
+            }
+        };
+        match self.make_plan(&session, spec).await {
+            Ok(view) => envelope::ok(&cid, view, live(&session), vec![]),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_apply_plan",
+        description = "Apply a plan from sch_plan_changes after the user has reviewed it (confirm: true). \
+Refused if the schematic changed since planning. Places symbols, sets values, adds wires and labels, then \
+reads connectivity back from KiCad and compares it with the plan's expected nets. On failure every change \
+is undone. Repeating the same idempotency_key returns the earlier result."
+    )]
+    pub async fn sch_apply_plan(&self, Parameters(args): Parameters<ApplyArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        if !args.confirm {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "confirm must be true; show the plan to the user first",
+                ),
+            );
+        }
+        match self.session(&args.session_id).await {
+            Ok(session) => {
+                self.apply_planned(&cid, &session, &args.plan_id, &args.idempotency_key)
+                    .await
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(name = "sch_save", description = "Save the session's schematic to its file.")]
+    pub async fn sch_save(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        match self.session(&args.session_id).await {
+            Ok(session) => match session.save().await {
+                Ok(()) => envelope::ok(
+                    &cid,
+                    serde_json::json!({ "saved": session.document_path().display().to_string() }),
+                    live(&session),
+                    vec![],
+                ),
+                Err(e) => envelope::error(&cid, &e),
+            },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_run_erc",
+        description = "Run KiCad's electrical rules check on the schematic as it is now (unsaved changes \
+included). Returns error and warning counts and every violation with its position in mm. Zero errors does \
+not prove the circuit works."
+    )]
+    pub async fn sch_run_erc(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let Some(cli) = session.cli().cloned() else {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::ErcUnavailable, "no matching kicad-cli install"),
+            );
+        };
+        let dir = match self.scratch_dir(session.id(), "erc", &cid) {
+            Ok(d) => d,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        // ERC runs on a snapshot of the in-memory document, so the user's file is not touched.
+        let result = async {
+            let copy = session.save_copy(&dir).await?;
+            kicad_cli_runner::erc::run_erc(&cli, &copy, &dir.join("erc.json"), std::time::Duration::from_secs(180))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::ErcUnavailable, e.to_string()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(report) => {
+                let violations: Vec<_> = report
+                    .violations()
+                    .map(|(sheet, v)| {
+                        serde_json::json!({
+                            "sheet": sheet.path,
+                            "severity": v.severity,
+                            "type": v.kind,
+                            "description": v.description,
+                            "items": v.items.iter().map(|i| serde_json::json!({ "description": i.description, "position_mm": i.pos })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                let provenance = vec![Provenance {
+                    origin: Origin::KicadCli,
+                    kicad_version: Some(cli.version.full.clone()),
+                    provider: None,
+                    document: Some(session.document_path().display().to_string()),
+                    revision: None,
+                }];
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({
+                        "errors": report.count("error"),
+                        "warnings": report.count("warning"),
+                        "violations": violations,
+                    }),
+                    provenance,
+                    vec!["ERC ran on a snapshot of the in-memory schematic".to_owned()],
+                )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_export_netlist",
+        description = "Write a KiCad netlist (.net, s-expression format) of the schematic as it is now to \
+output_path, which must be inside the schematic's folder. Returns the net and component counts."
+    )]
+    pub async fn sch_export_netlist(&self, Parameters(args): Parameters<ExportArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let output = PathBuf::from(&args.output_path);
+        let folder = session.document_path().parent().map(PathBuf::from).unwrap_or_default();
+        let inside = output.is_absolute()
+            && std::path::absolute(&output)
+                .is_ok_and(|p| p.parent() == Some(folder.as_path()) || p.starts_with(&folder));
+        if !inside || output.extension().and_then(|e| e.to_str()) != Some("net") {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("output_path must be an absolute .net path inside {}", folder.display()),
+                ),
+            );
+        }
+        let Some(cli) = session.cli().cloned() else {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::FeatureUnavailable, "no matching kicad-cli install"),
+            );
+        };
+        let dir = match self.scratch_dir(session.id(), "netlist", &cid) {
+            Ok(d) => d,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        // KiCad's IPC export jobs read the saved file, so export from a snapshot of the in-memory
+        // document instead (docs/tasks.md, 3.7).
+        let result = async {
+            let copy = session.save_copy(&dir).await?;
+            kicad_cli_runner::netlist::export_netlist(&cli, &copy, &output, std::time::Duration::from_secs(180))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(netlist) => envelope::ok(
+                &cid,
+                serde_json::json!({
+                    "path": output.display().to_string(),
+                    "components": netlist.components.len(),
+                    "nets": netlist.nets.len(),
+                }),
+                live(&session),
+                vec![],
+            ),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_render",
+        description = "Render the schematic as it is now to a PNG image and return it, so the layout can be \
+checked visually."
+    )]
+    pub async fn sch_render(&self, Parameters(args): Parameters<RenderArgs>) -> CallToolResult {
+        use base64::Engine;
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let dpi = args.dpi.unwrap_or(150);
+        if !(72..=600).contains(&dpi) {
+            return envelope::error(&cid, &ToolError::new(ErrorCode::InvalidArgument, "dpi must be 72–600"));
+        }
+        let dir = match self.scratch_dir(session.id(), "render", &cid) {
+            Ok(d) => d,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let Some(cli) = session.cli().cloned() else {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::FeatureUnavailable, "no matching kicad-cli install"),
+            );
+        };
+        // Render a snapshot of the in-memory document (IPC plot jobs read the saved file).
+        let result = async {
+            let snapshot = dir.join("snapshot");
+            let images = dir.join("png");
+            for d in [&snapshot, &images] {
+                std::fs::create_dir_all(d).map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
+            }
+            let copy = session.save_copy(&snapshot).await?;
+            let pngs =
+                kicad_cli_runner::export::export_png(&cli, &copy, &images, dpi, std::time::Duration::from_secs(180))
+                    .await
+                    .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
+            std::fs::read(&pngs[0]).map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(bytes) => {
+                let mut r = envelope::ok(
+                    &cid,
+                    serde_json::json!({ "format": "png", "dpi": dpi, "bytes": bytes.len() }),
+                    live(&session),
+                    vec![],
+                );
+                r.content.push(rmcp::model::ContentBlock::image(
+                    base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "image/png",
+                ));
+                r
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_create_demo_circuit",
+        description = "Plan (and with apply: true, confirm: true, and an idempotency_key, also apply) the \
+two-resistor series chain INPUT - R1 10k - MID - R2 10k - OUTPUT. A quick end-to-end check of planning, \
+applying, and verification."
+    )]
+    pub async fn sch_create_demo_circuit(&self, Parameters(args): Parameters<DemoArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let spec = CircuitSpec::from_json(DEMO_CIRCUIT).expect("bundled demo circuit is valid");
+        let view = match self.make_plan(&session, spec).await {
+            Ok(v) => v,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        if !args.apply {
+            return envelope::ok(
+                &cid,
+                view,
+                live(&session),
+                vec!["plan only; pass apply: true to build it".into()],
+            );
+        }
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        let (true, Some(key)) = (args.confirm, args.idempotency_key.as_deref()) else {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "apply: true needs confirm: true and an idempotency_key",
+                ),
+            );
+        };
+        let plan_id = view["plan_id"].as_str().unwrap_or_default().to_owned();
+        self.apply_planned(&cid, &session, &plan_id, key).await
     }
 }
 

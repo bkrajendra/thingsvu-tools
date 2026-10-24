@@ -50,3 +50,22 @@ pub fn error(correlation_id: &str, error: &ToolError) -> CallToolResult {
 pub fn structured(result: &CallToolResult) -> Option<&Value> {
     result.structured_content.as_ref()
 }
+
+/// Like [`ok`], with an explicit result state (e.g. `partial` when verification found a mismatch).
+pub fn ok_with_state(
+    correlation_id: &str,
+    state: ResultState,
+    result: impl Serialize,
+    provenance: Vec<Provenance>,
+    warnings: Vec<String>,
+) -> CallToolResult {
+    let mut r = ok(correlation_id, result, provenance, warnings);
+    if let Some(Value::Object(map)) = r.structured_content.as_mut() {
+        map.insert("result_state".into(), json!(state));
+    }
+    // Keep the text content in step with the structured content.
+    if let Some(value) = &r.structured_content {
+        r.content = vec![rmcp::model::ContentBlock::text(value.to_string())];
+    }
+    r
+}

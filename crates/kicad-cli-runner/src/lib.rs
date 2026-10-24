@@ -6,6 +6,7 @@
 //! - [`netlist`]: netlist export with the KiCad s-expression netlist parsed.
 
 pub mod erc;
+pub mod export;
 pub mod install;
 pub mod netlist;
 mod run;

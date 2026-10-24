@@ -20,7 +20,7 @@ pub fn capabilities_from_probe(report: &ProbeReport, headless: bool, cli: Option
     let mut caps = CapabilitySet::default();
     let cli_support = |what: &str| match cli {
         Some(install) => Support::via(Backend::KicadCli).with_note(format!(
-            "{what} via kicad-cli {} on the saved file",
+            "{what} via kicad-cli {} on a snapshot of the in-memory document",
             install.version.full
         )),
         None => Support::unavailable(format!(

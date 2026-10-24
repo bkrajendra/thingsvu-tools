@@ -277,6 +277,11 @@ impl Session {
         &self.document
     }
 
+    /// The kicad-cli install matching this session's KiCad, if one was found.
+    pub fn cli(&self) -> Option<&KicadInstall> {
+        self.cli.as_ref()
+    }
+
     pub fn kicad_version(&self) -> &str {
         &self.kicad_version
     }

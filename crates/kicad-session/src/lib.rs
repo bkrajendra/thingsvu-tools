@@ -10,10 +10,12 @@ mod errors;
 mod headless;
 #[cfg(windows)]
 mod job;
+mod mutate;
 mod schematic;
 mod session;
 
 pub use capability_map::capabilities_from_probe;
 pub use errors::from_ipc_error;
+pub use mutate::{ApplyReport, NetCheck, PlacedComponent};
 pub use schematic::OpenDocument;
 pub use session::{OpenTarget, Provider, Session, SessionConfig, SessionStatus};

@@ -159,7 +159,8 @@ Rules:
 - Headless sessions do not preload libraries. Session start issues `LoadAllLibraries` (symbol type) and the session reports "libraries loading" until the libraries a plan needs are available; placement before that fails with `AS_BAD_REQUEST` ("symbol … not found"). GUI sessions must not send it: the GUI preloads libraries and answers `AS_UNIMPLEMENTED`.
 - A headless session does not need a fixture file: start `api-server` without a file, then `CreateDocument` (new schematic in memory), or `OpenDocument` for an existing one. `SaveDocument`, `RevertDocument`, `GetDocumentModifiedState`, and `CloseDocument` / `CloseAllDocuments` manage the document lifecycle; one server can switch documents without a restart.
 - The headless server prints no readiness line when its output is redirected. The provider detects readiness by polling connect + `Ping` within a deadline.
-- Headless sessions do not handle `BeginCommit`/`EndCommit` (observed on the pinned nightly). Each request applies immediately, so a plan applied headless is not atomic: the apply step records every created/updated KIID as it goes; on a mid-plan failure it removes the items it created, reports `result_state: partial` with the applied and not-applied operations, and requires read-back before anything else runs. GUI sessions wrap each apply in one commit, which is one undo step in the editor (verified on the nightly).
+- Commits are available in headless sessions whose document was opened with `OpenDocument`/`CreateDocument` (a server started with a file argument has none), and in the GUI. Inside an open commit a newly placed symbol is not yet part of the document, so an apply uses **two commits**: (1) place the symbols, (2) set field values and add wires and labels. One apply is therefore two undo steps. A failed step's commit is dropped, and anything an earlier step created is deleted with `DeleteItems`. Sessions without commits record every created KIID and delete them on failure. The result is `rejected` with `mutation_state: not_applied` when the undo succeeded, `unknown` otherwise.
+- KiCad's IPC export jobs (netlist, plot) read the **saved file**, not the in-memory document. ERC, rendering, and netlist export therefore work on a `SaveCopyOfDocument` snapshot in a private folder, processed with `kicad-cli`; the user's file is not touched.
 - Commits are owned by the request's `client_name`; no other client can end them. Each session uses one stable `client_name` for its lifetime, and every error path inside an apply ends its open commit with `CMA_DROP` before reporting.
 - On Windows only one GUI instance gets an API endpoint: with two KiCad GUIs running (one 10.99, one 10.0.7), the second had no reachable socket at all. `session_status` must report which instance answered (version + token) and never assume the endpoint belongs to the KiCad the user means; the plugin provider (which receives the socket from KiCad) and the headless provider (own socket) avoid the ambiguity.
 - One provider per target document at a time. A document open in a GUI must not also be mutated through a headless server or the file backend.
@@ -192,8 +193,8 @@ Capabilities are probed at session start (`GetVersion`, then a harmless request 
 | `sch.place_symbol`, `sch.add_wire`, `sch.add_label`, `sch.set_field` | IPC | File, only if the document is not open in any editor (later phase) |
 | `sch.save` | IPC | File writer (atomic) |
 | `sch.erc` | CLI (KiCad 11 has no ERC job over IPC) | CLI |
-| `sch.render` | IPC job (SVG/PDF/PNG) or CLI | CLI (SVG/PDF) |
-| `sch.export_netlist` | IPC job or CLI | CLI |
+| `sch.render` | CLI on an in-memory snapshot (PNG) | CLI (SVG/PDF) |
+| `sch.export_netlist` | CLI on an in-memory snapshot | CLI |
 | `sch.diff` | CLI | Unavailable |
 | Live co-editing with undo | Plugin provider | Unavailable |
 

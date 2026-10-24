@@ -17,7 +17,12 @@ struct Mcp {
 
 impl Mcp {
     async fn start() -> Self {
+        Self::start_with(&[]).await
+    }
+
+    async fn start_with(args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_kicad-ai-mcp"))
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -99,9 +104,16 @@ async fn lists_tools_and_returns_envelopes() {
     assert_eq!(
         names,
         [
+            "sch_apply_plan",
+            "sch_create_demo_circuit",
+            "sch_export_netlist",
             "sch_get_netlist",
             "sch_get_symbol_pins",
             "sch_list_symbols",
+            "sch_plan_changes",
+            "sch_render",
+            "sch_run_erc",
+            "sch_save",
             "session_close",
             "session_list_documents",
             "session_open",
@@ -253,4 +265,163 @@ async fn live_read_tools_on_the_fixture() {
 
     let closed = mcp.call("session_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
+}
+
+#[tokio::test]
+async fn live_demo_circuit_end_to_end() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-demo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("demo.kicad_sch");
+
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call("session_open", json!({ "schematic_path": schematic, "create": true }))
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    // Plan only.
+    let plan = mcp.call("sch_create_demo_circuit", json!({ "session_id": id })).await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["can_apply"], true);
+    assert_eq!(plan["result"]["counts"]["symbols"], 2);
+    assert!(
+        mcp.call("sch_list_symbols", json!({ "session_id": id })).await["result"]["count"] == 0,
+        "planning changes nothing"
+    );
+
+    // Apply without confirm is refused.
+    let plan_id = plan["result"]["plan_id"].clone();
+    let refused = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": false, "idempotency_key": "demo-key-0001" }),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], "INVALID_ARGUMENT");
+
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "demo-key-0001" }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result_state"], "done", "{applied}");
+    assert_eq!(applied["result"]["verified"], true);
+    assert_eq!(applied["result"]["undo_steps"], 2);
+
+    // Same key again: replayed, not applied twice.
+    let replay = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "demo-key-0001" }),
+        )
+        .await;
+    assert!(replay["warnings"].to_string().contains("replayed"), "{replay}");
+    assert_eq!(
+        mcp.call("sch_list_symbols", json!({ "session_id": id })).await["result"]["count"],
+        2
+    );
+
+    // The same plan with a new key is stale.
+    let again = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "demo-key-0002" }),
+        )
+        .await;
+    assert_eq!(again["error"]["code"], "STALE_PLAN", "{again}");
+
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    assert_eq!(erc["ok"], true, "{erc}");
+    assert_eq!(erc["provenance"][0]["origin"], "kicad_cli");
+    println!(
+        "ERC: {} errors, {} warnings: {}",
+        erc["result"]["errors"], erc["result"]["warnings"], erc["result"]["violations"]
+    );
+
+    let render = mcp
+        .request(
+            "tools/call",
+            json!({ "name": "sch_render", "arguments": { "session_id": id } }),
+        )
+        .await;
+    let content = render["result"]["content"].as_array().unwrap();
+    let image = content
+        .iter()
+        .find(|c| c["type"] == "image")
+        .unwrap_or_else(|| panic!("no image block: {render}"));
+    assert_eq!(image["mimeType"], "image/png");
+    assert!(image["data"].as_str().unwrap().len() > 1000);
+
+    let net_path = dir.join("demo.net");
+    let exported = mcp
+        .call(
+            "sch_export_netlist",
+            json!({ "session_id": id, "output_path": net_path }),
+        )
+        .await;
+    assert_eq!(exported["result"]["nets"], 3, "{exported}");
+    let outside = mcp
+        .call(
+            "sch_export_netlist",
+            json!({ "session_id": id, "output_path": std::env::temp_dir().join("x.net") }),
+        )
+        .await;
+    assert_eq!(outside["error"]["code"], "INVALID_ARGUMENT");
+
+    let saved = mcp.call("sch_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+
+    // The saved file, checked independently with kicad-cli.
+    let installs = kicad_cli_runner::discover(&[]).await;
+    let cli = installs.iter().find(|i| i.version.series() >= 11).unwrap();
+    let netlist =
+        kicad_cli_runner::netlist::export_netlist(cli, &schematic, &dir.join("check.net"), Duration::from_secs(120))
+            .await
+            .unwrap();
+    let topology = netlist.topology();
+    for (name, pins) in [
+        ("/INPUT", vec!["R1.1"]),
+        ("/MID", vec!["R1.2", "R2.1"]),
+        ("/OUTPUT", vec!["R2.2"]),
+    ] {
+        let pins: std::collections::BTreeSet<String> = pins.into_iter().map(str::to_owned).collect();
+        assert!(topology.contains(&(name.to_owned(), pins)), "{name} in {topology:?}");
+    }
+    assert!(
+        netlist
+            .components
+            .iter()
+            .all(|c| c.value == "10k" && c.lib_source == "Device:R"),
+        "{:?}",
+        netlist.components
+    );
+}
+
+#[tokio::test]
+async fn read_only_mode_refuses_changes() {
+    let mut mcp = Mcp::start_with(&["--read-only"]).await;
+    for (tool, args) in [
+        (
+            "sch_apply_plan",
+            json!({ "session_id": "s", "plan_id": "p", "confirm": true, "idempotency_key": "key-12345" }),
+        ),
+        ("sch_save", json!({ "session_id": "s" })),
+        (
+            "sch_export_netlist",
+            json!({ "session_id": "s", "output_path": "C:/x/y.net" }),
+        ),
+    ] {
+        let r = mcp.call(tool, args).await;
+        assert_eq!(r["error"]["code"], "READ_ONLY_MODE", "{tool}: {r}");
+    }
 }

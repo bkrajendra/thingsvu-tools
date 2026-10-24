@@ -410,3 +410,69 @@ async fn value_update_strategies() {
         session.close(true).await.unwrap();
     }
 }
+
+/// Phase 3 groundwork: library symbol geometry before placement (GetItemsFromLibrary).
+#[tokio::test]
+async fn library_symbol_geometry() {
+    if !live() || std::env::var("THINGSVU_EXPERIMENT").is_err() {
+        eprintln!("skipped: set KICAD_LIVE=1 and THINGSVU_EXPERIMENT=1");
+        return;
+    }
+    use kicad_ipc::proto::kiapi::common::commands::{GetItemsFromLibrary, GetItemsResponse};
+    use kicad_ipc::proto::kiapi::common::types::LibraryType;
+    use kicad_ipc::proto::kiapi::schematic::types::{SchematicPin, SchematicSymbol};
+    use prost::Name;
+    let session = open(OpenTarget::New(scratch("libgeom").join("g.kicad_sch"))).await;
+    let ids: Vec<LibraryIdentifier> = ["R", "Q_NPN", "C"]
+        .iter()
+        .map(|e| LibraryIdentifier {
+            library_nickname: "Device".into(),
+            entry_name: (*e).into(),
+        })
+        .collect();
+    let started = Instant::now();
+    let r: GetItemsResponse = loop {
+        let result = session
+            .raw_client()
+            .await
+            .call::<_, GetItemsResponse>(&GetItemsFromLibrary {
+                r#type: LibraryType::LtSymbol as i32,
+                document: Some(session.document_specifier().clone()),
+                item_ids: ids.clone(),
+            })
+            .await;
+        match result {
+            Ok(r) if !r.items.is_empty() || started.elapsed() > Duration::from_secs(60) => break r,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            Err(e) if started.elapsed() < Duration::from_secs(60) => {
+                println!("waiting: {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    println!("GEOM status {:?} items {}", r.status, r.items.len());
+    for any in &r.items {
+        println!("GEOM item {}", any.type_url);
+        if let Ok(sym) = any.to_msg::<SchematicSymbol>() {
+            let reference = sym
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .map(|t| t.text.clone());
+            println!(
+                "GEOM symbol {:?} ref {:?} unit_count {}",
+                sym.id, reference, sym.unit_count
+            );
+            for child in &sym.items {
+                if let Some(a) = &child.item {
+                    if a.type_url == SchematicPin::type_url() {
+                        let p = a.to_msg::<SchematicPin>().unwrap();
+                        println!("GEOM   pin {} {:?} unit {:?}", p.number, p.position, child.unit);
+                    }
+                }
+            }
+        }
+    }
+    session.close(true).await.unwrap();
+}

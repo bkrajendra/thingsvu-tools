@@ -3,6 +3,7 @@
 //! traffic; all diagnostics go to stderr.
 
 pub mod envelope;
+pub mod plans;
 pub mod server;
 
 pub use server::{KicadAiServer, Options};
