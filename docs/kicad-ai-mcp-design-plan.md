@@ -209,7 +209,7 @@ Capabilities are probed at session start (`GetVersion`, then a harmless request 
 Single Cargo workspace. No microservices or containers until the core works.
 
 ```text
-thingvu-tools/
+thingsvu-tools/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── rust-toolchain.toml
@@ -269,7 +269,7 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 ### 5.2 KiCad IPC adapter (`kicad-ipc`)
 - `prost` / `prost-build` code generated from the vendored protos. Record commit and SHA-256 per file.
 - NNG via a maintained Rust binding (`nng` crate) or direct FFI. Prove request/reply, deadlines, and Windows named-pipe addressing in the Phase 0 spike.
-- Typed envelope with `client_name` (`thingvu-kicad-ai-<pid>`) and pinned `kicad_token` after the first reply.
+- Typed envelope with `client_name` (`thingsvu-kicad-ai-<pid>`) and pinned `kicad_token` after the first reply.
 - Map every `ApiStatusCode` to a typed error: `AS_BUSY`/`AS_NOT_READY` → retryable; `AS_UNHANDLED`/`AS_UNIMPLEMENTED` → `FEATURE_UNAVAILABLE`; `AS_TOKEN_MISMATCH` → `KICAD_INSTANCE_CHANGED`; `AS_BAD_REQUEST` → non-retryable.
 - One serialized request channel per session with a bounded queue; a deadline on every request; no blind retries of mutations.
 - Unit conversion (mm ↔ KiCad internal units) lives only here; the pinned proto definitions are the authority on units.
@@ -297,7 +297,7 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 - Group tools by prefix (`session_`, `sch_`, later `pcb_`, `lib_`, `mech_`) so tool groups can be enabled on demand later via `notifications/tools/list_changed`. Do not hide tools behind a generic `execute_tool` proxy.
 
 ### 5.6 Local bridge transport (`kicad-ai-bridge/v1`)
-- **Windows named pipe first** (`\\.\pipe\thingvu-kicad-ai-<user-sid-hash>-<session>`), created with a security descriptor restricting access to the current user. Unix domain socket in a `0700` runtime directory with a `0600` socket on Linux/macOS.
+- **Windows named pipe first** (`\\.\pipe\thingsvu-kicad-ai-<user-sid-hash>-<session>`), created with a security descriptor restricting access to the current user. Unix domain socket in a `0700` runtime directory with a `0600` socket on Linux/macOS.
 - No TCP listener.
 - Newline-delimited JSON; every message has `protocol_version`, `request_id`, `operation`, `payload`; every reply has `request_id`, `ok`, and `result` or a typed `error`.
 - Frame size limits; reject malformed JSON and unknown protocol versions.
@@ -726,7 +726,7 @@ Keep `kicad-domain` KiCad-specific. When the mechanical/enclosure tools start, d
 
 ## Appendix A: Stable names
 
-- Workspace: `thingvu-tools`
+- Workspace: `thingsvu-tools`
 - MCP binary: `kicad-ai-mcp`
 - Plugin/bridge binary: `kicad-ai-plugin`
 - Bridge protocol: `kicad-ai-bridge/v1`
