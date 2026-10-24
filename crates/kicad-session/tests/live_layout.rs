@@ -45,32 +45,6 @@ async fn build_and_render(spec_file: &str) -> PathBuf {
     assert!(report.verified, "{:#?}", report.verification);
     let counts = plan.counts();
     println!("LAYOUT {name}: {counts:?} fallback nets {:?}", plan.fallback_nets);
-    for op in &plan.operations {
-        if let kicad_domain::plan::Operation::PlaceSymbol {
-            library_id,
-            position,
-            orientation,
-            reference,
-            ..
-        }
-        | kicad_domain::plan::Operation::PlacePowerSymbol {
-            library_id,
-            position,
-            orientation,
-            reference,
-            ..
-        } = op
-        {
-            if reference.starts_with("D") || reference == "#PWR11" {
-                let s = &library[library_id];
-                eprintln!(
-                    "DBG {reference} {position:?} {orientation:?} body {:?} pins {:?}",
-                    s.body,
-                    s.pins.iter().map(|p| (p.local, p.outward)).collect::<Vec<_>>()
-                );
-            }
-        }
-    }
     assert!(plan.readability.is_clean(), "{name}: {:#?}", plan.readability);
     session.save().await.unwrap();
     session.close(false).await.unwrap();
