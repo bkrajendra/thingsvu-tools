@@ -123,6 +123,13 @@ impl Add for Point {
     }
 }
 
+impl Sub for Point {
+    type Output = Point;
+    fn sub(self, rhs: Point) -> Point {
+        Point::new(self.x - rhs.x, self.y - rhs.y)
+    }
+}
+
 /// Placement transform of a symbol: a rotation in 90° steps, then optional mirroring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Orientation {
@@ -135,6 +142,15 @@ pub struct Orientation {
 }
 
 impl Orientation {
+    /// True when both transforms place every point the same way. KiCad stores transforms in a
+    /// normalized form (e.g. 180° + mirror_x reads back as mirror_y), so compare by effect.
+    pub fn same_effect(self, other: Orientation) -> bool {
+        let probes = [Point::new(Nm(1), Nm(0)), Point::new(Nm(0), Nm(1))];
+        probes
+            .iter()
+            .all(|p| self.apply(*p).is_some() && self.apply(*p) == other.apply(*p))
+    }
+
     /// Maps a pin position relative to the symbol origin (in placed-symbol axes, y down) to an
     /// offset in sheet coordinates. Returns `None` for a rotation that is not a multiple of 90°.
     pub fn apply(self, local: Point) -> Option<Point> {
@@ -154,6 +170,139 @@ impl Orientation {
             x = -x;
         }
         Some(Point::new(Nm(x), Nm(y)))
+    }
+}
+
+/// One of the four drawing directions, in sheet axes (y down).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Dir {
+    pub const ALL: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+
+    /// A step of `length` in this direction.
+    pub fn step(self, length: Nm) -> Point {
+        let l = length.0;
+        let (x, y) = match self {
+            Dir::Left => (-l, 0),
+            Dir::Right => (l, 0),
+            Dir::Up => (0, -l),
+            Dir::Down => (0, l),
+        };
+        Point::new(Nm(x), Nm(y))
+    }
+
+    pub fn opposite(self) -> Dir {
+        match self {
+            Dir::Left => Dir::Right,
+            Dir::Right => Dir::Left,
+            Dir::Up => Dir::Down,
+            Dir::Down => Dir::Up,
+        }
+    }
+
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, Dir::Left | Dir::Right)
+    }
+
+    /// This direction after the symbol transform `o`.
+    pub fn transformed(self, o: Orientation) -> Dir {
+        let p = o.apply(self.step(Nm(1))).unwrap_or(self.step(Nm(1)));
+        match (p.x.0.signum(), p.y.0.signum()) {
+            (-1, _) => Dir::Left,
+            (1, _) => Dir::Right,
+            (_, -1) => Dir::Up,
+            _ => Dir::Down,
+        }
+    }
+
+    /// 0 when equal, 1 when perpendicular, 2 when opposite.
+    pub fn distance(self, other: Dir) -> u32 {
+        if self == other {
+            0
+        } else if self == other.opposite() {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// An axis-aligned rectangle (inclusive), y down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Rect {
+    pub min: Point,
+    pub max: Point,
+}
+
+impl Rect {
+    pub fn from_points(points: impl IntoIterator<Item = Point>) -> Option<Rect> {
+        let mut it = points.into_iter();
+        let first = it.next()?;
+        let mut r = Rect { min: first, max: first };
+        for p in it {
+            r.min = Point::new(r.min.x.min(p.x), r.min.y.min(p.y));
+            r.max = Point::new(r.max.x.max(p.x), r.max.y.max(p.y));
+        }
+        Some(r)
+    }
+
+    pub fn union(self, other: Rect) -> Rect {
+        Rect::from_points([self.min, self.max, other.min, other.max]).expect("non-empty")
+    }
+
+    pub fn inflate(self, by: Nm) -> Rect {
+        Rect {
+            min: Point::new(self.min.x - by, self.min.y - by),
+            max: Point::new(self.max.x + by, self.max.y + by),
+        }
+    }
+
+    pub fn translate(self, by: Point) -> Rect {
+        Rect {
+            min: self.min + by,
+            max: self.max + by,
+        }
+    }
+
+    /// The rectangle after the symbol transform `o` (around the symbol origin).
+    pub fn transformed(self, o: Orientation) -> Rect {
+        let corners = [
+            self.min,
+            self.max,
+            Point::new(self.min.x, self.max.y),
+            Point::new(self.max.x, self.min.y),
+        ];
+        Rect::from_points(corners.into_iter().map(|c| o.apply(c).unwrap_or(c))).expect("four corners")
+    }
+
+    pub fn width(self) -> Nm {
+        self.max.x - self.min.x
+    }
+
+    pub fn height(self) -> Nm {
+        self.max.y - self.min.y
+    }
+
+    /// True when the rectangles share interior area (touching edges do not count).
+    pub fn overlaps(self, other: Rect) -> bool {
+        self.min.x < other.max.x && other.min.x < self.max.x && self.min.y < other.max.y && other.min.y < self.max.y
+    }
+
+    /// True when the axis-aligned segment a–b passes through the rectangle's interior.
+    pub fn crossed_by(self, a: Point, b: Point) -> bool {
+        let seg = Rect::from_points([a, b]).expect("two points");
+        if a.x == b.x {
+            a.x > self.min.x && a.x < self.max.x && seg.min.y < self.max.y && seg.max.y > self.min.y
+        } else {
+            a.y > self.min.y && a.y < self.max.y && seg.min.x < self.max.x && seg.max.x > self.min.x
+        }
     }
 }
 
@@ -211,5 +360,46 @@ mod tests {
         }
         .apply(p)
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod dir_rect_tests {
+    use super::*;
+
+    #[test]
+    fn directions_follow_the_transform() {
+        let r90 = Orientation {
+            rotation_deg: 90,
+            ..Default::default()
+        };
+        // A quarter turn counter-clockwise on screen: up becomes left, right becomes up.
+        assert_eq!(Dir::Up.transformed(r90), Dir::Left);
+        assert_eq!(Dir::Right.transformed(r90), Dir::Up);
+        let mirror_y = Orientation {
+            mirror_y: true,
+            ..Default::default()
+        };
+        assert_eq!(Dir::Left.transformed(mirror_y), Dir::Right);
+        assert_eq!(Dir::Up.distance(Dir::Down), 2);
+    }
+
+    #[test]
+    fn rect_checks() {
+        let body =
+            Rect::from_points([Point::from_mm(-1.0, -2.54).unwrap(), Point::from_mm(1.0, 2.54).unwrap()]).unwrap();
+        let wire_through = (Point::from_mm(-5.08, 0.0).unwrap(), Point::from_mm(5.08, 0.0).unwrap());
+        assert!(body.crossed_by(wire_through.0, wire_through.1));
+        let wire_beside = (
+            Point::from_mm(-5.08, 3.81).unwrap(),
+            Point::from_mm(5.08, 3.81).unwrap(),
+        );
+        assert!(!body.crossed_by(wire_beside.0, wire_beside.1));
+        let rotated = body.transformed(Orientation {
+            rotation_deg: 90,
+            ..Default::default()
+        });
+        assert_eq!((rotated.width(), rotated.height()), (body.height(), body.width()));
+        assert!(body.overlaps(rotated));
     }
 }

@@ -684,16 +684,26 @@ Exit: all Tier 1 headless acceptance criteria.
 
 Exit: all Tier 1 acceptance criteria.
 
-### Phase 5 — KiCad 10 fallback
-`kicad-sexpr` read path, then guarded mutation for closed documents; CLI-based ERC/netlist with the 10.0 CLI; direct-socket provider for open-document checks. Backend-contract tests run the demo on both backends.
+### Phase 5 — Readable schematics (layout engine)
+Generated schematics must read like a person drew them, not only be electrically correct (owner review of a generated 3.3 V regulator, 24 Oct 2026). The netlist verification after every apply stays unchanged, so layout can never alter the circuit.
+
+- Drawing conventions: power and ground nets as power symbols, oriented by net type; short wire stubs leading away from pins; labels oriented to read correctly; text clear of symbol bodies.
+- Roles from the netlist: classify nets (power, ground, signal) and parts (series parts in the main path, shunt parts such as decoupling capacitors, sources such as connectors).
+- Placement by signal flow: the main path left to right on a baseline; shunt parts grouped below the net they serve; 2-pin parts rotated and oriented (diode and LED polarity follows the flow).
+- Wires: orthogonal routes between nearby pins that avoid symbol bodies, with junctions where wires meet; labels only for long or crossing connections.
+- Optional layout hints in the circuit spec; editing tools (move, rotate, wire, delete) so a layout can be refined after creation (deferred; see tasks 5.9).
+- Acceptance: golden circuits (3.3 V regulator first) pass automated readability checks (no overlapping parts or text, power as symbols, local nets drawn as wires) and a rendered review.
+
+### Phase 6 — KiCad 10 fallback
+`kicad-sexpr` read path, then guarded mutation for closed documents, reusing the Phase 5 layout engine; CLI-based ERC/netlist with the 10.0 CLI; direct-socket provider for open-document checks. Backend-contract tests run the demo on both backends.
 
 Exit: all Tier 2 acceptance criteria.
 
-### Phase 6 — Hardening and packaging
-PCM package and PowerShell installer, read-only mode, log rotation, failure-injection suite, documentation of the observed capability matrix. Re-pin to KiCad 11.0 when released and re-run the Phase 0 probes.
+### Phase 7 — Hardening and packaging
+PCM package and PowerShell installer, log rotation, failure-injection suite, documentation of the observed capability matrix. Re-pin to KiCad 11.0 when released and re-run the Phase 0 probes.
 
 ### Later
-PCB tools on IPC (both versions), hierarchical sheets, layout engine improvements, BOM/part tooling, design-review checks, simulation hand-off, MCP prompts/resources and a bundled skill with KiCad conventions, on-demand tool groups, enclosure integration (§16.1).
+PCB tools on IPC (both versions), hierarchical sheets, multi-unit symbols, BOM/part tooling, design-review checks, simulation hand-off, MCP prompts/resources and a bundled skill with KiCad conventions, on-demand tool groups, enclosure integration (§16.1).
 
 ---
 

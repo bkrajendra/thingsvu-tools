@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "name": "regulator_3v3",
+  "description": "5 V input through a fuse and a Schottky diode to an AMS1117-3.3 regulator, with input and output decoupling and a power LED.",
+  "components": [
+    { "id": "j1", "library_id": "Connector_Generic:Conn_01x02", "reference_preference": "J1", "value": "5V_IN" },
+    { "id": "f1", "library_id": "Device:Fuse", "reference_preference": "F1", "value": "500mA" },
+    { "id": "d1", "library_id": "Device:D_Schottky", "reference_preference": "D1", "value": "SS34" },
+    { "id": "c1", "library_id": "Device:C", "reference_preference": "C1", "value": "10uF" },
+    { "id": "c2", "library_id": "Device:C", "reference_preference": "C2", "value": "100nF" },
+    { "id": "u1", "library_id": "Regulator_Linear:AMS1117-3.3", "reference_preference": "U1", "value": "AMS1117-3.3" },
+    { "id": "c3", "library_id": "Device:C", "reference_preference": "C3", "value": "22uF" },
+    { "id": "c4", "library_id": "Device:C", "reference_preference": "C4", "value": "10uF" },
+    { "id": "c5", "library_id": "Device:C", "reference_preference": "C5", "value": "100nF" },
+    { "id": "r1", "library_id": "Device:R", "reference_preference": "R1", "value": "1k" },
+    { "id": "d2", "library_id": "Device:LED", "reference_preference": "D2", "value": "PWR" },
+    { "id": "flag_5v", "library_id": "power:PWR_FLAG", "value": "PWR_FLAG" },
+    { "id": "flag_gnd", "library_id": "power:PWR_FLAG", "value": "PWR_FLAG" }
+  ],
+  "nets": [
+    { "name": "VBUS", "pins": [
+      { "component_id": "j1", "pin_number": "1" },
+      { "component_id": "f1", "pin_number": "1" } ] },
+    { "name": "VBUS_F", "pins": [
+      { "component_id": "f1", "pin_number": "2" },
+      { "component_id": "d1", "pin_number": "2" } ] },
+    { "name": "+5V", "pins": [
+      { "component_id": "d1", "pin_number": "1" },
+      { "component_id": "c1", "pin_number": "1" },
+      { "component_id": "c2", "pin_number": "1" },
+      { "component_id": "u1", "pin_number": "3" },
+      { "component_id": "flag_5v", "pin_number": "1" } ] },
+    { "name": "+3V3", "pins": [
+      { "component_id": "u1", "pin_number": "2" },
+      { "component_id": "c3", "pin_number": "1" },
+      { "component_id": "c4", "pin_number": "1" },
+      { "component_id": "c5", "pin_number": "1" },
+      { "component_id": "r1", "pin_number": "1" } ] },
+    { "name": "LED_PWR", "pins": [
+      { "component_id": "r1", "pin_number": "2" },
+      { "component_id": "d2", "pin_number": "2" } ] },
+    { "name": "GND", "pins": [
+      { "component_id": "j1", "pin_number": "2" },
+      { "component_id": "c1", "pin_number": "2" },
+      { "component_id": "c2", "pin_number": "2" },
+      { "component_id": "u1", "pin_number": "1" },
+      { "component_id": "c3", "pin_number": "2" },
+      { "component_id": "c4", "pin_number": "2" },
+      { "component_id": "c5", "pin_number": "2" },
+      { "component_id": "d2", "pin_number": "1" },
+      { "component_id": "flag_gnd", "pin_number": "1" } ] }
+  ],
+  "notes": [
+    "Reconstructed from the circuit Claude generated in the owner's test on 24 Oct 2026.",
+    "Device:D_Schottky and Device:LED: pin 1 is the cathode (K), pin 2 the anode (A).",
+    "AMS1117-3.3 (extends AP1117-15): pin 1 GND (bottom), pin 2 VO (right), pin 3 VI (left)."
+  ]
+}

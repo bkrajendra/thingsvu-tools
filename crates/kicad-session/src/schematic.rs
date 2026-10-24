@@ -66,7 +66,7 @@ fn orientation(symbol: &SchematicSymbolInstance) -> Orientation {
     }
 }
 
-fn electrical_type(value: i32) -> &'static str {
+pub(crate) fn electrical_type(value: i32) -> &'static str {
     match ElectricalPinType::try_from(value).unwrap_or(ElectricalPinType::EptUnknown) {
         ElectricalPinType::EptInput => "input",
         ElectricalPinType::EptOutput => "output",

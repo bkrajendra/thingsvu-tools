@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use kicad_domain::geometry::Orientation;
 use kicad_domain::{
-    Capability, ErrorCode, ExistingDocument, LibraryId, LibraryPin, LibrarySymbol, MutationState, Nm, Operation,
-    OperationPlan, Point, ToolError,
+    Capability, Dir, ErrorCode, ExistingDocument, LibraryId, LibraryPin, LibrarySymbol, MutationState, Nm, Operation,
+    OperationPlan, Point, Rect, ToolError,
 };
 use kicad_ipc::proto::kiapi::common::commands::{
     BeginCommit, BeginCommitResponse, CommitAction, CreateItems, CreateItemsResponse, DeleteItems, EndCommit,
@@ -17,12 +17,14 @@ use kicad_ipc::proto::kiapi::common::commands::{
     SaveOptions, UpdateItems, UpdateItemsResponse,
 };
 use kicad_ipc::proto::kiapi::common::types::{
-    ItemHeader, Kiid as ProtoKiid, LibraryIdentifier, LibraryType, Text, Vector2,
+    graphic_shape, poly_line_node, GraphicShape, ItemHeader, Kiid as ProtoKiid, LibraryIdentifier, LibraryType, Text,
+    Vector2,
 };
 use kicad_ipc::proto::kiapi::schematic::commands::PlaceSymbolFromLibrary;
 use kicad_ipc::proto::kiapi::schematic::types::{
-    LocalLabel, SchematicLine, SchematicLineType, SchematicPin, SchematicSymbol, SchematicSymbolInstance,
-    SchematicSymbolOrientation,
+    Junction, LocalLabel, SchematicGraphicShape, SchematicLabelSpinStyle, SchematicLine, SchematicLineType,
+    SchematicPin, SchematicPinOrientation, SchematicSymbol, SchematicSymbolInstance, SchematicSymbolOrientation,
+    SchematicSymbolTransform, SchematicSymbolType,
 };
 use kicad_ipc::Client;
 use prost::Name;
@@ -142,8 +144,15 @@ impl Session {
                 continue;
             };
             let mut pins = Vec::new();
+            let mut outline: Vec<Point> = Vec::new();
             for child in &sym.items {
                 let Some(item) = &child.item else { continue };
+                if item.type_url == SchematicGraphicShape::type_url() {
+                    if let Ok(shape) = item.to_msg::<SchematicGraphicShape>() {
+                        outline.extend(shape_points(shape.shape.as_ref()));
+                    }
+                    continue;
+                }
                 if item.type_url != SchematicPin::type_url() {
                     continue;
                 }
@@ -151,10 +160,13 @@ impl Session {
                     continue;
                 };
                 let p = pin.position.unwrap_or_default();
+                let local = Point::new(Nm(p.x_nm), Nm(p.y_nm));
                 pins.push(LibraryPin {
+                    outward: outward(pin.orientation, local),
+                    electrical_type: crate::schematic::electrical_type(pin.electrical_type).to_owned(),
                     number: pin.number,
                     name: pin.name,
-                    local: Point::new(Nm(p.x_nm), Nm(p.y_nm)),
+                    local,
                     unit: child.unit.map(|u| u.unit.max(0) as u32).unwrap_or(0),
                 });
             }
@@ -165,12 +177,18 @@ impl Session {
                 .map(|t| t.text.trim_end_matches(['?', '*']).to_owned())
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| "U".into());
+            let is_power = matches!(
+                SchematicSymbolType::try_from(sym.r#type),
+                Ok(SchematicSymbolType::SstGlobalPower | SchematicSymbolType::SstLocalPower)
+            );
             out.insert(
                 library_id.clone(),
                 LibrarySymbol {
                     library_id,
                     reference_prefix: prefix,
                     unit_count: sym.unit_count.max(1),
+                    is_power,
+                    body: Rect::from_points(outline),
                     pins,
                 },
             );
@@ -316,7 +334,14 @@ impl Session {
                 .iter()
                 .find(|n| n.pins.iter().any(|p| format!("{}.{}", p.reference, p.pin) == first));
             let actual: BTreeSet<String> = found
-                .map(|n| n.pins.iter().map(|p| format!("{}.{}", p.reference, p.pin)).collect())
+                .map(|n| {
+                    n.pins
+                        .iter()
+                        .map(|p| format!("{}.{}", p.reference, p.pin))
+                        // Power symbols the layout added (#PWR…) name the net; they are not circuit parts.
+                        .filter(|r| !r.starts_with('#') || expected.pins.contains(r))
+                        .collect()
+                })
                 .unwrap_or_default();
             let name_ok = found.is_some_and(|n| n.name.trim_start_matches('/') == expected.name);
             checks.push(NetCheck {
@@ -428,8 +453,18 @@ async fn update_fields(
     mut symbol: SchematicSymbolInstance,
     value: &str,
     footprint: Option<&str>,
+    mirror: Option<Orientation>,
 ) -> Result<SchematicSymbolInstance, ToolError> {
     let mut paths = vec!["value_field".to_owned()];
+    // Mirroring cannot be set at placement; it goes with the field update, masked to `transform`.
+    if let Some(o) = mirror.filter(|o| o.mirror_x || o.mirror_y) {
+        symbol.transform = Some(SchematicSymbolTransform {
+            orientation: sso(o).unwrap_or(SchematicSymbolOrientation::Sso0 as i32),
+            mirror_x: o.mirror_x,
+            mirror_y: o.mirror_y,
+        });
+        paths.push("transform".into());
+    }
     symbol.definition = None;
     if let Some(t) = symbol.value_field.as_mut().and_then(|f| f.text.as_mut()) {
         t.text = value.into();
@@ -558,7 +593,8 @@ async fn undo(
     ToolError::new(err.code, format!("{} ({note})", err.message)).with_mutation_state(state)
 }
 
-/// Step 1: place every symbol. Returns each placement with the instance KiCad created.
+/// Step 1: place every symbol and power symbol. Returns each component placement with the
+/// instance KiCad created; position, rotation, and reference are read back and checked.
 async fn place_symbols(
     client: &mut Client,
     header: &impl Fn() -> Option<ItemHeader>,
@@ -567,32 +603,43 @@ async fn place_symbols(
 ) -> Result<Vec<(PlacedComponent, SchematicSymbolInstance)>, ToolError> {
     let mut placed = Vec::new();
     for op in &plan.operations {
-        if let Operation::PlaceSymbol {
-            component_id,
-            library_id,
-            reference,
-            position,
-            orientation,
-            ..
-        } = op
+        let (component_id, library_id, reference, position, orientation) = match op {
+            Operation::PlaceSymbol {
+                component_id,
+                library_id,
+                reference,
+                position,
+                orientation,
+                ..
+            } => (Some(component_id), library_id, reference, position, orientation),
+            Operation::PlacePowerSymbol {
+                library_id,
+                reference,
+                position,
+                orientation,
+                ..
+            } => (None, library_id, reference, position, orientation),
+            _ => continue,
+        };
+        let symbol = place(client, header, library_id, reference, *position, *orientation).await?;
+        let id = symbol.id.as_ref().map(|k| k.value.clone()).unwrap_or_default();
+        created.pending.push(id.clone());
+        let info = symbol_info(&symbol)?;
+        let at = Point::new(
+            Nm::from_mm(info.position_mm.x).unwrap_or_default(),
+            Nm::from_mm(info.position_mm.y).unwrap_or_default(),
+        );
+        if info.reference != *reference || at != *position || info.orientation.rotation_deg != orientation.rotation_deg
         {
-            let symbol = place(client, header, library_id, reference, *position, *orientation).await?;
-            let id = symbol.id.as_ref().map(|k| k.value.clone()).unwrap_or_default();
-            created.pending.push(id.clone());
-            let info = symbol_info(&symbol)?;
-            let at = Point::new(
-                Nm::from_mm(info.position_mm.x).unwrap_or_default(),
-                Nm::from_mm(info.position_mm.y).unwrap_or_default(),
-            );
-            if info.reference != *reference || at != *position {
-                return Err(ToolError::new(
-                    ErrorCode::KicadError,
-                    format!(
-                        "{reference} was placed as {} at ({}, {}) mm",
-                        info.reference, info.position_mm.x, info.position_mm.y
-                    ),
-                ));
-            }
+            return Err(ToolError::new(
+                ErrorCode::KicadError,
+                format!(
+                    "{reference} was placed as {} at ({}, {}) mm, rotated {}°",
+                    info.reference, info.position_mm.x, info.position_mm.y, info.orientation.rotation_deg
+                ),
+            ));
+        }
+        if let Some(component_id) = component_id {
             placed.push((
                 PlacedComponent {
                     component_id: component_id.to_string(),
@@ -603,11 +650,19 @@ async fn place_symbols(
             ));
         }
     }
-
     Ok(placed)
 }
 
-/// Step 2: set field values, then add wires and labels.
+fn label_spin(direction: Dir) -> i32 {
+    (match direction {
+        Dir::Left => SchematicLabelSpinStyle::SlssLeft,
+        Dir::Right => SchematicLabelSpinStyle::SlssRight,
+        Dir::Up => SchematicLabelSpinStyle::SlssUp,
+        Dir::Down => SchematicLabelSpinStyle::SlssBottom,
+    }) as i32
+}
+
+/// Step 2: set field values, then add wires, labels, and junctions.
 async fn finish(
     client: &mut Client,
     header: &impl Fn() -> Option<ItemHeader>,
@@ -621,6 +676,7 @@ async fn finish(
             reference,
             value,
             footprint,
+            orientation,
             ..
         } = op
         else {
@@ -630,13 +686,29 @@ async fn finish(
             .iter()
             .find(|(p, _)| p.component_id == component_id.as_str())
             .ok_or_else(|| ToolError::new(ErrorCode::KicadError, format!("{reference} was not placed")))?;
-        let updated = update_fields(client, header, symbol.clone(), value, footprint.as_deref())
-            .await
-            .map_err(|mut e| {
-                e.message = format!("{reference} ({}): {}", p.symbol_id, e.message);
-                e
-            })?;
+        let updated = update_fields(
+            client,
+            header,
+            symbol.clone(),
+            value,
+            footprint.as_deref(),
+            Some(*orientation),
+        )
+        .await
+        .map_err(|mut e| {
+            e.message = format!("{reference} ({}): {}", p.symbol_id, e.message);
+            e
+        })?;
         let info = symbol_info(&updated)?;
+        if !info.orientation.same_effect(*orientation) {
+            return Err(ToolError::new(
+                ErrorCode::KicadError,
+                format!(
+                    "{reference} transform read back as {:?} instead of {:?}",
+                    info.orientation, orientation
+                ),
+            ));
+        }
         if info.value != *value {
             return Err(ToolError::new(
                 ErrorCode::KicadError,
@@ -645,38 +717,45 @@ async fn finish(
         }
     }
 
+    let encode =
+        |m: Result<Any, prost::EncodeError>| m.map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()));
     let mut items = Vec::new();
     let (mut wires, mut labels) = (0, 0);
     for op in &plan.operations {
         match op {
             Operation::AddWire { start, end, .. } => {
                 wires += 1;
-                items.push(
-                    Any::from_msg(&SchematicLine {
-                        start: vector(*start),
-                        end: vector(*end),
-                        r#type: SchematicLineType::SltWire as i32,
-                        ..Default::default()
-                    })
-                    .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?,
-                );
+                items.push(encode(Any::from_msg(&SchematicLine {
+                    start: vector(*start),
+                    end: vector(*end),
+                    r#type: SchematicLineType::SltWire as i32,
+                    ..Default::default()
+                }))?);
             }
-            Operation::AddLabel { net, position } => {
+            Operation::AddLabel {
+                net,
+                position,
+                direction,
+            } => {
                 labels += 1;
-                items.push(
-                    Any::from_msg(&LocalLabel {
+                items.push(encode(Any::from_msg(&LocalLabel {
+                    position: vector(*position),
+                    text: Some(Text {
                         position: vector(*position),
-                        text: Some(Text {
-                            position: vector(*position),
-                            text: net.clone(),
-                            ..Default::default()
-                        }),
+                        text: net.clone(),
                         ..Default::default()
-                    })
-                    .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?,
-                );
+                    }),
+                    spin_style: label_spin(*direction),
+                    ..Default::default()
+                }))?);
             }
-            Operation::PlaceSymbol { .. } => {}
+            Operation::AddJunction { position } => {
+                items.push(encode(Any::from_msg(&Junction {
+                    position: vector(*position),
+                    ..Default::default()
+                }))?);
+            }
+            Operation::PlaceSymbol { .. } | Operation::PlacePowerSymbol { .. } => {}
         }
     }
     if items.is_empty() {
@@ -691,33 +770,107 @@ async fn finish(
         })
         .await
         .map_err(|e| from_ipc_error(&e, true))?;
+    created.pending.extend(
+        r.created_items
+            .iter()
+            .filter_map(|c| c.item.as_ref().and_then(item_kiid)),
+    );
     let ok = r
         .created_items
         .iter()
         .filter(|c| c.status.as_ref().map(|s| s.code) == Some(ItemStatusCode::IscOk as i32))
         .count();
     if ok != expected {
-        // Without a commit, the items that were created must be removed by the undo step.
-        created.committed.extend(
-            r.created_items
-                .iter()
-                .filter_map(|c| c.item.as_ref().and_then(item_kiid)),
-        );
+        let reasons: BTreeSet<String> = r
+            .created_items
+            .iter()
+            .filter_map(|c| c.status.as_ref())
+            .filter(|s| s.code != ItemStatusCode::IscOk as i32)
+            .map(|s| s.error_message.clone())
+            .collect();
         return Err(ToolError::new(
             ErrorCode::KicadError,
-            format!("KiCad created {ok} of {expected} wires and labels"),
+            format!(
+                "KiCad created {ok} of {expected} wires, labels, and junctions: {}",
+                reasons.into_iter().collect::<Vec<_>>().join("; ")
+            ),
         ));
     }
     Ok((wires, labels))
 }
 
-/// The KIID of a created wire or label.
+/// The KIID of a created wire, label, or junction.
 fn item_kiid(any: &Any) -> Option<String> {
     if any.type_url == SchematicLine::type_url() {
         any.to_msg::<SchematicLine>().ok()?.id.map(|k| k.value)
     } else if any.type_url == LocalLabel::type_url() {
         any.to_msg::<LocalLabel>().ok()?.id.map(|k| k.value)
+    } else if any.type_url == Junction::type_url() {
+        any.to_msg::<Junction>().ok()?.id.map(|k| k.value)
     } else {
         None
+    }
+}
+
+/// Direction a pin points away from its symbol, from KiCad's pin orientation: the orientation
+/// names the direction the pin line extends from its connection point into the body, so the
+/// outward direction is the opposite (verified against Device:R in Phase 2).
+fn outward(orientation: i32, local: Point) -> Dir {
+    match SchematicPinOrientation::try_from(orientation) {
+        Ok(SchematicPinOrientation::SpoRight) => Dir::Left,
+        Ok(SchematicPinOrientation::SpoLeft) => Dir::Right,
+        Ok(SchematicPinOrientation::SpoDown) => Dir::Up,
+        Ok(SchematicPinOrientation::SpoUp) => Dir::Down,
+        // Unknown: guess from where the pin sits relative to the symbol origin.
+        _ if local.x.0.abs() >= local.y.0.abs() => {
+            if local.x.0 < 0 {
+                Dir::Left
+            } else {
+                Dir::Right
+            }
+        }
+        _ if local.y.0 < 0 => Dir::Up,
+        _ => Dir::Down,
+    }
+}
+
+/// The points that bound a graphic shape, for the symbol body box.
+fn shape_points(shape: Option<&GraphicShape>) -> Vec<Point> {
+    let pt = |v: &Option<Vector2>| v.as_ref().map(|v| Point::new(Nm(v.x_nm), Nm(v.y_nm)));
+    let Some(geometry) = shape.and_then(|s| s.geometry.as_ref()) else {
+        return vec![];
+    };
+    match geometry {
+        graphic_shape::Geometry::Segment(s) => [pt(&s.start), pt(&s.end)].into_iter().flatten().collect(),
+        graphic_shape::Geometry::Rectangle(r) => [pt(&r.top_left), pt(&r.bottom_right)].into_iter().flatten().collect(),
+        graphic_shape::Geometry::Arc(a) => [pt(&a.start), pt(&a.mid), pt(&a.end)].into_iter().flatten().collect(),
+        graphic_shape::Geometry::Circle(c) => match (pt(&c.center), pt(&c.radius_point)) {
+            (Some(center), Some(edge)) => {
+                let r = Nm((((edge.x.0 - center.x.0) as f64).hypot((edge.y.0 - center.y.0) as f64)) as i64);
+                vec![
+                    Point::new(center.x - r, center.y - r),
+                    Point::new(center.x + r, center.y + r),
+                ]
+            }
+            _ => vec![],
+        },
+        graphic_shape::Geometry::Polygon(set) => set
+            .polygons
+            .iter()
+            .filter_map(|p| p.outline.as_ref())
+            .flat_map(|line| line.nodes.iter())
+            .flat_map(|node| match &node.geometry {
+                Some(poly_line_node::Geometry::Point(p)) => vec![Point::new(Nm(p.x_nm), Nm(p.y_nm))],
+                Some(poly_line_node::Geometry::Arc(a)) => {
+                    [pt(&a.start), pt(&a.mid), pt(&a.end)].into_iter().flatten().collect()
+                }
+                None => vec![],
+            })
+            .collect(),
+        graphic_shape::Geometry::Bezier(b) => [pt(&b.start), pt(&b.control1), pt(&b.control2), pt(&b.end)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        _ => vec![],
     }
 }

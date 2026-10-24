@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "name": "ne555_blinker",
+  "description": "NE555 astable oscillator driving an LED, powered from a 5 V connector.",
+  "components": [
+    { "id": "j1", "library_id": "Connector_Generic:Conn_01x02", "reference_preference": "J1", "value": "5V_IN" },
+    { "id": "c3", "library_id": "Device:C", "reference_preference": "C3", "value": "100nF" },
+    { "id": "u1", "library_id": "Timer:NE555P", "reference_preference": "U1", "value": "NE555P" },
+    { "id": "r1", "library_id": "Device:R", "reference_preference": "R1", "value": "10k" },
+    { "id": "r2", "library_id": "Device:R", "reference_preference": "R2", "value": "47k" },
+    { "id": "c1", "library_id": "Device:C", "reference_preference": "C1", "value": "10uF" },
+    { "id": "c2", "library_id": "Device:C", "reference_preference": "C2", "value": "10nF" },
+    { "id": "r3", "library_id": "Device:R", "reference_preference": "R3", "value": "330" },
+    { "id": "d1", "library_id": "Device:LED", "reference_preference": "D1", "value": "RED" },
+    { "id": "flag_5v", "library_id": "power:PWR_FLAG", "value": "PWR_FLAG" },
+    { "id": "flag_gnd", "library_id": "power:PWR_FLAG", "value": "PWR_FLAG" }
+  ],
+  "nets": [
+    { "name": "+5V", "pins": [
+      { "component_id": "j1", "pin_number": "1" },
+      { "component_id": "c3", "pin_number": "1" },
+      { "component_id": "u1", "pin_number": "8" },
+      { "component_id": "u1", "pin_number": "4" },
+      { "component_id": "r1", "pin_number": "1" },
+      { "component_id": "flag_5v", "pin_number": "1" } ] },
+    { "name": "DISCH", "pins": [
+      { "component_id": "r1", "pin_number": "2" },
+      { "component_id": "r2", "pin_number": "1" },
+      { "component_id": "u1", "pin_number": "7" } ] },
+    { "name": "THR_TRIG", "pins": [
+      { "component_id": "r2", "pin_number": "2" },
+      { "component_id": "u1", "pin_number": "6" },
+      { "component_id": "u1", "pin_number": "2" },
+      { "component_id": "c1", "pin_number": "1" } ] },
+    { "name": "CTRL", "pins": [
+      { "component_id": "u1", "pin_number": "5" },
+      { "component_id": "c2", "pin_number": "1" } ] },
+    { "name": "OUT", "pins": [
+      { "component_id": "u1", "pin_number": "3" },
+      { "component_id": "r3", "pin_number": "1" } ] },
+    { "name": "LED_A", "pins": [
+      { "component_id": "r3", "pin_number": "2" },
+      { "component_id": "d1", "pin_number": "2" } ] },
+    { "name": "GND", "pins": [
+      { "component_id": "j1", "pin_number": "2" },
+      { "component_id": "c3", "pin_number": "2" },
+      { "component_id": "u1", "pin_number": "1" },
+      { "component_id": "c1", "pin_number": "2" },
+      { "component_id": "c2", "pin_number": "2" },
+      { "component_id": "d1", "pin_number": "1" },
+      { "component_id": "flag_gnd", "pin_number": "1" } ] }
+  ],
+  "notes": [
+    "NE555P (extends NE555D): GND 1 bottom; VCC 8 and CONT 5 top; TRIG 2, THRES 6, DISCH 7, RST 4 left; OUT 3 right.",
+    "A layout test for parts attached to an IC on several sides."
+  ]
+}

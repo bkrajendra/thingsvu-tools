@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kicad_cli_runner::KicadInstall;
-use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, LibraryId, Origin, Provenance, ResultState, ToolError};
+use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, Origin, Provenance, ResultState, ToolError};
 use kicad_session::registry::{self, Registration};
 use kicad_session::{OpenTarget, Provider, Session, SessionConfig};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -309,9 +309,7 @@ impl KicadAiServer {
 
     /// Validates, lays out, and stores a plan; returns its client view.
     async fn make_plan(&self, session: &Arc<Session>, spec: CircuitSpec) -> Result<serde_json::Value, ToolError> {
-        let mut ids: Vec<LibraryId> = spec.components.iter().map(|c| c.library_id.clone()).collect();
-        ids.sort();
-        ids.dedup();
+        let ids = kicad_domain::library_ids_for(&spec);
         let library = session.library_symbols(&ids).await?;
         let existing = session.existing_document().await?;
         let plan = plan_circuit(&spec, &library, &existing);

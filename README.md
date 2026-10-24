@@ -42,8 +42,8 @@ It connects to any assistant that speaks the [Model Context Protocol](https://mo
 
 ## Roadmap
 
-- **Now:** schematic inspection and editing, ERC, netlist export, verified demo circuits
-- **Next:** PCB tools, hierarchical schematics, smarter layout, part and BOM assistance
+- **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), ERC, netlist export, verified demo circuits
+- **Next:** KiCad 10 fallback, layout editing tools, PCB tools, hierarchical schematics, part and BOM assistance
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 
 ## Project status

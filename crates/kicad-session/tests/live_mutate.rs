@@ -30,7 +30,7 @@ async fn new_session(name: &str) -> (Session, PathBuf) {
 }
 
 async fn plan_for(session: &Session, spec: &CircuitSpec) -> OperationPlan {
-    let ids: Vec<LibraryId> = spec.components.iter().map(|c| c.library_id.clone()).collect();
+    let ids = kicad_domain::library_ids_for(spec);
     let library = session.library_symbols(&ids).await.unwrap();
     plan_circuit(spec, &library, &session.existing_document().await.unwrap())
 }

@@ -82,20 +82,40 @@ pub fn operation_view(op: &Operation) -> Value {
         Operation::AddWire { net, start, end } => json!({
             "op": "add_wire", "net": net, "start_mm": mm(*start), "end_mm": mm(*end),
         }),
-        Operation::AddLabel { net, position } => json!({
-            "op": "add_label", "net": net, "position_mm": mm(*position),
+        Operation::AddLabel {
+            net,
+            position,
+            direction,
+        } => json!({
+            "op": "add_label", "net": net, "position_mm": mm(*position), "direction": direction,
         }),
+        Operation::PlacePowerSymbol {
+            net,
+            library_id,
+            reference,
+            position,
+            orientation,
+        } => json!({
+            "op": "place_power_symbol",
+            "net": net,
+            "library_id": library_id.to_string(),
+            "reference": reference,
+            "position_mm": mm(*position),
+            "rotation_deg": orientation.rotation_deg,
+        }),
+        Operation::AddJunction { position } => json!({ "op": "add_junction", "position_mm": mm(*position) }),
     }
 }
 
 pub fn plan_view(plan_id: &str, plan: &OperationPlan) -> Value {
-    let (symbols, wires, labels) = plan.count();
     let can_apply = !kicad_domain::validation::has_errors(&plan.findings);
     json!({
         "plan_id": plan_id,
         "circuit": plan.circuit,
         "can_apply": can_apply,
-        "counts": { "symbols": symbols, "wires": wires, "labels": labels },
+        "counts": plan.counts(),
+        "fallback_nets": plan.fallback_nets,
+        "readability": plan.readability,
         "references": plan.references,
         "findings": plan.findings,
         "operations": plan.operations.iter().map(operation_view).collect::<Vec<_>>(),
