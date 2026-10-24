@@ -16,3 +16,5 @@ Expected connectivity for `two-resistor-series-chain` (from `kicad-cli sch expor
 | `/OUTPUT` | R2.2 |
 
 ERC (`kicad-cli sch erc --severity-all`): 2 warnings, `isolated_pin_label` on INPUT and OUTPUT. This is expected, because those nets have one pin each.
+
+Known artifact: the probe set values by sending each whole symbol back through `UpdateItems`, so `two-resistor-series-chain` also contains a duplicate library symbol `R_1`, and its netlist reports `libsource` `:R_1`. Regenerate the fixture once value updates send only the changed field (tracked in `docs/tasks.md`, task 1.4).

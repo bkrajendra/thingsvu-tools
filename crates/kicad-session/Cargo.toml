@@ -1,0 +1,25 @@
+[package]
+name = "kicad-session"
+description = "KiCad sessions: headless api-server lifecycle, capability mapping, and serialized access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kicad-cli-runner = { path = "../kicad-cli-runner" }
+kicad-domain = { path = "../kicad-domain" }
+kicad-ipc = { path = "../kicad-ipc" }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "sync"] }
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+
+[dev-dependencies]
+kicad-ipc-mock = { path = "../kicad-ipc-mock" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }

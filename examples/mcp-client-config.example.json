@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kicad-ai": {
+      "command": "D:\\projects\\thingsvu-tools\\target\\release\\kicad-ai-mcp.exe",
+      "args": [],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

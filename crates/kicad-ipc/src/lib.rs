@@ -6,6 +6,7 @@
 //!   (REQ0 over the NNG ipc transport: a Windows named pipe or a Unix domain socket).
 //! - [`Client`]: request/reply with the KiCad envelope, instance-token pinning and status mapping.
 
+pub mod capabilities;
 pub mod client;
 pub mod transport;
 

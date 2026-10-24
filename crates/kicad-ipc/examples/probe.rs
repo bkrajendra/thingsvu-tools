@@ -3,7 +3,7 @@
 //! connectivity from KiCad's own netlist.
 //!
 //! ```text
-//! cargo run -p kicad-ipc --example probe -- <socket path> [basic|demo|gui|revert] [output dir]
+//! cargo run -p kicad-ipc --example probe -- <socket path> [basic|capabilities|demo|gui|revert|lifecycle] [output dir]
 //! ```
 //!
 //! - `basic`: version and open documents.
@@ -209,6 +209,11 @@ async fn main() -> Result<()> {
         kicad.instance_token().is_some()
     );
 
+    if scenario == "capabilities" {
+        let report = kicad_ipc::capabilities::probe(&mut kicad).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if scenario == "lifecycle" {
         return lifecycle(&mut kicad, &out_dir.ok_or("lifecycle needs an output dir")?).await;
     }

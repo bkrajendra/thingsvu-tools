@@ -1,0 +1,67 @@
+{
+    "$schema": "https://schemas.kicad.org/erc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-10-24T15:08:10",
+    "ignored_checks": [
+        {
+            "description": "Global label only appears once in the schematic",
+            "key": "single_global_label"
+        },
+        {
+            "description": "Four connection points are joined together",
+            "key": "four_way_junction"
+        },
+        {
+            "description": "SPICE model issue",
+            "key": "simulation_model_issue"
+        },
+        {
+            "description": "Assigned footprint doesn't match footprint filters",
+            "key": "footprint_filter"
+        }
+    ],
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "10.99.0",
+    "sheets": [
+        {
+            "path": "/",
+            "uuid_path": "/676e26d5-b204-462a-9ea2-e7f371842562",
+            "violations": [
+                {
+                    "description": "Label connected to only one pin",
+                    "items": [
+                        {
+                            "description": "Label 'INPUT'",
+                            "pos": {
+                                "x": 50.8,
+                                "y": 46.99
+                            },
+                            "uuid": "26348d53-8a4c-4bbe-94a3-3fe869d9c69f"
+                        }
+                    ],
+                    "severity": "warning",
+                    "type": "isolated_pin_label"
+                },
+                {
+                    "description": "Label connected to only one pin",
+                    "items": [
+                        {
+                            "description": "Label 'OUTPUT'",
+                            "pos": {
+                                "x": 50.8,
+                                "y": 67.31
+                            },
+                            "uuid": "03f740aa-c123-4849-84fe-0a2160897887"
+                        }
+                    ],
+                    "severity": "warning",
+                    "type": "isolated_pin_label"
+                }
+            ]
+        }
+    ],
+    "source": "kicad-demo.kicad_sch"
+}

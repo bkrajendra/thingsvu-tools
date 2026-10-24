@@ -231,8 +231,10 @@ thingsvu-tools/
 │   ├── plugin.json                      # KiCad 11 manifest (schematic + pcb scopes)
 │   └── README.md
 ├── crates/
-│   ├── kicad-ai-mcp/                    # bin: MCP stdio server
-│   │   └── src/{main,server,tools,backend_select,headless,bridge_client,logging}.rs
+│   ├── kicad-ai-mcp/                    # bin + lib: MCP stdio server (tools, result envelope)
+│   │   └── src/{main,lib,server,envelope}.rs
+│   ├── kicad-session/                   # lib: session providers (headless first), capability
+│   │   └── src/{session,headless,job,capability_map,errors}.rs   # mapping, serialized access
 │   ├── kicad-ai-plugin/                 # bin: KiCad 11 exec plugin / bridge
 │   │   └── src/{main,lifecycle,local_server,config}.rs
 │   ├── kicad-domain/                    # lib: IR, plans, validation, capabilities
@@ -245,7 +247,7 @@ thingsvu-tools/
 │   │   └── src/{lib,parse,write,schematic,atomic,lock}.rs
 │   ├── kicad-cli-runner/                # lib: kicad-cli jobs and report parsing
 │   │   └── src/{lib,install,erc,netlist,export,diff}.rs
-│   └── kicad-ipc-mock/                  # dev lib: inproc NNG responder for tests
+│   └── kicad-ipc-mock/                  # dev lib: fake KiCad API server on a real pipe/socket
 ├── tests/
 │   ├── fixtures/{v10,v11}/              # KiCad-authored files per version
 │   ├── mcp_protocol.rs
