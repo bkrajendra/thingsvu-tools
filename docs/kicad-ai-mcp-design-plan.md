@@ -156,6 +156,7 @@ Rules:
 - Never attach to a socket the current user does not own.
 - Never open a raw stream connection to an NNG endpoint for discovery. A connection that does not complete the NNG handshake can wedge KiCad's server; Windows named pipes also consume a server instance.
 - The headless child is owned by the MCP process: killed on MCP exit, deadline, or provider shutdown; never orphaned.
+- Headless sessions do not preload libraries. Session start issues `LoadAllLibraries` (symbol type) and the session reports "libraries loading" until the libraries a plan needs are available; placement before that fails with `AS_BAD_REQUEST` ("symbol … not found"). In GUI sessions the command is a no-op.
 - One provider per target document at a time. A document open in a GUI must not also be mutated through a headless server or the file backend.
 
 ### 3.2 Backends and capability model
@@ -652,7 +653,7 @@ Probe matrix:
 
 Exit criteria: every row recorded as supported / unsupported / failing, with captured request/response logs; proto commit and checksums recorded; license confirmed as GPL-3.0-or-later. **Do not proceed** to Phase 2 until the headless column passes.
 
-Open item from environment validation: `kicad-cli api-server --socket <path>` started and stayed alive, but no matching entry appeared in the Windows pipe namespace listing. Determine the actual endpoint naming (with and without `--socket`) using an NNG client, not a raw pipe open.
+First results (24 Oct 2026, nightly headless, default socket): NNG handshake, `GetVersion`, and `Ping` succeed over the named pipe `\\.\pipe\<socket path>`; the pipe does not appear in a pipe-namespace listing, so discovery derives the name from the socket path. Document commands return `AS_UNHANDLED` when the server has no loaded project. Next: repeat with a pre-loaded project and with `--socket`.
 
 ### Phase 1 — Foundations
 `kicad-domain` (IR, plans, result states, capabilities), `kicad-ipc` (envelope, status mapping, serialized client), `kicad-ipc-mock`, `kicad-cli-runner` (install discovery, ERC JSON, netlist). Headless provider lifecycle. MCP skeleton with `session_status` and `session_open`.
