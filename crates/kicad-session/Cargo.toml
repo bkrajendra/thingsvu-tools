@@ -11,6 +11,8 @@ rust-version.workspace = true
 kicad-cli-runner = { path = "../kicad-cli-runner" }
 kicad-domain = { path = "../kicad-domain" }
 kicad-ipc = { path = "../kicad-ipc" }
+prost.workspace = true
+prost-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "sync"] }

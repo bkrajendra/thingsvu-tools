@@ -345,11 +345,13 @@ async fn main() -> Result<()> {
         symbols.push(symbol);
     }
 
-    // Values: full-object update of each placed instance with an edited value field.
+    // Values: send each instance without its embedded library definition and with a field mask,
+    // so only the value changes (a full-object batch duplicated the library symbol headless).
     let updates = symbols
         .iter()
         .map(|s| {
             let mut s = s.clone();
+            s.definition = None;
             if let Some(text) = s.value_field.as_mut().and_then(|f| f.text.as_mut()) {
                 text.text = "10k".into();
             }
@@ -358,7 +360,13 @@ async fn main() -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let updated: UpdateItemsResponse = kicad
         .call(&UpdateItems {
-            header: header(),
+            header: Some(ItemHeader {
+                document: Some(doc.clone()),
+                field_mask: Some(prost_types::FieldMask {
+                    paths: vec!["value_field".into()],
+                }),
+                ..Default::default()
+            }),
             items: updates,
         })
         .await?;

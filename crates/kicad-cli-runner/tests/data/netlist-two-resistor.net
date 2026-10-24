@@ -2,7 +2,7 @@
 	(version "E")
 	(design
 		(source "kicad-demo.kicad_sch")
-		(date "2026-10-24T15:08:07")
+		(date "2026-10-24T17:53:51")
 		(tool "Eeschema 10.99.0-5896-gd033635628")
 		(sheet
 			(number "1")
@@ -69,8 +69,8 @@
 					(name "Description") "Resistor")
 			)
 			(libsource
-				(lib "")
-				(part "R_1")
+				(lib "Device")
+				(part "R")
 				(description "Resistor")
 			)
 			(property
@@ -93,7 +93,7 @@
 				(names "/")
 				(tstamps "/")
 			)
-			(tstamps "3360cc7e-0b79-4cc8-98fb-4b669e7815d3")
+			(tstamps "e7c51afb-ef84-47c1-b2eb-8f261cbb1e7d")
 			(units
 				(unit
 					(name "A")
@@ -147,7 +147,7 @@
 				(names "/")
 				(tstamps "/")
 			)
-			(tstamps "a8755b44-655d-4d84-bc4e-de56d7909e3f")
+			(tstamps "55b45285-6de2-4ece-980b-0251804c1574")
 			(units
 				(unit
 					(name "A")
@@ -166,40 +166,6 @@
 	(groups)
 	(variants)
 	(libparts
-		(libpart
-			(lib "")
-			(part "R_1")
-			(description "Resistor")
-			(footprints
-				(fp "R_*")
-			)
-			(fields
-				(field
-					(name "Reference") "R")
-				(field
-					(name "Value") "R")
-				(field
-					(name "Footprint")
-				)
-				(field
-					(name "Datasheet")
-				)
-				(field
-					(name "Description") "Resistor")
-			)
-			(pins
-				(pin
-					(num "1")
-					(name "")
-					(type "passive")
-				)
-				(pin
-					(num "2")
-					(name "")
-					(type "passive")
-				)
-			)
-		)
 		(libpart
 			(lib "Device")
 			(part "R")

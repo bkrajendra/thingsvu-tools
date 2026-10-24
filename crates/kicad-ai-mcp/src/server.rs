@@ -79,6 +79,21 @@ pub struct CloseArgs {
     pub discard_unsaved: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolPinsArgs {
+    pub session_id: String,
+    /// Symbol id (UUID from sch_list_symbols), or a reference such as R1 that matches exactly
+    /// one symbol. Prefer the id: references can change when a schematic is re-annotated.
+    pub symbol: String,
+}
+
 #[derive(Serialize)]
 struct InstallInfo<'a> {
     cli: String,
@@ -96,6 +111,17 @@ fn provenance(status: &kicad_session::SessionStatus) -> Provenance {
         document: status.document.as_ref().map(|d| d.display().to_string()),
         revision: None,
     }
+}
+
+/// Provenance for data read live from a session's KiCad.
+fn live(session: &Session) -> Vec<Provenance> {
+    vec![Provenance {
+        origin: Origin::KicadIpc,
+        kicad_version: Some(session.kicad_version().to_owned()),
+        provider: Some("headless".into()),
+        document: Some(session.document_path().display().to_string()),
+        revision: None,
+    }]
 }
 
 impl KicadAiServer {
@@ -244,6 +270,83 @@ changes unless discard_unsaved is true."
                     vec![],
                 )
             }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "session_list_documents",
+        description = "Documents open in the session's KiCad instance (schematics and boards), as KiCad reports them."
+    )]
+    pub async fn session_list_documents(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        match self.session(&args.session_id).await {
+            Ok(session) => match session.open_documents().await {
+                Ok(docs) => envelope::ok(&cid, serde_json::json!({ "documents": docs }), live(&session), vec![]),
+                Err(e) => envelope::error(&cid, &e),
+            },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_list_symbols",
+        description = "Every placed symbol in the session's schematic: id (stable UUID), reference, value, \
+library id, footprint, position in mm, orientation, unit, and sheet path. Read live from KiCad."
+    )]
+    pub async fn sch_list_symbols(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        match self.session(&args.session_id).await {
+            Ok(session) => match session.list_symbols().await {
+                Ok(symbols) => envelope::ok(
+                    &cid,
+                    serde_json::json!({ "count": symbols.len(), "symbols": symbols }),
+                    live(&session),
+                    vec![],
+                ),
+                Err(e) => envelope::error(&cid, &e),
+            },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_get_symbol_pins",
+        description = "Pins of one symbol: number, name, electrical type, and connection point on the sheet \
+in mm (after the symbol's rotation and mirroring). Wires must end exactly on these points to connect."
+    )]
+    pub async fn sch_get_symbol_pins(&self, Parameters(args): Parameters<SymbolPinsArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        match self.session(&args.session_id).await {
+            Ok(session) => match session.symbol_pins(&args.symbol).await {
+                Ok(pins) => envelope::ok(&cid, pins, live(&session), vec![]),
+                Err(e) => envelope::error(&cid, &e),
+            },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_get_netlist",
+        description = "Connectivity as KiCad's netlister sees it: each net with its symbol pins (reference, \
+pin number, symbol id) and a count of other connected items such as wires and labels. Use it to verify that \
+intended connections really exist."
+    )]
+    pub async fn sch_get_netlist(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        match self.session(&args.session_id).await {
+            Ok(session) => match session.netlist().await {
+                Ok(nets) => {
+                    let unconnected = nets.iter().filter(|n| n.name.starts_with("unconnected-")).count();
+                    envelope::ok(
+                        &cid,
+                        serde_json::json!({ "count": nets.len(), "unconnected_pins": unconnected, "nets": nets }),
+                        live(&session),
+                        vec![],
+                    )
+                }
+                Err(e) => envelope::error(&cid, &e),
+            },
             Err(e) => envelope::error(&cid, &e),
         }
     }

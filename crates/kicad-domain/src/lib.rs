@@ -9,6 +9,7 @@ pub mod circuit;
 pub mod geometry;
 pub mod ids;
 pub mod result;
+pub mod schematic;
 pub mod validation;
 
 pub use capability::{Backend, Capability, CapabilitySet, Support};
@@ -16,4 +17,5 @@ pub use circuit::{CircuitSpec, ComponentSpec, NetSpec, PinRef};
 pub use geometry::{Nm, Orientation, Point, GRID};
 pub use ids::{IdError, Kiid, LibraryId, LogicalId};
 pub use result::{ErrorCode, MutationState, Origin, Provenance, ResultState, ToolError};
+pub use schematic::{NetInfo, NetPin, PinInfo, PointMm, SymbolInfo, SymbolPins};
 pub use validation::{validate_circuit, Finding, Severity};

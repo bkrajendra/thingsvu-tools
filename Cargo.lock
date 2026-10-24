@@ -415,6 +415,8 @@ dependencies = [
  "kicad-domain",
  "kicad-ipc",
  "kicad-ipc-mock",
+ "prost",
+ "prost-types",
  "serde",
  "serde_json",
  "thiserror",

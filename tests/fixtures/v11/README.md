@@ -5,7 +5,7 @@ Files written by KiCad itself (10.99 nightly `10.99.0-5896-gd033635628`, schemat
 | Fixture | Source |
 |---|---|
 | `empty-schematic/` | New project created in the 10.99 GUI |
-| `two-resistor-series-chain/` | `empty-schematic` after `scripts/probe-kicad.ps1 -Scenario demo`, saved with `SaveCopyOfDocument` through the headless API server |
+| `two-resistor-series-chain/` | `empty-schematic` after the Rust probe `demo` scenario on the headless server. Values were set with `UpdateItems` without the embedded library definition and with field mask `value_field`. One library symbol (`Device:R`); R1 and R2 are `10k` |
 
 Expected connectivity for `two-resistor-series-chain` (from `kicad-cli sch export netlist`, matching `docs/examples/two-resistor-series-chain.json`):
 
@@ -17,4 +17,4 @@ Expected connectivity for `two-resistor-series-chain` (from `kicad-cli sch expor
 
 ERC (`kicad-cli sch erc --severity-all`): 2 warnings, `isolated_pin_label` on INPUT and OUTPUT. This is expected, because those nets have one pin each.
 
-Known artifact: the probe set values by sending each whole symbol back through `UpdateItems`, so `two-resistor-series-chain` also contains a duplicate library symbol `R_1`, and its netlist reports `libsource` `:R_1`. Regenerate the fixture once value updates send only the changed field (tracked in `docs/tasks.md`, task 1.4).
+History: earlier versions of this fixture were wrong. The first headless one duplicated the library symbol (`R_1`) because whole symbols were sent back in one batch. A GUI-saved one kept Value `R` although `UpdateItems` replied `10k`. Replaced on 24 Oct 2026; see `docs/tasks.md` (tasks 1.4 and 2.6).

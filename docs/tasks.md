@@ -65,9 +65,9 @@ Exit criteria (plan §14): unit and protocol tests green on Windows CI; `session
   - Inputs reject unknown fields.
   - `--kicad-cli <path>` prefers a specific CLI. Release binary is 4.5 MB.
   - **Review:** the protocol test negotiates MCP `2025-11-25`, the newest version that still has `initialize`; rmcp also supports `2026-07-28`.
-- [~] **1.7 End-to-end check** — passed with a scripted MCP client over stdio driving the real binary: handshake, tool list, error envelopes, only protocol messages on stdout, and a live headless open/status/close on the nightly. Client setup is in `examples/README.md`.
-  - **Attention:** check with a real MCP host (Claude Code or Claude Desktop), which cannot be run from inside the development session. Steps are in `examples/README.md`.
-- [~] **1.8 CI** — `.github/workflows/ci.yml`: Windows job (fmt, clippy `-D warnings`, tests) and a Linux job (build and tests, `continue-on-error`). The same commands pass locally. The first hosted run happens on the next push.
+- [x] **1.7 End-to-end check** — passed with a scripted MCP client over stdio driving the real binary: handshake, tool list, error envelopes, only protocol messages on stdout, and a live headless open/status/close on the nightly. Client setup is in `examples/README.md`.
+  - Confirmed by the project owner with a real MCP host: `kicad-ai` added to Claude, `session_open` and `session_close` worked (24 Oct 2026).
+- [x] **1.8 CI** — `.github/workflows/ci.yml`: Windows job (fmt, clippy `-D warnings`, tests) and a Linux job (build and tests, `continue-on-error`). First hosted run (`0ead3d2`): both jobs passed, Linux included.
   - **Review:** the Linux job is informational only. The Unix code paths (Unix sockets, no job object) compile in principle but have not been run.
 
 ---
@@ -76,9 +76,34 @@ Exit criteria (plan §14): unit and protocol tests green on Windows CI; `session
 
 Exit criteria (plan §14): read tools on IPC whose results agree with KiCad-authored fixtures.
 
-- [ ] **2.1 `sch_list_symbols`** — UUID, reference, value, library id, position (mm), sheet path, with provenance.
-- [ ] **2.2 `sch_get_symbol_pins`** — pin number/name/type and world position for one symbol (UUID, or an unambiguous reference).
-- [ ] **2.3 `sch_get_netlist`** — nets as (symbol, reference, pin) tuples, mapped from KiCad's pin KIIDs.
-- [ ] **2.4 `session_list_documents`** — open documents per session.
-- [ ] **2.5 Verify orientation transforms** — compare `Orientation::apply` with KiCad read-back for rotated and mirrored symbols (follow-up from 1.1).
-- [ ] **2.6 Fixture refresh** — regenerate `two-resistor-series-chain` without the duplicate `R_1` library symbol, once field-only updates exist (follow-up from 1.4; may move to Phase 3).
+- [x] **2.1 `sch_list_symbols`** — `GetItems(KOT_SCH_SYMBOL)` mapped to id, reference, value, library id, footprint, position (mm), orientation, unit, sheet path; sorted naturally (R2 before R10); provenance `kicad_ipc`.
+  - **Review:** reads the document's root sheet only (the `DocumentSpecifier` from `OpenDocument` has no sheet path). Hierarchical sheets are out of MVP scope; revisit when multi-sheet support starts.
+- [x] **2.2 `sch_get_symbol_pins`** — pins of the symbol's unit (unit 0 = shared), with number, name, electrical type, connection point on the sheet, and the symbol-local point. Selector is a KIID, or a reference matching exactly one symbol; otherwise `SYMBOL_NOT_FOUND`, or `INVALID_ARGUMENT` listing the candidate ids.
+  - **Review:** body styles (De Morgan alternates) are not filtered yet; every pin of the unit is returned.
+- [x] **2.3 `sch_get_netlist`** — `GetSchematicNetlist`, with pin KIIDs resolved through every instance's pins to (reference, pin, symbol id). Wires, labels, and other items are counted per net. The result includes an `unconnected_pins` count (nets KiCad names `unconnected-…`).
+- [x] **2.4 `session_list_documents`** — schematic and PCB documents from `GetOpenDocuments`; editor types with nothing open are skipped.
+- [x] **2.5 Verify orientation transforms** — live test with `Device:Q_NPN` (pins B/C/E, asymmetric) in 4 rotations × {none, mirror_x, mirror_y}. A label placed where our transform puts each pin touches exactly that pin in KiCad's netlist, for all 36 pins. `Orientation::apply` is correct for KiCad's read-back transforms.
+  - **Attention (Phase 3):** KiCad stores transforms in its own normalized form, and setting one by `UpdateItems` is not straightforward: requesting 180° + `mirror_x` read back as identity, and 90° + `mirror_y` read back as 270° + `mirror_x`. Phase 3 must check every transform it writes by reading it back, and should place symbols with the rotation set at placement time.
+- [x] **2.6 Fixture refresh** — `two-resistor-series-chain` regenerated headless: one library symbol `Device:R`, R1/R2 = `10k`, netlist parts `R`, ERC unchanged (2 expected warnings). CLI test data regenerated from it, and the netlist test now fails if a duplicate library symbol appears.
+  - **Finding (feeds Phase 3):** how `UpdateItems` behaves when setting a value:
+    - Sending the whole symbol (embedded library definition included) for two instances in one headless batch created a duplicate library symbol `R_1`.
+    - The same request in a GUI commit replied `10k` but the saved file kept `R`.
+    - Sending the instance without `definition` and with field mask `value_field` works headless for one and for two symbols. The probe now does this.
+    - **Attention:** the GUI path for value updates is not yet verified with the new form; Phase 3 must test it.
+
+Phase 2 exit check: met. The read tools agree with the KiCad-authored fixture, both through `kicad-session` (`tests/live_read.rs`) and through the MCP binary (`kicad-ai-mcp/tests/stdio.rs`, `live_read_tools_on_the_fixture`).
+
+---
+
+## Phase 3 — KiCad 11 mutation path (headless first)
+
+Exit criteria (plan §14): all Tier 1 headless acceptance criteria (plan §9). The two-resistor demo goes end to end through MCP tools.
+
+- [ ] **3.1 `OperationPlan`** in `kicad-domain` — ordered operations with preconditions, document identity, and limits (plan §7.2, §10).
+- [ ] **3.2 Layout for `CircuitSpec`** — deterministic grid placement; wires and labels on computed pin points.
+- [ ] **3.3 `sch_plan_changes`** — validate and return a plan id; nothing is applied.
+- [ ] **3.4 `sch_apply_plan`** — `confirm: true` plus idempotency key. One commit in GUI sessions; a recorded sequence with cleanup on failure headless. Read back after applying.
+- [ ] **3.5 Field updates** — `UpdateItems` without `definition`, with a field mask; verify in GUI and headless that no duplicate library symbol appears and the value persists (follow-up from 2.6).
+- [ ] **3.6 Transforms** — set rotation at placement; check any transform written by `UpdateItems` by reading it back (follow-up from 2.5).
+- [ ] **3.7 `sch_save`, `sch_run_erc`, `sch_export_netlist`, `sch_render`.**
+- [ ] **3.8 `sch_create_demo_circuit`** — the two-resistor fixture as plan → apply → verify through MCP.

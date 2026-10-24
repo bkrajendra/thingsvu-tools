@@ -74,15 +74,15 @@ pub struct Session {
     kicad_version: String,
     fingerprint: Option<String>,
     document_path: PathBuf,
-    document: DocumentSpecifier,
+    pub(crate) document: DocumentSpecifier,
     capabilities: CapabilitySet,
     cli: Option<KicadInstall>,
-    inner: Mutex<Inner>,
+    pub(crate) inner: Mutex<Inner>,
 }
 
 /// Everything that talks to KiCad sits behind one lock, so requests are strictly serialized.
-struct Inner {
-    client: Client,
+pub(crate) struct Inner {
+    pub(crate) client: Client,
     server: HeadlessServer,
 }
 
@@ -262,6 +262,23 @@ impl Session {
 
     pub fn capabilities(&self) -> &CapabilitySet {
         &self.capabilities
+    }
+
+    /// Direct access to the session's KiCad client, for tests and probes only. Normal callers use
+    /// the typed operations, which enforce capabilities and serialization.
+    #[doc(hidden)]
+    pub async fn raw_client(&self) -> tokio::sync::MappedMutexGuard<'_, Client> {
+        tokio::sync::MutexGuard::map(self.inner.lock().await, |inner| &mut inner.client)
+    }
+
+    /// The document identifier KiCad assigned when the session opened.
+    #[doc(hidden)]
+    pub fn document_specifier(&self) -> &DocumentSpecifier {
+        &self.document
+    }
+
+    pub fn kicad_version(&self) -> &str {
+        &self.kicad_version
     }
 
     pub fn document_path(&self) -> &Path {

@@ -149,6 +149,12 @@ mod tests {
             .map(|c| (c.reference.as_str(), c.value.as_str()))
             .collect();
         assert_eq!(refs, [("R1", "10k"), ("R2", "10k")]);
+        // A duplicated library symbol would show up here as ":R_1".
+        assert!(
+            netlist.components.iter().all(|c| c.lib_source == "Device:R"),
+            "{:?}",
+            netlist.components
+        );
         let expected: BTreeSet<(String, BTreeSet<String>)> = [
             ("/INPUT", vec!["R1.1"]),
             ("/MID", vec!["R1.2", "R2.1"]),

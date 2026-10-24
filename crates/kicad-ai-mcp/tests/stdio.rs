@@ -96,7 +96,18 @@ async fn lists_tools_and_returns_envelopes() {
         .map(|t| t["name"].as_str().unwrap().to_owned())
         .collect();
     names.sort();
-    assert_eq!(names, ["session_close", "session_open", "session_status"]);
+    assert_eq!(
+        names,
+        [
+            "sch_get_netlist",
+            "sch_get_symbol_pins",
+            "sch_list_symbols",
+            "session_close",
+            "session_list_documents",
+            "session_open",
+            "session_status"
+        ]
+    );
 
     let status = mcp.call("session_status", json!({})).await;
     assert_eq!(status["ok"], true, "{status}");
@@ -165,4 +176,81 @@ async fn live_headless_session_round_trip() {
     assert_eq!(closed["ok"], true, "{closed}");
     let after = mcp.call("session_status", json!({ "session_id": id })).await;
     assert_eq!(after["error"]["code"], "NO_SESSION");
+}
+
+#[tokio::test]
+async fn live_read_tools_on_the_fixture() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/v11/two-resistor-series-chain");
+    for file in ["kicad-demo.kicad_sch", "kicad-demo.kicad_pro"] {
+        std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
+    }
+
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": dir.join("kicad-demo.kicad_sch") }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert_eq!(symbols["ok"], true, "{symbols}");
+    assert_eq!(symbols["result"]["count"], 2);
+    let r1 = &symbols["result"]["symbols"][0];
+    assert_eq!(
+        (
+            r1["reference"].as_str(),
+            r1["value"].as_str(),
+            r1["library_id"].as_str()
+        ),
+        (Some("R1"), Some("10k"), Some("Device:R"))
+    );
+    assert_eq!(r1["position_mm"], json!({ "x": 50.8, "y": 50.8 }));
+    assert_eq!(symbols["provenance"][0]["origin"], "kicad_ipc");
+
+    let pins = mcp
+        .call("sch_get_symbol_pins", json!({ "session_id": id, "symbol": r1["id"] }))
+        .await;
+    assert_eq!(
+        pins["result"]["pins"][0]["position_mm"],
+        json!({ "x": 50.8, "y": 46.99 }),
+        "{pins}"
+    );
+    let ambiguous = mcp
+        .call("sch_get_symbol_pins", json!({ "session_id": id, "symbol": "R7" }))
+        .await;
+    assert_eq!(ambiguous["error"]["code"], "SYMBOL_NOT_FOUND");
+
+    let netlist = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert_eq!(netlist["result"]["count"], 3, "{netlist}");
+    assert_eq!(netlist["result"]["unconnected_pins"], 0);
+    let mid = netlist["result"]["nets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "/MID")
+        .unwrap();
+    let mid_pins: Vec<String> = mid["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| format!("{}.{}", p["reference"].as_str().unwrap(), p["pin"].as_str().unwrap()))
+        .collect();
+    assert_eq!(mid_pins, ["R1.2", "R2.1"]);
+
+    let docs = mcp.call("session_list_documents", json!({ "session_id": id })).await;
+    assert_eq!(docs["ok"], true, "{docs}");
+
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
 }
