@@ -157,6 +157,8 @@ Rules:
 - Never open a raw stream connection to an NNG endpoint for discovery. A connection that does not complete the NNG handshake can wedge KiCad's server; Windows named pipes also consume a server instance.
 - The headless child is owned by the MCP process: killed on MCP exit, deadline, or provider shutdown; never orphaned.
 - Headless sessions do not preload libraries. Session start issues `LoadAllLibraries` (symbol type) and the session reports "libraries loading" until the libraries a plan needs are available; placement before that fails with `AS_BAD_REQUEST` ("symbol … not found"). In GUI sessions the command is a no-op.
+- The headless server prints no readiness line when its output is redirected. The provider detects readiness by polling connect + `Ping` within a deadline.
+- Headless sessions do not handle `BeginCommit`/`EndCommit` (observed on the pinned nightly). Each request applies immediately, so a plan applied headless is not atomic: the apply step records every created/updated KIID as it goes; on a mid-plan failure it removes the items it created, reports `result_state: partial` with the applied and not-applied operations, and requires read-back before anything else runs. GUI sessions use a commit when KiCad supports it.
 - One provider per target document at a time. A document open in a GUI must not also be mutated through a headless server or the file backend.
 
 ### 3.2 Backends and capability model
@@ -269,7 +271,7 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 
 ### 5.2 KiCad IPC adapter (`kicad-ipc`)
 - `prost` / `prost-build` code generated from the vendored protos. Record commit and SHA-256 per file.
-- NNG via a maintained Rust binding (`nng` crate) or direct FFI. Prove request/reply, deadlines, and Windows named-pipe addressing in the Phase 0 spike.
+- NNG transport implemented natively in Rust (decision from Phase 0): KiCad needs only the REQ0 side of NNG's ipc transport, which is small and was verified on the wire — an 8-byte SP header exchange (`00 'S' 'P' 00 00 30 00 00` ↔ `… 00 31 …`), then frames of `0x01` + u64 big-endian length + body, where the body starts with a 4-byte request ID (high bit set) that the reply echoes. Windows: `tokio` named pipe `\\.\pipe\<socket path>`; Unix: Unix domain socket at the socket path. One outstanding request per connection. This removes the C NNG library and CMake from the build. Keep it behind a `Transport` trait so a binding to the C library can be swapped in if a KiCad version needs NNG features beyond this subset.
 - Typed envelope with `client_name` (`thingsvu-kicad-ai-<pid>`) and pinned `kicad_token` after the first reply.
 - Map every `ApiStatusCode` to a typed error: `AS_BUSY`/`AS_NOT_READY` → retryable; `AS_UNHANDLED`/`AS_UNIMPLEMENTED` → `FEATURE_UNAVAILABLE`; `AS_TOKEN_MISMATCH` → `KICAD_INSTANCE_CHANGED`; `AS_BAD_REQUEST` → non-retryable.
 - One serialized request channel per session with a bounded queue; a deadline on every request; no blind retries of mutations.
@@ -365,7 +367,7 @@ Later: `sch_move_symbol`, `sch_set_field`, `sch_add_power_symbol`, `sch_remove_i
 3. Plan and apply are separate. A plan records session, document identity, and a document revision/hash; it is `STALE_PLAN` if any change.
 4. Idempotency key on every apply; a repeated key returns the earlier result.
 5. Success is derived from read-back, never from the request echo.
-6. Prefer high-level batches; one apply = one KiCad commit = one undo step (IPC).
+6. Prefer high-level batches. In GUI sessions one apply = one KiCad commit = one undo step where KiCad supports commits; in headless sessions (no commit support) an apply is a recorded sequence with cleanup on failure (§3.1).
 7. Bound counts, coordinates, payload sizes, and durations.
 8. Return changed IDs and a diff summary.
 9. Same contract on every backend; tests in `backend_contract.rs` run identical assertions on IPC and file backends.
@@ -593,7 +595,7 @@ CI: unit/protocol/file/MCP tests on every push (Windows runner first). Live test
 
 ### Prerequisites
 - KiCad nightly (pinned build, §2.3) with API server enabled; KiCad 10.0.7 with API server enabled for Tier 2 IPC probes.
-- Stable Rust; `protoc`; NNG (built by the binding crate or provided).
+- Stable Rust; `protoc` (for `prost-build`). No NNG library or CMake is needed (native transport, §5.2).
 - An MCP host that launches a stdio server (Claude Code / Claude Desktop / VS Code).
 
 ### Install selection
@@ -653,7 +655,7 @@ Probe matrix:
 
 Exit criteria: every row recorded as supported / unsupported / failing, with captured request/response logs; proto commit and checksums recorded; license confirmed as GPL-3.0-or-later. **Do not proceed** to Phase 2 until the headless column passes.
 
-First results (24 Oct 2026, nightly headless, default socket): NNG handshake, `GetVersion`, and `Ping` succeed over the named pipe `\\.\pipe\<socket path>`; the pipe does not appear in a pipe-namespace listing, so discovery derives the name from the socket path. Document commands return `AS_UNHANDLED` when the server has no loaded project. Next: repeat with a pre-loaded project and with `--socket`.
+**Status (24 Oct 2026): nightly headless column complete.** The two-resistor demo runs end to end on the headless server, both from `scripts/probe-kicad.ps1` and from the Rust client (`crates/kicad-ipc`, `examples/probe.rs`) with the native NNG transport: place, set values, wire, labels, netlist read-back, save copy; the saved copy's `kicad-cli` netlist matches the intent. Design changes recorded: native transport (§5.2), library loading, readiness polling and non-atomic headless applies (§3.1). Remaining Phase 0 work: the nightly GUI column (including commits/undo and the schematic-scope plugin), the 10.0.7 GUI column, token mismatch, `SaveDocument`/`RevertDocument`, and IPC ERC/export jobs. Details in `docs/kicad-api-compatibility.md`.
 
 ### Phase 1 — Foundations
 `kicad-domain` (IR, plans, result states, capabilities), `kicad-ipc` (envelope, status mapping, serialized client), `kicad-ipc-mock`, `kicad-cli-runner` (install discovery, ERC JSON, netlist). Headless provider lifecycle. MCP skeleton with `session_status` and `session_open`.
@@ -693,7 +695,8 @@ PCB tools on IPC (both versions), hierarchical sheets, layout engine improvement
 | Nightly API changes before 11.0 | Rework, broken probes | Pin build + proto commit; probe suite re-run on every re-pin; adapter isolation |
 | KiCad 11 release slips | Tier 1 users must run nightly | Tier 2 fallback provides read/ERC/netlist and closed-file mutation on 10 |
 | Headless API server endpoint/lifecycle differs from docs | Blocks first IPC path | Phase 0 first; plugin provider as alternative path |
-| Rust NNG binding issues on Windows named pipes | Blocks IPC | Spike first; FFI fallback; isolate behind a trait |
+| Native NNG transport diverges from KiCad's NNG behavior | IPC failures | Wire format verified in Phase 0; transport tests against a live server and the mock; `Transport` trait allows swapping in the C library |
+| Headless edits are not atomic (no commit support) | Half-applied plan | Recorded apply with cleanup on failure; `partial` result state; mandatory read-back |
 | Plugin process lifetime doesn't fit a persistent bridge | Bridge exits early | Launcher + managed child; headless path doesn't depend on it |
 | File backend corrupts or upgrades a file | Data loss, unreadable in KiCad 10 | Lossless CST, round-trip fixtures, version preservation, atomic writes, CLI validation after write |
 | Same document mutated via two paths (GUI + file/headless) | Lost edits on next GUI save | Lock-file and open-document checks; one provider per document |

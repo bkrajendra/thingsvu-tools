@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/kicad-ipc"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bkrajendra/thingsvu-tools"
+rust-version = "1.99"
+
+[workspace.dependencies]
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }

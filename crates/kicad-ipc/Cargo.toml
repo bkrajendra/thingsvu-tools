@@ -1,0 +1,20 @@
+[package]
+name = "kicad-ipc"
+description = "KiCad IPC API client: protobuf messages and a native NNG request/reply transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -1,0 +1,180 @@
+/*
+ * This program source code file is part of KiCad, a free EDA CAD application.
+ *
+ * Copyright (C) 2024 KiCad Developers, see AUTHORS.txt for contributors.
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+syntax = "proto3";
+
+package kiapi.common.commands;
+
+import "common/types/base_types.proto";
+import "common/types/project_settings.proto";
+
+
+message GetNetClasses
+{
+  // Requests should include a project even though KiCad cannot have more than one project open at
+  // once yet.  Requests without a project will be deprecated in a future version.
+  // Since: 11.0
+  kiapi.common.types.ProjectSpecifier project = 1;
+}
+
+message NetClassesResponse
+{
+  repeated kiapi.common.project.NetClass net_classes = 1;
+}
+
+
+message SetNetClasses
+{
+  repeated kiapi.common.project.NetClass net_classes = 1;
+
+  // Whether to merge or replace the existing netclasses with the contents of this message
+  // Note that this only happens at the level of netclass name: for example, if merge_mode is set to
+  // MMM_MERGE, the design has netclasses ["Default", "HV"], and this message has netclasses
+  // ["Default", "LV"], the resulting set will be ["Default", "HV", "LV"] -- the Default netclass
+  // will have its properties replaced with those in this message, the "LV" netclass will be added,
+  // and the "HV" netclass will be left alone.  If merge_mode is set to MMM_REPLACE, the "HV" class
+  // will be erased.  Note that there must always be a "Default" netclass, so it will not be erased
+  // even if merge_mode is MMM_REPLACE and there is no "Default" class specified in this message.
+  kiapi.common.types.MapMergeMode merge_mode = 3;
+
+  // Requests should include a project even though KiCad cannot have more than one project open at
+  // once yet.  Requests without a project will be deprecated in a future version.
+  // Since: 11.0
+  kiapi.common.types.ProjectSpecifier project = 4;
+}
+
+// Returns NetClassAssignmentsResponse
+// Since: 11.0
+message GetNetClassAssignments
+{
+  // The project to query
+  kiapi.common.types.ProjectSpecifier project = 1;
+}
+
+// Since: 11.0
+message NetClassAssignmentsResponse
+{
+  repeated kiapi.common.project.NetClassAssignment assignments = 1;
+  repeated kiapi.common.project.NetClassPatternAssignment pattern_assignments = 2;
+}
+
+// Since: 11.0
+message SetNetClassAssignments
+{
+  // The project to query
+  kiapi.common.types.ProjectSpecifier project = 1;
+
+  // In MMM_MERGE mode, per-net assignments are replaced for each net present in the
+  // request (an empty netclasses list removes all assignments for that net), and pattern
+  // assignments are updated if they already exist.
+  // In MMM_REPLACE mode, any existing assignments or patterns not present in the request are erased.
+  kiapi.common.types.MapMergeMode merge_mode = 2;
+
+  repeated kiapi.common.project.NetClassAssignment assignments = 3;
+  repeated kiapi.common.project.NetClassPatternAssignment pattern_assignments = 4;
+}
+
+message ExpandTextVariables
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+
+  repeated string text = 2;
+
+  // If set, environment variables (such as ${KIPRJMOD} or user-defined variables) will be
+  // expanded in addition to the usual text variables, after the text variables are expanded.
+  // Since: 10.0.7
+  bool expand_env_vars = 3;
+}
+
+
+message ExpandTextVariablesResponse
+{
+  repeated string text = 1;
+}
+
+
+// returns kiapi.common.project.TextVariables
+message GetTextVariables
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+
+
+message SetTextVariables
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+
+  kiapi.common.project.TextVariables variables = 2;
+  // Whether to merge or replace the existing text variables map with the contents of this message
+  kiapi.common.types.MapMergeMode merge_mode = 3;
+}
+
+
+// Opens a document (currently only supported in CLI api-server mode)
+// A document cannot be opened unless no project is currently loaded or it is
+// part of a currently loaded project.  To switch projects, use CloseDocument
+// or CloseAllDocuments to close existing documents.
+message OpenDocument
+{
+  kiapi.common.types.DocumentType type = 1;
+
+  string path = 2;
+}
+
+
+message OpenDocumentResponse
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+
+
+message CloseDocument
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+
+
+// Closes all open documents (currently only supported in CLI api-server mode)
+message CloseAllDocuments
+{
+  // If set, will close documents even if they have been modified and not saved
+  bool force = 1;
+}
+
+
+// Saves the given document to its existing file path.
+// Returns an error if the document is untitled (it has never been saved to disk); use
+// SaveDocumentAs to save an untitled document to an explicit path.
+message SaveDocument
+{
+  kiapi.common.types.DocumentSpecifier document = 1;
+}
+
+// Creates a new document (in memory; does not save to disk)
+// Currently board and schematic files can be created.  A project will be created
+// for the document if it doesn't already exist.
+// Will return an error if the current document is unsaved: save or revert first
+// Returns OpenDocumentResponse
+// Since: 11.0
+message CreateDocument
+{
+  kiapi.common.types.DocumentType type = 1;
+
+  string path = 2;
+}
