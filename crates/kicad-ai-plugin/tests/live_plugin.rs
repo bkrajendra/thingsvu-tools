@@ -23,6 +23,7 @@ fn plugin(command: &str, socket: &str, token: &str, registry_dir: &std::path::Pa
         .env("KICAD_API_SOCKET", socket)
         .env("KICAD_API_TOKEN", token)
         .env("THINGSVU_REGISTRY_DIR", registry_dir)
+        .env("THINGSVU_NO_DIALOG", "1")
         .output()
         .unwrap();
     (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
@@ -56,7 +57,7 @@ async fn plugin_registers_and_gui_session_connects() {
     let registry_dir = scratch("registry");
     let (ok, stdout) = plugin("register", &env_socket, &token, &registry_dir);
     assert!(ok, "{stdout}");
-    assert!(stdout.contains("ready"), "{stdout}");
+    assert!(stdout.contains("Connected"), "{stdout}");
     let records = registry::list(&registry_dir);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].socket_path, socket);
@@ -128,7 +129,7 @@ async fn plugin_registers_and_gui_session_connects() {
     assert_eq!(err.code, ErrorCode::KicadInstanceChanged, "{err:?}");
 
     let (ok, stdout) = plugin("unregister", &env_socket, &token, &registry_dir);
-    assert!(ok && stdout.contains("no longer available"), "{stdout}");
+    assert!(ok && stdout.contains("Disconnected"), "{stdout}");
     assert!(registry::list(&registry_dir).is_empty());
 
     // Outside KiCad the plugin explains itself instead of failing silently.

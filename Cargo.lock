@@ -381,6 +381,7 @@ dependencies = [
  "kicad-ipc",
  "kicad-session",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

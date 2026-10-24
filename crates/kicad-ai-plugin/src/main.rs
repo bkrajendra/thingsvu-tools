@@ -6,9 +6,9 @@
 //! (see `kicad_session::registry`) so `kicad-ai-mcp` can connect to exactly this KiCad. The
 //! process exits right away; nothing keeps running inside or beside KiCad.
 //!
-//! KiCad reports an action only when it fails (non-zero exit, with stderr as detail); output on
-//! stderr after a success would be shown as an error, so success is silent apart from stdout,
-//! which KiCad ignores (useful when run by hand).
+//! KiCad reports an action only when it fails (non-zero exit, with stderr as detail), and shows
+//! stderr after a success as an error. So failures go to stderr with exit code 1, and success is
+//! confirmed with a small message box (see `notify`) plus a line on stdout.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -114,15 +114,17 @@ async fn register() -> Result<(), String> {
     } else {
         projects.join(", ")
     };
-    println!("KiCad AI: ready — AI tools can now work with KiCad {kicad_version} ({what}).");
+    notify(&format!(
+        "Connected. AI tools can now work with KiCad {kicad_version} ({what})."
+    ));
     Ok(())
 }
 
 fn unregister() -> Result<(), String> {
     let socket = registry::socket_path_from_env(&env("KICAD_API_SOCKET")?);
     match registry::remove(&registry::registry_dir(), &socket) {
-        Ok(true) => println!("KiCad AI: this KiCad is no longer available to AI tools."),
-        Ok(false) => println!("KiCad AI: this KiCad was not registered."),
+        Ok(true) => notify("Disconnected. AI tools can no longer use this KiCad."),
+        Ok(false) => notify("This KiCad was not connected."),
         Err(e) => return Err(format!("cannot remove the registration: {e}")),
     }
     Ok(())
@@ -139,5 +141,29 @@ fn list() {
             r.socket_path.display(),
             projects
         );
+    }
+}
+
+/// Tells the user an action succeeded. KiCad shows nothing for a successful plugin action, so on
+/// Windows a small message box confirms it (it blocks only this process, not KiCad). Set
+/// `THINGSVU_NO_DIALOG` to skip the box, e.g. in tests. The text always goes to stdout too.
+fn notify(message: &str) {
+    println!("KiCad AI: {message}");
+    #[cfg(windows)]
+    if std::env::var_os("THINGSVU_NO_DIALOG").is_none() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        };
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (text, title) = (wide(message), wide("KiCad AI"));
+        // SAFETY: both strings are NUL-terminated UTF-16 buffers that outlive the call.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+        }
     }
 }

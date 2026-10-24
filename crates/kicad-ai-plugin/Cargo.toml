@@ -16,6 +16,9 @@ kicad-ipc = { path = "../kicad-ipc" }
 kicad-session = { path = "../kicad-session" }
 tokio = { workspace = true, features = ["rt"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 kicad-cli-runner = { path = "../kicad-cli-runner" }
 kicad-domain = { path = "../kicad-domain" }
