@@ -79,6 +79,10 @@ pub enum BoardOp {
         diameter: Nm,
         drill: Nm,
     },
+    /// A copper pour.
+    AddZone(Box<crate::zones::ZoneSpec>),
+    /// A zone being replaced.
+    RemoveZone { id: String, name: String },
     /// A footprint moved, turned, or flipped, and its lock set.
     MoveFootprint {
         reference: String,
@@ -676,6 +680,25 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                         at.x.to_mm(),
                         at.y.to_mm()
                     ));
+                }
+            }
+            BoardOp::AddZone(z) => {
+                match after
+                    .zones
+                    .iter()
+                    .find(|a| a.name == z.name && a.net == z.net && a.layers == z.layers)
+                {
+                    Some(a) if a.filled => {}
+                    Some(_) => problems.push(format!(
+                        "the zone {} is there but has no copper after the refill (nothing of {} inside it?)",
+                        z.name, z.net
+                    )),
+                    None => problems.push(format!("no zone {} on {} after applying", z.name, z.layers.join(", "))),
+                }
+            }
+            BoardOp::RemoveZone { id, name } => {
+                if after.zones.iter().any(|a| &a.id == id) {
+                    problems.push(format!("the old zone {name} ({id}) is still there"));
                 }
             }
             BoardOp::MoveFootprint {

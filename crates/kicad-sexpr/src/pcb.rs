@@ -265,6 +265,7 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
                         .and_then(|p| p.child("pts"))
                         .and_then(|p| bounds(p.children("xy").filter_map(point))),
                     locked: is_yes(item, "locked"),
+                    filled: item.child("filled_polygon").is_some(),
                 });
             }
             Some(head) if head.starts_with("gr_") => {

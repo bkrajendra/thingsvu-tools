@@ -126,6 +126,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_run_drc",
             "pcb_save",
             "pcb_update_from_schematic_plan",
+            "pcb_zone_plan",
             "sch_apply_plan",
             "sch_arrange_plan",
             "sch_create_demo_circuit",
@@ -2565,4 +2566,149 @@ async fn gui_pcb_route_demo() {
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: the tracks are on the board; Ctrl+Z undoes them");
+}
+
+/// The placed and partly routed regulator board gets a ground pour on both layers: planned,
+/// created, refilled, read back, and checked with DRC; a second pour is refused unless it replaces.
+#[tokio::test]
+async fn live_board_gets_a_ground_pour() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("zone", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-zone-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "corner_radius_mm": 1,
+                    "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+
+    let plan = mcp
+        .call(
+            "pcb_zone_plan",
+            json!({ "session_id": id, "zones": [{ "net": "GND" }] }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    println!("ZONE PLAN {}", plan["result"]["measured"]);
+    let zone = &plan["result"]["measured"]["zones"][0];
+    assert_eq!(zone["layers"], json!(["F.Cu", "B.Cu"]), "{plan}");
+    assert!(
+        zone["pads_inside"].as_array().unwrap().len() >= 6,
+        "every GND pad is inside: {plan}"
+    );
+    assert_eq!(plan["result"]["operations"][0]["clearance"], 0.2, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("gnd")).await;
+    println!(
+        "ZONE APPLY {} {}",
+        applied["result"]["report"], applied["result"]["drc"]["after"]["by_type"]
+    );
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(applied["result"]["report"]["refilled"], true, "{applied}");
+    let drc = &applied["result"]["drc"];
+    assert!(
+        drc["unrouted_after"].as_u64().unwrap() < drc["unrouted_before"].as_u64().unwrap(),
+        "the pour connects GND: {drc}"
+    );
+    let unrouted_gnd = drc["after"]["unrouted_items"].to_string().matches("[GND]").count();
+    assert_eq!(unrouted_gnd, 0, "no GND pad is left unconnected: {drc}");
+
+    // A second GND pour is refused unless it replaces the first.
+    let again = mcp
+        .call(
+            "pcb_zone_plan",
+            json!({ "session_id": id, "zones": [{ "net": "GND", "layers": ["B.Cu"] }] }),
+        )
+        .await;
+    assert_eq!(again["ok"], false, "{again}");
+    let replace = mcp
+        .call(
+            "pcb_zone_plan",
+            json!({ "session_id": id, "zones": [{ "net": "GND", "layers": ["B.Cu"], "replace": true, "name": "GND back" }] }),
+        )
+        .await;
+    assert_eq!(replace["ok"], true, "{replace}");
+    assert_eq!(replace["result"]["operations"][0]["op"], "remove_zone", "{replace}");
+    let applied = apply_board(&mut mcp, &id, &replace, &key("replace")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let listed = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    let zones = listed["result"]["zones"].as_array().unwrap();
+    assert_eq!(zones.len(), 1, "{listed}");
+    assert_eq!(zones[0]["name"], "GND back", "{listed}");
+    let bad = mcp
+        .call(
+            "pcb_zone_plan",
+            json!({ "session_id": id, "zones": [{ "net": "NOPE" }] }),
+        )
+        .await;
+    assert_eq!(bad["ok"], false, "{bad}");
+
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    mcp.call("pcb_close", json!({ "session_id": id })).await;
+    let text = std::fs::read_to_string(&pcb).unwrap();
+    assert!(
+        text.contains("\"GND back\"") && text.contains("filled_polygon"),
+        "the pour is saved filled"
+    );
+    assert!(text.contains("(thermal_gap 0.5)") && text.contains("(min_thickness 0.25)"));
+}
+
+/// Against a real KiCad 11 PCB editor: a ground pour over the whole board on every copper layer.
+/// Open a **copy** of a placed board in the PCB Editor, press "KiCad AI: connect" there, then run
+/// with THINGSVU_GUI_PCB_ZONE=1.
+#[tokio::test]
+async fn gui_pcb_zone_demo() {
+    if std::env::var("THINGSVU_GUI_PCB_ZONE").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_PCB_ZONE=1 with a registered KiCad PCB editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let plan = mcp
+        .call(
+            "pcb_zone_plan",
+            json!({ "session_id": id, "zones": [{ "net": "GND", "replace": true }] }),
+        )
+        .await;
+    println!("GUI ZONE PLAN {plan}");
+    assert_eq!(plan["ok"], true, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &format!("gui-pcb-zone-{}", std::process::id())).await;
+    println!(
+        "GUI ZONE APPLY verified {} unrouted {} -> {}, errors {} -> {}",
+        applied["result"]["verified"],
+        applied["result"]["drc"]["unrouted_before"],
+        applied["result"]["drc"]["unrouted_after"],
+        applied["result"]["drc"]["errors_before"],
+        applied["result"]["drc"]["errors_after"]
+    );
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: GND is poured; Ctrl+Z undoes the fill, a second Ctrl+Z the zone");
 }

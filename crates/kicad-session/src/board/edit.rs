@@ -49,7 +49,80 @@ pub struct EditReport {
     pub placed: Vec<String>,
     pub moved: Vec<String>,
     pub flipped: Vec<String>,
-    pub tracks_and_vias: usize,
+    /// Tracks, vias, and zones created.
+    pub copper_items: usize,
+    /// Zones were refilled after the change.
+    pub refilled: bool,
+}
+
+/// A copper zone with every setting given (a zone sent without them has zero clearance).
+fn zone_message(z: &kicad_domain::zones::ZoneSpec) -> Result<Zone, ToolError> {
+    use kicad_domain::zones::PadConnection;
+    use kicad_ipc::proto::kiapi::board::types::{
+        zone, CopperZoneSettings, IslandRemovalMode, ThermalSpokeSettings, ZoneConnectionSettings, ZoneConnectionStyle,
+        ZoneFillMode, ZoneType,
+    };
+    use kicad_ipc::proto::kiapi::common::types::PolygonWithHoles;
+    Ok(Zone {
+        r#type: ZoneType::ZtCopper as i32,
+        layers: z
+            .layers
+            .iter()
+            .map(|l| board_layer(l).map(|b| b as i32))
+            .collect::<Result<_, _>>()?,
+        outline: Some(PolySet {
+            polygons: vec![PolygonWithHoles {
+                outline: Some(PolyLine {
+                    nodes: z
+                        .outline
+                        .iter()
+                        .map(|p| PolyLineNode {
+                            geometry: Some(poly_line_node::Geometry::Point(Vector2 {
+                                x_nm: p.x.0,
+                                y_nm: p.y.0,
+                            })),
+                        })
+                        .collect(),
+                    closed: true,
+                }),
+                holes: vec![],
+            }],
+        }),
+        name: z.name.clone(),
+        priority: z.priority,
+        settings: Some(zone::Settings::CopperSettings(CopperZoneSettings {
+            net: Some(Net {
+                name: z.net.clone(),
+                ..Default::default()
+            }),
+            clearance: Some(Distance {
+                value_nm: z.clearance.0,
+            }),
+            min_thickness: Some(Distance {
+                value_nm: z.min_width.0,
+            }),
+            connection: Some(ZoneConnectionSettings {
+                zone_connection: match z.connection {
+                    PadConnection::Thermal => ZoneConnectionStyle::ZcsThermal,
+                    PadConnection::Solid => ZoneConnectionStyle::ZcsFull,
+                    PadConnection::None => ZoneConnectionStyle::ZcsNone,
+                } as i32,
+                thermal_spokes: Some(ThermalSpokeSettings {
+                    width: Some(Distance {
+                        value_nm: z.spoke_width.0,
+                    }),
+                    gap: Some(Distance {
+                        value_nm: z.thermal_gap.0,
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            island_mode: IslandRemovalMode::IrmAlways as i32,
+            fill_mode: ZoneFillMode::ZfmSolid as i32,
+            ..Default::default()
+        })),
+        ..Default::default()
+    })
 }
 
 /// `F.Cu` to `BL_F_Cu`.
@@ -529,6 +602,7 @@ impl BoardSession {
             "outline" => "AI: board outline",
             "place" => "AI: place footprints",
             "route" => "AI: route",
+            "zone" => "AI: copper pour",
             _ => "AI: move footprints",
         };
         let result = apply_steps(client, &header, plan).await;
@@ -545,7 +619,29 @@ impl BoardSession {
                 header: header(),
             })
             .await;
+        let zones_changed = plan
+            .operations
+            .iter()
+            .any(|o| matches!(o, BoardOp::AddZone(_) | BoardOp::RemoveZone { .. }));
         match (result, ended) {
+            (Ok(mut report), Ok(_)) if zones_changed => {
+                // After the commit: a refill inside it does not fill a zone made in it.
+                client
+                    .call_any(&kicad_ipc::proto::kiapi::board::commands::RefillZones {
+                        board: Some(document.clone()),
+                        zones: vec![],
+                    })
+                    .await
+                    .map_err(|e| {
+                        ToolError::new(
+                            ErrorCode::KicadError,
+                            format!("the zones were created but the refill failed ({e}); refill them in KiCad (B)"),
+                        )
+                        .with_mutation_state(MutationState::Applied)
+                    })?;
+                report.refilled = true;
+                Ok(report)
+            }
             (Ok(report), Ok(_)) => Ok(report),
             (Ok(_), Err(e)) => Err(from_ipc_error(&e, true)),
             (Err(err), Ok(_)) => Err(ToolError::new(
@@ -574,7 +670,7 @@ async fn apply_steps(
         .operations
         .iter()
         .filter_map(|o| match o {
-            BoardOp::RemoveEdge { id, .. } => Some(ProtoKiid { value: id.clone() }),
+            BoardOp::RemoveEdge { id, .. } | BoardOp::RemoveZone { id, .. } => Some(ProtoKiid { value: id.clone() }),
             _ => None,
         })
         .collect();
@@ -601,7 +697,7 @@ async fn apply_steps(
             .collect();
         if !failed.is_empty() {
             return Err(kerr(format!(
-                "KiCad did not delete the old outline: {}",
+                "KiCad did not delete the old outline or zones: {}",
                 failed.join("; ")
             )));
         }
@@ -776,6 +872,7 @@ async fn apply_steps(
                 }),
                 ..Default::default()
             }),
+            BoardOp::AddZone(z) => Any::from_msg(&zone_message(z)?),
             _ => continue,
         };
         copper.push(encoded.map_err(|e| kerr(e.to_string()))?);
@@ -797,12 +894,12 @@ async fn apply_steps(
             .collect();
         if !failed.is_empty() || r.created_items.len() != n {
             return Err(kerr(format!(
-                "KiCad created {} of {n} tracks and vias: {}",
+                "KiCad created {} of {n} tracks, vias, and zones: {}",
                 r.created_items.len() - failed.len(),
                 failed.join("; ")
             )));
         }
-        report.tracks_and_vias = n;
+        report.copper_items = n;
     }
 
     // 5. Moves: flips first (KiCad's own flip mirrors the footprint top to bottom), then every

@@ -832,6 +832,150 @@ async fn how_a_headless_board_is_edited() {
         }
     }
 
+    // 5c. Zones (12.6): a fully set copper zone created and refilled inside one commit.
+    let zone = Zone {
+        r#type: ZoneType::ZtCopper as i32,
+        layers: vec![BoardLayer::BlFCu as i32],
+        outline: Some(PolySet {
+            polygons: vec![PolygonWithHoles {
+                outline: Some(PolyLine {
+                    nodes: [(102.0, 82.0), (148.0, 82.0), (148.0, 118.0), (102.0, 118.0)]
+                        .iter()
+                        .map(|(x, y)| PolyLineNode {
+                            geometry: Some(kicad_ipc::proto::kiapi::common::types::poly_line_node::Geometry::Point(
+                                Vector2 {
+                                    x_nm: (x * 1e6) as i64,
+                                    y_nm: (y * 1e6) as i64,
+                                },
+                            )),
+                        })
+                        .collect(),
+                    closed: true,
+                }),
+                holes: vec![],
+            }],
+        }),
+        name: "GND front".into(),
+        priority: 1,
+        settings: Some(zone::Settings::CopperSettings(CopperZoneSettings {
+            net: net("GND"),
+            clearance: Some(Distance { value_nm: 300_000 }),
+            min_thickness: Some(Distance { value_nm: 250_000 }),
+            connection: Some(kicad_ipc::proto::kiapi::board::types::ZoneConnectionSettings {
+                zone_connection: kicad_ipc::proto::kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32,
+                thermal_spokes: Some(kicad_ipc::proto::kiapi::board::types::ThermalSpokeSettings {
+                    width: Some(Distance { value_nm: 500_000 }),
+                    gap: Some(Distance { value_nm: 500_000 }),
+                    ..Default::default()
+                }),
+            }),
+            island_mode: kicad_ipc::proto::kiapi::board::types::IslandRemovalMode::IrmAlways as i32,
+            fill_mode: kicad_ipc::proto::kiapi::board::types::ZoneFillMode::ZfmSolid as i32,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let commit: BeginCommitResponse = board.raw_call(&BeginCommit { header: header() }).await.unwrap();
+    let created: Result<CreateItemsResponse, _> = board
+        .raw_call(&CreateItems {
+            header: header(),
+            items: vec![Any::from_msg(&zone).unwrap()],
+            ..Default::default()
+        })
+        .await;
+    println!(
+        "ZONE IN COMMIT {:?}",
+        created
+            .as_ref()
+            .map(|r| r.created_items.first().map(|c| c.status.clone()))
+    );
+    let refill = board
+        .raw_call_any(&RefillZones {
+            board: Some(document.clone()),
+            zones: vec![],
+        })
+        .await;
+    println!("REFILL IN COMMIT {:?}", refill.as_ref().map(|_| ()));
+    let end = board
+        .raw_call_any(&EndCommit {
+            id: commit.id,
+            action: CommitAction::CmaCommit as i32,
+            message: "AI: zone".into(),
+            header: header(),
+        })
+        .await;
+    println!("END ZONE COMMIT {:?}", end.as_ref().map(|_| ()));
+    let zone_state = || async {
+        let zones: GetItemsResponse = board
+            .raw_call(&GetItems {
+                header: header(),
+                types: vec![KiCadObjectType::KotPcbZone as i32],
+            })
+            .await
+            .unwrap();
+        zones
+            .items
+            .iter()
+            .map(|a| a.to_msg::<Zone>().unwrap())
+            .map(|z| {
+                let area: usize = z
+                    .filled_polygons
+                    .iter()
+                    .flat_map(|f| f.shapes.iter())
+                    .flat_map(|s| s.polygons.iter())
+                    .map(|p| p.outline.as_ref().map(|o| o.nodes.len()).unwrap_or(0))
+                    .sum();
+                (z.name, z.filled, area)
+            })
+            .collect::<Vec<_>>()
+    };
+    println!("ZONES AFTER COMMIT (name, filled, fill nodes) {:?}", zone_state().await);
+    let refill = board
+        .raw_call_any(&RefillZones {
+            board: Some(document.clone()),
+            zones: vec![],
+        })
+        .await;
+    println!("REFILL AFTER COMMIT {:?}", refill.as_ref().map(|_| ()));
+    println!("ZONES AFTER REFILL {:?}", zone_state().await);
+    let state = board
+        .raw_call::<_, kicad_ipc::proto::kiapi::common::commands::GetDocumentModifiedStateResponse>(
+            &kicad_ipc::proto::kiapi::common::commands::GetDocumentModifiedState {
+                document: Some(document.clone()),
+            },
+        )
+        .await;
+    println!("MODIFIED {:?}", state.map(|s| s.state));
+    let zones: GetItemsResponse = board
+        .raw_call(&GetItems {
+            header: header(),
+            types: vec![KiCadObjectType::KotPcbZone as i32],
+        })
+        .await
+        .unwrap();
+    for a in &zones.items {
+        let z: Zone = a.to_msg().unwrap();
+        let s = match &z.settings {
+            Some(zone::Settings::CopperSettings(c)) => Some((
+                c.net.as_ref().map(|n| n.name.clone()),
+                c.clearance,
+                c.min_thickness,
+                c.connection.as_ref().map(|k| (k.zone_connection, k.thermal_spokes)),
+                c.island_mode,
+            )),
+            _ => None,
+        };
+        println!(
+            "ZONE BACK {} layers {:?} priority {} filled {} fills {} settings {:?}",
+            z.name,
+            z.layers,
+            z.priority,
+            z.filled,
+            z.filled_polygons.len(),
+            s
+        );
+    }
+
     // 6. The saved file, read with our own reader.
     let copy = dir.join("copy");
     std::fs::create_dir_all(&copy).unwrap();

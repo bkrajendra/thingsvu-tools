@@ -10,7 +10,7 @@ use std::time::Duration;
 use kicad_domain::board::{place_rect, Board};
 use kicad_domain::board_edit::{self, BoardEditPlan, BoardOp, HolePlacement, MoveRequest, OutlineRequest};
 use kicad_domain::placement::{self, NearHint, PinnedPlace, PlaceHints, PlaceOptions};
-use kicad_domain::routing;
+use kicad_domain::{routing, zones};
 use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
 use kicad_session::{BoardSession, Provider};
 use rmcp::handler::server::wrapper::Parameters;
@@ -251,6 +251,58 @@ pub struct RouteArg {
 pub struct PcbRouteArgs {
     pub session_id: String,
     pub routes: Vec<RouteArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RectMm {
+    pub min: XyMm,
+    pub max: XyMm,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ZoneArg {
+    /// The net to pour, e.g. GND.
+    pub net: String,
+    /// Copper layers (default: every copper layer of the board).
+    #[serde(default)]
+    pub layers: Option<Vec<String>>,
+    /// An area other than the whole board: a rectangle in mm.
+    #[serde(default)]
+    pub rect: Option<RectMm>,
+    /// Or a polygon, three or more corners in mm.
+    #[serde(default)]
+    pub polygon: Option<Vec<XyMm>>,
+    /// Clearance to other nets, mm (default: the net class's).
+    #[serde(default)]
+    pub clearance_mm: Option<f64>,
+    /// Thinnest copper the fill keeps, mm (default 0.25).
+    #[serde(default)]
+    pub min_width_mm: Option<f64>,
+    /// How pads of the net connect: thermal (default), solid, or none.
+    #[serde(default)]
+    pub pad_connection: Option<String>,
+    /// Thermal relief gap and spoke width, mm (default 0.5 each).
+    #[serde(default)]
+    pub thermal_gap_mm: Option<f64>,
+    #[serde(default)]
+    pub spoke_width_mm: Option<f64>,
+    /// Higher fills first where zones of different nets overlap (default 0).
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Replace the zones this net already has on these layers.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbZoneArgs {
+    pub session_id: String,
+    pub zones: Vec<ZoneArg>,
 }
 
 /// What a pending board plan does.
@@ -1211,8 +1263,39 @@ impl KicadAiServer {
     }
 
     #[tool(
+        name = "pcb_zone_plan",
+        description = "Plan copper pours: for each zone a net (ground first), its copper layers (default \\nall), and the whole board or a rect or polygon in mm; clearance (default the net class's), minimum width \\n(0.25), pad connection thermal (default), solid, or none, thermal gap and spoke width (0.5), priority, \\nname. A net that already has a zone on those layers is refused unless replace is true; a locked zone is \\nnever deleted. The plan lists each zone, its area, the pads of the net inside it, and warnings (a pour \\nthat reaches no pad, overlapping pours of two nets with the same priority). Needs a live KiCad 11 \\nsession. Apply with pcb_apply_plan: the zones are created in one commit, then every zone is refilled \\n(a second undo step in the editor), read back, and checked with DRC before and after."
+    )]
+    pub async fn pcb_zone_plan(&self, Parameters(args): Parameters<PcbZoneArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let data = board.read().await?;
+            let rules = board.routing_rules(&data.nets).await?;
+            let requests = args
+                .zones
+                .iter()
+                .enumerate()
+                .map(|(i, z)| zone_request(i, z, &data.copper_layers))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (plan, summaries) = zones::plan_zones(&data, &rules, &requests)?;
+            let measured = serde_json::json!({ "zones": summaries });
+            Ok::<_, ToolError>((plan, measured, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, measured, fp)) => self.store_edit_plan_with(&cid, &board, plan, fp, Some(measured)).await,
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan, pcb_zone_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1500,6 +1583,39 @@ fn drc_json(report: &kicad_cli_runner::pcb::DrcReport) -> serde_json::Value {
     })
 }
 
+fn zone_request(i: usize, z: &ZoneArg, copper: &[String]) -> Result<zones::ZoneRequest, ToolError> {
+    let label = format!("zone {}", i + 1);
+    let area = match (&z.rect, &z.polygon) {
+        (Some(_), Some(_)) => return Err(bad_arg(format!("{label}: give rect or polygon, not both"))),
+        (Some(r), None) => zones::ZoneArea::Rect(
+            Rect::from_points([point_arg(r.min.x_mm, r.min.y_mm)?, point_arg(r.max.x_mm, r.max.y_mm)?])
+                .expect("two corners"),
+        ),
+        (None, Some(p)) => {
+            zones::ZoneArea::Polygon(p.iter().map(|q| point_arg(q.x_mm, q.y_mm)).collect::<Result<_, _>>()?)
+        }
+        (None, None) => zones::ZoneArea::Board,
+    };
+    let opt = |v: Option<f64>, what: &str| v.map(|x| nm_arg(what, x)).transpose();
+    Ok(zones::ZoneRequest {
+        net: z.net.clone(),
+        layers: z.layers.clone().unwrap_or_else(|| copper.to_vec()),
+        area,
+        clearance: opt(z.clearance_mm, "clearance_mm")?,
+        min_width: opt(z.min_width_mm, "min_width_mm")?,
+        connection: match z.pad_connection.as_deref() {
+            None => zones::PadConnection::Thermal,
+            Some(s) => zones::PadConnection::parse(s)
+                .ok_or_else(|| bad_arg(format!("{label}: pad_connection is thermal, solid, or none, not {s}")))?,
+        },
+        thermal_gap: opt(z.thermal_gap_mm, "thermal_gap_mm")?,
+        spoke_width: opt(z.spoke_width_mm, "spoke_width_mm")?,
+        priority: z.priority,
+        name: z.name.clone(),
+        replace: z.replace,
+    })
+}
+
 fn route_request(i: usize, r: &RouteArg) -> Result<routing::RouteRequest, ToolError> {
     let points = r
         .points
@@ -1629,6 +1745,13 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
         } => serde_json::json!({
             "op": "add_via", "net": net, "at": pt(*at), "diameter": mm(diameter.0), "drill": mm(drill.0),
         }),
+        BoardOp::AddZone(z) => serde_json::json!({
+            "op": "add_zone", "name": z.name, "net": z.net, "layers": z.layers,
+            "outline": z.outline.iter().map(|p| pt(*p)).collect::<Vec<_>>(),
+            "clearance": mm(z.clearance.0), "min_width": mm(z.min_width.0), "pad_connection": z.connection,
+            "thermal_gap": mm(z.thermal_gap.0), "spoke_width": mm(z.spoke_width.0), "priority": z.priority,
+        }),
+        BoardOp::RemoveZone { id, name } => serde_json::json!({ "op": "remove_zone", "id": id, "name": name }),
         BoardOp::MoveFootprint {
             reference,
             from,
@@ -1709,13 +1832,14 @@ impl KicadAiServer {
                 ));
             }
             // A route is judged by DRC too: run before and after.
-            let drc_before = if plan.kind == "route" {
+            let judged_by_drc = matches!(plan.kind, "route" | "zone");
+            let drc_before = if judged_by_drc {
                 self.run_drc(cid, board, false).await.ok()
             } else {
                 None
             };
             let report = board.apply_edit(plan).await?;
-            let drc_after = if plan.kind == "route" {
+            let drc_after = if judged_by_drc {
                 self.run_drc(cid, board, false).await.ok()
             } else {
                 None
@@ -1745,7 +1869,7 @@ impl KicadAiServer {
                     "after": drc_json(a),
                 }))
             }
-            _ if plan.kind == "route" => {
+            _ if matches!(plan.kind, "route" | "zone") => {
                 problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
                 None
             }

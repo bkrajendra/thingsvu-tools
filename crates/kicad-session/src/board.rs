@@ -767,8 +767,21 @@ impl BoardSession {
                     layers: z.layers.iter().map(|l| layer_name(*l)).collect(),
                     net,
                     priority: z.priority,
-                    bounds: None,
+                    bounds: Rect::from_points(
+                        z.outline
+                            .iter()
+                            .flat_map(|o| o.polygons.iter())
+                            .filter_map(|p| p.outline.as_ref())
+                            .flat_map(|l| l.nodes.iter())
+                            .filter_map(|n| match &n.geometry {
+                                Some(kicad_ipc::proto::kiapi::common::types::poly_line_node::Geometry::Point(v)) => {
+                                    Some(Point::new(Nm(v.x_nm), Nm(v.y_nm)))
+                                }
+                                _ => None,
+                            }),
+                    ),
                     locked: z.locked == 2,
+                    filled: z.filled,
                 });
             } else {
                 board.drawings += 1;

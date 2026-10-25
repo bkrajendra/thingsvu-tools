@@ -27,6 +27,7 @@ pub mod schematic;
 pub mod text;
 pub mod tidy;
 pub mod validation;
+pub mod zones;
 
 pub use arrange::{plan_arrange, Mirror, PartEdit};
 pub use capability::{Backend, Capability, CapabilitySet, Support};

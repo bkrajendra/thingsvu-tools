@@ -118,6 +118,8 @@ pub struct BoardZone {
     /// The area of the zone's outline.
     pub bounds: Option<Rect>,
     pub locked: bool,
+    /// KiCad has filled it (it has copper).
+    pub filled: bool,
 }
 
 /// A drawing on `Edge.Cuts` (part of the outline).

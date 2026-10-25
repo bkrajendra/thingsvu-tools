@@ -162,7 +162,11 @@ Tracks are planned the same way:
 
 > Route VBUS from J1 to the fuse, then run +3V3 from U1 pin 2 to C3 on the top layer, dropping to the bottom layer through a via at 112, 90.
 
-Between two pads the assistant finds a simple path (straight, 45°, or an L) on a layer both pads are on; with more points it follows them, placing a via wherever the layer changes. Widths, clearances, and via sizes come from your board's net classes. Every track and via is checked against other nets' copper and the board edge before anything changes, and DRC runs before and after applying, so you see the unrouted count drop and any new error. Ground pours and an optional external autorouter come later in Phase 12.
+Between two pads the assistant finds a simple path (straight, 45°, or an L) on a layer both pads are on; with more points it follows them, placing a via wherever the layer changes. Widths, clearances, and via sizes come from your board's net classes. Every track and via is checked against other nets' copper and the board edge before anything changes, and DRC runs before and after applying, so you see the unrouted count drop and any new error. Copper pours too:
+
+> Pour ground on both layers, with thermal reliefs, and tell me which connections are still missing.
+
+The pour covers the board (or an area you give) at your net class's clearance; the plan lists the pads it should connect, applying refills it and runs DRC before and after. An optional external autorouter comes later in Phase 12.
 
 To get a schematic ready to order parts:
 
@@ -224,6 +228,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_outline_plan` | A board outline (rectangle, rounded corners) of a given size or fitted around the parts, with mounting holes in the corners or at given places; applied with `pcb_apply_plan` |
 | `pcb_move_plan` | Move, turn, flip, and lock named footprints (places on a grid, exact offsets); shows overlaps before and after; applied with `pcb_apply_plan`, every pad read back |
 | `pcb_route_plan` | Tracks and vias for named nets, pad to pad or through given points, at the net class width; checked against other nets' copper and the edge; DRC before and after applying |
+| `pcb_zone_plan` | Copper pours (ground first) over the board or an area, with clearance, minimum width, and thermal reliefs; refilled after applying, DRC before and after |
 | `pcb_place_plan` | Place the footprints inside the outline (main IC central, connectors on edges, decoupling beside its pins, no overlaps), with hints keep, place, near, edge, groups, side, only; measured before and after; applied with `pcb_apply_plan` |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
