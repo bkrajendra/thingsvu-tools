@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::geometry::{Nm, Orientation, Point, Rect};
+use crate::geometry::{Dir, Nm, Orientation, Point, Rect};
 use crate::ids::Kiid;
+use crate::text::{label_box, text_box, HAlign, VAlign};
 
 /// A point in millimetres, as reported to clients.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -95,8 +96,32 @@ pub fn note_area(anchor: Point, text: &str, size: Nm) -> Rect {
     }
 }
 
+/// One text field of a placed symbol (its reference or its value) as drawn.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DesignField {
+    /// `Reference` or `Value`.
+    pub name: String,
+    pub text: String,
+    /// Where the text is anchored on the sheet.
+    pub position: Point,
+    /// How the text is turned on the sheet: 0 reads left to right, 90 upward.
+    pub angle_deg: u16,
+    pub size: Nm,
+    pub hidden: bool,
+    pub h: HAlign,
+    pub v: VAlign,
+}
+
+impl DesignField {
+    /// The area the text covers, estimated; none for hidden or empty text.
+    pub fn bounds(&self) -> Option<Rect> {
+        (!self.hidden && !self.text.is_empty())
+            .then(|| text_box(&self.text, self.position, self.size, self.angle_deg, self.h, self.v))
+    }
+}
+
 /// A placed symbol, as much of it as planning needs.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DesignSymbol {
     /// The symbol's id in the document (its UUID).
     pub id: String,
@@ -107,6 +132,8 @@ pub struct DesignSymbol {
     pub position: Point,
     pub orientation: Orientation,
     pub unit: u32,
+    /// The reference and value text as drawn.
+    pub fields: Vec<DesignField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -122,6 +149,59 @@ pub struct DesignLabel {
     pub id: String,
     pub text: String,
     pub position: Point,
+    /// The way the text runs from its anchor.
+    pub direction: Dir,
+}
+
+impl DesignLabel {
+    pub fn bounds(&self) -> Rect {
+        label_box(&self.text, self.position, crate::text::DEFAULT_SIZE, self.direction)
+    }
+}
+
+/// A free text note.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DesignText {
+    pub id: String,
+    pub text: String,
+    pub position: Point,
+    pub size: Nm,
+    pub angle_deg: u16,
+    pub h: HAlign,
+    pub v: VAlign,
+}
+
+impl DesignText {
+    pub fn bounds(&self) -> Rect {
+        text_box(&self.text, self.position, self.size, self.angle_deg, self.h, self.v)
+    }
+}
+
+/// A line, rectangle, or circle drawn on the sheet (not a wire).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DesignShape {
+    pub id: String,
+    pub kind: ShapeKind,
+    pub stroke: Nm,
+    pub filled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeKind {
+    Rectangle { min: Point, max: Point },
+    Circle { center: Point, radius: Nm },
+    Line { start: Point, end: Point },
+}
+
+impl ShapeKind {
+    pub fn bounds(&self) -> Rect {
+        match *self {
+            ShapeKind::Rectangle { min, max } => Rect::from_points([min, max]).expect("two points"),
+            ShapeKind::Circle { center, radius } => Rect::from_points([center]).expect("a point").inflate(radius),
+            ShapeKind::Line { start, end } => Rect::from_points([start, end]).expect("two points"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -138,6 +218,10 @@ pub struct SchematicDesign {
     pub wires: Vec<DesignWire>,
     pub labels: Vec<DesignLabel>,
     pub junctions: Vec<DesignJunction>,
+    /// Free text notes.
+    pub texts: Vec<DesignText>,
+    /// Lines, rectangles, and circles drawn on the sheet.
+    pub shapes: Vec<DesignShape>,
     /// Text notes, graphics, and images: they are left where they are.
     pub annotations: usize,
     /// The area each text note covers, roughly: a layout keeps clear of these.

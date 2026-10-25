@@ -104,6 +104,19 @@ pub fn operation_view(op: &Operation) -> Value {
             "rotation_deg": orientation.rotation_deg,
         }),
         Operation::AddJunction { position } => json!({ "op": "add_junction", "position_mm": mm(*position) }),
+        Operation::AddText {
+            text,
+            position,
+            size,
+            angle_deg,
+            ..
+        } => json!({
+            "op": "add_text", "text": text, "position_mm": mm(*position),
+            "size_mm": size.to_mm(), "rotation_deg": angle_deg,
+        }),
+        Operation::AddShape { kind, stroke, filled } => json!({
+            "op": "add_shape", "shape": kind, "stroke_mm": stroke.to_mm(), "filled": filled,
+        }),
     }
 }
 
@@ -133,6 +146,10 @@ pub fn plan_view(plan_id: &str, plan: &OperationPlan) -> Value {
         "findings": plan.findings,
         "moves": plan.moves.iter().map(move_view).collect::<Vec<_>>(),
         "removals": plan.removals,
+        "field_changes": plan.field_changes.iter().map(|c| json!({
+            "reference": c.reference, "field": c.field, "from_mm": mm(c.from),
+            "to_mm": mm(c.position), "hide": c.hide,
+        })).collect::<Vec<_>>(),
         "operations": plan.operations.iter().map(operation_view).collect::<Vec<_>>(),
         "expected_nets": plan.expected_nets,
     })

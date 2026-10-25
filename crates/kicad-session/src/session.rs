@@ -495,3 +495,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
     };
     norm(a) == norm(b)
 }
+
+impl Session {
+    /// One request to KiCad as it is, for probes and tests that explore the API.
+    #[doc(hidden)]
+    pub async fn raw_call<Req: prost::Name, Resp: prost::Name + Default>(
+        &self,
+        request: &Req,
+    ) -> Result<Resp, kicad_ipc::Error> {
+        self.inner.lock().await.client.call(request).await
+    }
+}

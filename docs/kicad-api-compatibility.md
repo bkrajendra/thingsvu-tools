@@ -124,3 +124,16 @@ Observed 25 Oct 2026.
 | Wires after `CreateItems` | KiCad joins wires that meet end to end into one, so a set of wires read back may be cut differently from the set that was created; compare wires as runs along a line |
 | `kicad-cli` netlist vs API netlist | The CLI netlister omits power symbols and flags; the API netlist includes them. A flag that is connected to the rest of a net only through the name of a power symbol on its wire has to be attached by name |
 | ERC `power_pin_not_driven` | One violation per net. A net named by a **power symbol** whose pins nothing drives (no `PWR_FLAG`, no output pin) gets it; the same net named by a **label** does not. A tidy must therefore not turn a label-named net into a power-symbol net |
+
+## Text, labels, and drawings over the API and in the file (10.99, Phase 9 probe)
+
+Observed 25 Oct 2026 with `crates/kicad-session/tests/live_probe9.rs` (`KICAD_LIVE=1 cargo test -p kicad-session --test live_probe9 -- --nocapture`), on the headless server and in the saved file.
+
+| Topic | Observation |
+|---|---|
+| `GetBoundingBox` | **Not handled for schematics** (`AS_UNHANDLED: no handler available`), with either mode. The extent of text cannot be asked of KiCad, so it is estimated from the string, size, angle, and justification (`kicad-domain::text`; about 0.9 of the text height per character, 1.2 high per line). The estimate errs on the generous side |
+| SVG export | Carries `textLength` on a hidden `<text>` for each string, which can be used to calibrate the estimate offline. Digits and capitals measure about 1.1 × the text height per character, mixed text about 0.76–0.9 |
+| `CreateItems` of `SchematicText`, `SchematicGraphicShape` (rectangle, circle), `SchematicLine` with type `SLT_GRAPHIC`, `SchematicTextBox`, `LocalLabel` | All accepted (`ISC_OK`) on the headless server and read back by `GetItems`. In the file they are `text`, `rectangle`, `circle`, `polyline` (two points), `text_box`, and `label` |
+| Field text, API vs file | `reference_field` and `value_field` carry `text.position`, `attributes.angle`, `size`, `horizontal_alignment`, `vertical_alignment`, and `visible`; for parts with no rotation, position, size, justification, and angle match the file's `property` exactly |
+| Label direction | A new `LocalLabel` with no spin style is saved as angle 180, `justify right bottom` (text running left). The reader maps spin styles and file angles (0, 90, 180, 270) to the way the text runs |
+| Text size in a plan | KiCad's text height is 1.27 mm by default; `size` on text attributes is read as the larger of the two sides |

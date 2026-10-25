@@ -24,6 +24,9 @@ pub struct Readability {
     pub labelled_power_nets: Vec<String>,
     /// Nets joined by labels because they could not be wired.
     pub fallback_nets: Vec<String>,
+    /// Pairs of things that text runs into: another text, a wire, or a part. Text is estimated
+    /// (see [`crate::text`]), so these are reported as warnings.
+    pub text_overlaps: Vec<(String, String)>,
 }
 
 impl Readability {
@@ -32,6 +35,7 @@ impl Readability {
             && self.overlapping_symbols.is_empty()
             && self.wires_through_symbols.is_empty()
             && self.labelled_power_nets.is_empty()
+            && self.text_overlaps.is_empty()
     }
 }
 
@@ -137,7 +141,7 @@ pub fn check(plan: &OperationPlan, library: &BTreeMap<LibraryId, LibrarySymbol>)
                     report.labelled_power_nets.push(net.clone());
                 }
             }
-            Operation::AddJunction { .. } => {}
+            Operation::AddJunction { .. } | Operation::AddText { .. } | Operation::AddShape { .. } => {}
         }
     }
 
@@ -210,5 +214,74 @@ pub fn check_design(design: &SchematicDesign, library: &BTreeMap<LibraryId, Libr
         })
         .collect();
     geometry_findings(&bodies, &pins_of, &wires, &mut report);
+    report.text_overlaps = text_overlaps(design, &bodies, &wires);
     report
+}
+
+/// Every piece of visible text on the sheet, with a name for reports and the symbol it belongs to.
+pub fn text_items(design: &SchematicDesign) -> Vec<(String, Option<String>, Rect)> {
+    let mut items = Vec::new();
+    for symbol in &design.symbols {
+        for field in &symbol.fields {
+            if let Some(bounds) = field.bounds() {
+                let what = if symbol.reference.starts_with('#') && field.name == "Value" {
+                    format!("{} ({})", symbol.reference, field.text)
+                } else {
+                    format!("{} {}", symbol.reference, field.name.to_lowercase())
+                };
+                items.push((what, Some(symbol.reference.clone()), bounds));
+            }
+        }
+    }
+    for label in &design.labels {
+        items.push((format!("label {}", label.text), None, label.bounds()));
+    }
+    for note in &design.texts {
+        let mut shown: String = note.text.chars().take(24).collect();
+        if note.text.chars().count() > 24 {
+            shown.push('…');
+        }
+        items.push((format!("note \"{shown}\""), None, note.bounds()));
+    }
+    items
+}
+
+/// Text that runs into other text, a wire, or a part.
+fn text_overlaps(
+    design: &SchematicDesign,
+    bodies: &[(String, Rect)],
+    wires: &[(String, Point, Point)],
+) -> Vec<(String, String)> {
+    let items = text_items(design);
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut add = |a: &str, b: &str| {
+        let pair = (a.to_owned(), b.to_owned());
+        if !found.contains(&pair) {
+            found.push(pair);
+        }
+    };
+    for (i, (name, _, bounds)) in items.iter().enumerate() {
+        let inside = crate::text::shrunk(*bounds);
+        for (other, _, other_bounds) in &items[i + 1..] {
+            if inside.overlaps(crate::text::shrunk(*other_bounds)) {
+                add(name, other);
+            }
+        }
+        for (wire, a, b) in wires {
+            if inside.crossed_by(*a, *b) || (a == b && inside.overlaps(Rect { min: *a, max: *b })) {
+                add(name, wire);
+            }
+        }
+    }
+    for (name, owner, bounds) in &items {
+        let inside = crate::text::shrunk(*bounds);
+        // A part's own text may sit on its own drawing: many library symbols put the value inside
+        // the body on purpose. Only other parts' bodies count.
+        for (reference, body) in bodies {
+            if owner.as_deref() != Some(reference.as_str()) && inside.overlaps(*body) {
+                add(name, &format!("part {reference}"));
+            }
+        }
+    }
+    found
 }

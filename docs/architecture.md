@@ -208,6 +208,25 @@ flowchart LR
     ROUTER --> VERIFY
 ```
 
+### Text, labels, and drawings (Phase 9)
+
+KiCad decides where a part's reference and value text lands, and its API cannot report how far text extends (`GetBoundingBox` is not handled for schematics). The server therefore reads where the text is (position, angle, size, justification), estimates the area it covers, and checks it against other text, wires, and other parts' bodies. `sch_declutter_plan` moves the text that runs into something; the label, drawing, and item planners are ordinary plans, so they use the same confirm, apply, and verify flow. After applying, every position, turn, and text move is read back and compared with the plan.
+
+```mermaid
+flowchart LR
+    READ["Read the sheet<br/>parts + field text, labels,<br/>notes, drawings (file or API)"] --> BOXES["Text boxes<br/>estimated from string, size,<br/>angle, justification"]
+    BOXES --> CHECK["TEXT_OVERLAP<br/>in sch_review and plans"]
+    BOXES --> DECLUTTER["sch_declutter_plan<br/>move field text, turn labels,<br/>hide PWR_FLAG text"]
+    READ --> LABELS["sch_label_plan<br/>add, rename, turn, delete<br/>refuses a second name or a join"]
+    READ --> DRAW["sch_draw_plan<br/>shapes, notes, titled box"]
+    READ --> ITEMS["sch_edit_items_plan<br/>delete or move by id"]
+    DECLUTTER --> APPLY["sch_apply_plan"]
+    LABELS --> APPLY
+    DRAW --> APPLY
+    ITEMS --> APPLY
+    APPLY --> VERIFY["Nets checked against KiCad,<br/>positions and text read back"]
+```
+
 How the three providers apply it:
 
 | Provider | Applying | If it fails |

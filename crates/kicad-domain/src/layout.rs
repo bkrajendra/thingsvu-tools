@@ -1106,6 +1106,39 @@ pub(crate) fn translate(op: Operation, by: Point) -> Operation {
         Operation::AddJunction { position } => Operation::AddJunction {
             position: position + by,
         },
+        Operation::AddText {
+            text,
+            position,
+            size,
+            angle_deg,
+            h,
+            v,
+        } => Operation::AddText {
+            text,
+            position: position + by,
+            size,
+            angle_deg,
+            h,
+            v,
+        },
+        Operation::AddShape { kind, stroke, filled } => Operation::AddShape {
+            kind: match kind {
+                crate::schematic::ShapeKind::Rectangle { min, max } => crate::schematic::ShapeKind::Rectangle {
+                    min: min + by,
+                    max: max + by,
+                },
+                crate::schematic::ShapeKind::Circle { center, radius } => crate::schematic::ShapeKind::Circle {
+                    center: center + by,
+                    radius,
+                },
+                crate::schematic::ShapeKind::Line { start, end } => crate::schematic::ShapeKind::Line {
+                    start: start + by,
+                    end: end + by,
+                },
+            },
+            stroke,
+            filled,
+        },
     }
 }
 
@@ -1139,6 +1172,15 @@ pub fn operations_bounds(operations: &[Operation], library: &BTreeMap<LibraryId,
             } => symbol_rect(library_id, *position, *orientation),
             Operation::AddWire { start, end, .. } => Rect::from_points([*start, *end]),
             Operation::AddJunction { position } => Rect::from_points([*position]),
+            Operation::AddText {
+                text,
+                position,
+                size,
+                angle_deg,
+                h,
+                v,
+            } => Some(crate::text::text_box(text, *position, *size, *angle_deg, *h, *v)),
+            Operation::AddShape { kind, .. } => Some(kind.bounds()),
             Operation::AddLabel {
                 net,
                 position,

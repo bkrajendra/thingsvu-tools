@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-ai-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "kicad-cli-runner",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-ai-plugin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kicad-cli-runner",
  "kicad-domain",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-cli-runner"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-domain"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-fault-tests"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kicad-cli-runner",
  "kicad-domain",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-ipc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-ipc-mock"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kicad-ipc",
  "prost",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-session"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kicad-cli-runner",
  "kicad-domain",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "kicad-sexpr"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "kicad-domain",
  "thiserror",

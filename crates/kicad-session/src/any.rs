@@ -171,10 +171,50 @@ impl AnySession {
     }
 
     pub async fn apply_plan(&self, plan: &OperationPlan, expected_fingerprint: &str) -> Result<ApplyReport, ToolError> {
-        match self {
+        let mut report = match self {
             Self::Ipc(s) => s.apply_plan(plan, expected_fingerprint).await,
             Self::File(s) => s.apply_plan(plan, expected_fingerprint).await,
+        }?;
+        // Every position and turn the plan asked for is read back from the document.
+        if !plan.moves.is_empty()
+            || !plan.field_changes.is_empty()
+            || plan.operations.iter().any(|op| {
+                matches!(
+                    op,
+                    kicad_domain::Operation::PlaceSymbol { .. } | kicad_domain::Operation::PlacePowerSymbol { .. }
+                )
+            })
+        {
+            match self.design().await {
+                Ok(design) => {
+                    let problems = placement_problems(plan, &design);
+                    report.placements_checked = plan.moves.len()
+                        + plan.field_changes.len()
+                        + plan
+                            .operations
+                            .iter()
+                            .filter(|op| {
+                                matches!(
+                                    op,
+                                    kicad_domain::Operation::PlaceSymbol { .. }
+                                        | kicad_domain::Operation::PlacePowerSymbol { .. }
+                                )
+                            })
+                            .count();
+                    if !problems.is_empty() {
+                        report.verified = false;
+                    }
+                    report.placement_problems = problems;
+                }
+                Err(e) => {
+                    report.verified = false;
+                    report
+                        .placement_problems
+                        .push(format!("the placements could not be read back: {}", e.message));
+                }
+            }
         }
+        Ok(report)
     }
 
     pub async fn save(&self) -> Result<(), ToolError> {
@@ -190,5 +230,160 @@ impl AnySession {
             Self::Ipc(s) => s.save_copy(dir).await,
             Self::File(s) => s.save_copy(dir).await,
         }
+    }
+}
+
+/// Where the document differs from what the plan placed, moved, or changed.
+fn placement_problems(plan: &OperationPlan, design: &kicad_domain::SchematicDesign) -> Vec<String> {
+    let mut problems = Vec::new();
+    let at = |p: kicad_domain::Point| format!("({:.2}, {:.2})", p.x.to_mm(), p.y.to_mm());
+    for m in &plan.moves {
+        match design.symbols.iter().find(|s| s.id.eq_ignore_ascii_case(&m.id)) {
+            Some(s) if s.position == m.to && s.orientation.same_effect(m.orientation) => {}
+            Some(s) => problems.push(format!(
+                "{} is at {} turned {:?}, not at {} turned {:?} as planned",
+                m.reference,
+                at(s.position),
+                s.orientation,
+                at(m.to),
+                m.orientation
+            )),
+            None => problems.push(format!("{} is missing after the move", m.reference)),
+        }
+    }
+    for op in &plan.operations {
+        let (reference, position, orientation) = match op {
+            kicad_domain::Operation::PlaceSymbol {
+                reference,
+                position,
+                orientation,
+                ..
+            }
+            | kicad_domain::Operation::PlacePowerSymbol {
+                reference,
+                position,
+                orientation,
+                ..
+            } => (reference, *position, *orientation),
+            _ => continue,
+        };
+        // A new symbol may be numbered by KiCad; only complain when one by this reference is wrong.
+        if let Some(s) = design.symbols.iter().find(|s| &s.reference == reference) {
+            if s.position != position || !s.orientation.same_effect(orientation) {
+                problems.push(format!(
+                    "{reference} is at {} turned {:?}, not at {} turned {:?} as planned",
+                    at(s.position),
+                    s.orientation,
+                    at(position),
+                    orientation
+                ));
+            }
+        }
+    }
+    for c in &plan.field_changes {
+        let Some(symbol) = design.symbols.iter().find(|s| s.id.eq_ignore_ascii_case(&c.id)) else {
+            problems.push(format!("{} is missing after its text was changed", c.reference));
+            continue;
+        };
+        match symbol.fields.iter().find(|f| f.name == c.field) {
+            Some(f) if c.hide && f.hidden => {}
+            Some(f) if !c.hide && f.position == c.position && !f.hidden => {}
+            Some(f) => problems.push(format!(
+                "the {} text of {} is at {}{}, not {} as planned",
+                c.field.to_lowercase(),
+                c.reference,
+                at(f.position),
+                if f.hidden { " (hidden)" } else { "" },
+                if c.hide { "hidden".to_owned() } else { at(c.position) }
+            )),
+            None => problems.push(format!("{} has no {} text after the change", c.reference, c.field)),
+        }
+    }
+    problems
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kicad_domain::plan::{FieldChange, SymbolMove};
+    use kicad_domain::schematic::{DesignField, DesignSymbol};
+    use kicad_domain::text::{HAlign, VAlign};
+    use kicad_domain::{Nm, Orientation, Point, SchematicDesign};
+
+    fn at(x: i64, y: i64) -> Point {
+        Point::new(Nm(x * 1_270_000), Nm(y * 1_270_000))
+    }
+
+    fn design() -> SchematicDesign {
+        SchematicDesign {
+            symbols: vec![DesignSymbol {
+                id: "AAAA".into(),
+                reference: "R1".into(),
+                position: at(10, 10),
+                fields: vec![DesignField {
+                    name: "Value".into(),
+                    text: "10k".into(),
+                    position: at(12, 10),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn mv(to: Point) -> SymbolMove {
+        SymbolMove {
+            id: "aaaa".into(),
+            reference: "R1".into(),
+            from: at(1, 1),
+            from_orientation: Orientation::default(),
+            to,
+            orientation: Orientation::default(),
+        }
+    }
+
+    #[test]
+    fn a_part_where_the_plan_put_it_is_not_a_problem() {
+        let plan = OperationPlan {
+            moves: vec![mv(at(10, 10))],
+            ..Default::default()
+        };
+        assert!(placement_problems(&plan, &design()).is_empty());
+    }
+
+    #[test]
+    fn a_part_that_ended_up_elsewhere_is_reported() {
+        let plan = OperationPlan {
+            moves: vec![mv(at(20, 10))],
+            ..Default::default()
+        };
+        let problems = placement_problems(&plan, &design());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("R1"));
+    }
+
+    #[test]
+    fn moved_text_is_read_back_too() {
+        let change = |position, hide| FieldChange {
+            id: "AAAA".into(),
+            reference: "R1".into(),
+            field: "Value".into(),
+            from: at(1, 1),
+            position,
+            h: HAlign::Left,
+            v: VAlign::Center,
+            hide,
+        };
+        let ok = OperationPlan {
+            field_changes: vec![change(at(12, 10), false)],
+            ..Default::default()
+        };
+        assert!(placement_problems(&ok, &design()).is_empty());
+        let wrong = OperationPlan {
+            field_changes: vec![change(at(30, 10), false), change(at(12, 10), true)],
+            ..Default::default()
+        };
+        assert_eq!(placement_problems(&wrong, &design()).len(), 2);
     }
 }

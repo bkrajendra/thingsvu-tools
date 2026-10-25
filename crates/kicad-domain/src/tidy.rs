@@ -358,6 +358,7 @@ fn plan_redraw(
                 .iter()
                 .map(|p| format!("{}.{}", plan.references[&p.component_id], p.pin_number))
                 .collect(),
+            ..Default::default()
         })
         .collect();
 
@@ -647,6 +648,13 @@ fn plan_redraw(
             message: "the schematic already matches the layout the tidy tool would draw".into(),
             objects: vec![],
         });
+    } else {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "TEXT_NOT_PLACED",
+            message: "KiCad places each part's reference and value text itself, and it can run into wires or other text; after applying, run sch_declutter_plan".into(),
+            objects: vec![],
+        });
     }
     let total = plan.operations.len() + plan.moves.len() + plan.removals.len();
     if total > MAX_OPERATIONS {
@@ -851,6 +859,7 @@ mod tests {
                     position: *position,
                     orientation: *orientation,
                     unit: 1,
+                    fields: vec![],
                 }),
                 Operation::PlacePowerSymbol {
                     net,
@@ -867,20 +876,48 @@ mod tests {
                     position: *position,
                     orientation: *orientation,
                     unit: 1,
+                    fields: vec![],
                 }),
                 Operation::AddWire { start, end, .. } => design.wires.push(DesignWire {
                     id,
                     start: *start,
                     end: *end,
                 }),
-                Operation::AddLabel { net, position, .. } => design.labels.push(DesignLabel {
+                Operation::AddLabel {
+                    net,
+                    position,
+                    direction,
+                } => design.labels.push(DesignLabel {
                     id,
                     text: net.clone(),
                     position: *position,
+                    direction: *direction,
                 }),
                 Operation::AddJunction { position } => design.junctions.push(DesignJunction {
                     id,
                     position: *position,
+                }),
+                Operation::AddText {
+                    text,
+                    position,
+                    size,
+                    angle_deg,
+                    h,
+                    v,
+                } => design.texts.push(crate::schematic::DesignText {
+                    id,
+                    text: text.clone(),
+                    position: *position,
+                    size: *size,
+                    angle_deg: *angle_deg,
+                    h: *h,
+                    v: *v,
+                }),
+                Operation::AddShape { kind, stroke, filled } => design.shapes.push(crate::schematic::DesignShape {
+                    id,
+                    kind: *kind,
+                    stroke: *stroke,
+                    filled: *filled,
                 }),
             }
         }
@@ -1432,5 +1469,234 @@ mod tests {
             &[],
         );
         assert!(errors(&twisted).iter().any(|f| f.code == "ARRANGE_BAD_ROTATION"));
+    }
+
+    /// A tidy design and the nets KiCad would report for it.
+    fn tidy_design() -> (OperationPlan, SchematicDesign, Vec<NetInfo>) {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let tidy = apply(&design, &plan_tidy(&design, &nets, &library()));
+        (built, tidy, nets)
+    }
+
+    #[test]
+    fn a_label_can_be_renamed_but_not_onto_another_net() {
+        let (_, design, nets) = tidy_design();
+        let label = design.labels.first().expect("the regulator has labels").clone();
+        let other = design
+            .labels
+            .iter()
+            .find(|l| l.text != label.text)
+            .expect("two differently named labels")
+            .text
+            .clone();
+        let edits = crate::edits::LabelEdits {
+            rename: vec![(label.id.clone(), "RENAMED".into())],
+            ..Default::default()
+        };
+        let plan = crate::edits::plan_labels(&design, &nets, &library(), &edits);
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert_eq!(plan.removals.len(), 1);
+        assert!(plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::AddLabel { net, .. } if net == "RENAMED")));
+        assert!(plan.expected_nets.iter().any(|n| n.name == "RENAMED"));
+
+        let onto = crate::edits::LabelEdits {
+            rename: vec![(label.id.clone(), other)],
+            ..Default::default()
+        };
+        let refused = crate::edits::plan_labels(&design, &nets, &library(), &onto);
+        assert!(
+            errors(&refused).iter().any(|f| f.code == "LABEL_WOULD_MERGE_NETS"),
+            "{:#?}",
+            refused.findings
+        );
+    }
+
+    #[test]
+    fn a_label_cannot_give_a_named_net_a_second_name_or_sit_on_nothing() {
+        let (_, design, nets) = tidy_design();
+        let label = design.labels.first().unwrap().clone();
+        let add = |text: &str, at: crate::edits::LabelAt| crate::edits::LabelEdits {
+            add: vec![crate::edits::LabelAdd {
+                text: text.into(),
+                at,
+                direction: None,
+                allow_join: false,
+            }],
+            ..Default::default()
+        };
+        let second = crate::edits::plan_labels(
+            &design,
+            &nets,
+            &library(),
+            &add("ANOTHER", crate::edits::LabelAt::Point(label.position)),
+        );
+        assert!(
+            errors(&second).iter().any(|f| f.code == "LABEL_NET_ALREADY_NAMED"),
+            "{:#?}",
+            second.findings
+        );
+        let nowhere = crate::edits::plan_labels(
+            &design,
+            &nets,
+            &library(),
+            &add(
+                "X",
+                crate::edits::LabelAt::Point(Point::new(Nm(500_000_000), Nm(500_000_000))),
+            ),
+        );
+        assert!(errors(&nowhere).iter().any(|f| f.code == "LABEL_NOT_ON_NET"));
+        let bad = crate::edits::plan_labels(
+            &design,
+            &nets,
+            &library(),
+            &add("  ", crate::edits::LabelAt::Point(label.position)),
+        );
+        assert!(errors(&bad).iter().any(|f| f.code == "LABEL_BAD_TEXT"));
+        let pin = crate::edits::plan_labels(
+            &design,
+            &nets,
+            &library(),
+            &add(
+                "X",
+                crate::edits::LabelAt::Pin {
+                    reference: "R99".into(),
+                    pin: "1".into(),
+                },
+            ),
+        );
+        assert!(errors(&pin).iter().any(|f| f.code == "LABEL_UNKNOWN_PIN"));
+    }
+
+    #[test]
+    fn removing_a_label_leaves_its_net_name_open() {
+        let (_, design, nets) = tidy_design();
+        let label = design.labels.first().unwrap().clone();
+        let edits = crate::edits::LabelEdits {
+            remove: vec![label.id.clone()],
+            ..Default::default()
+        };
+        let plan = crate::edits::plan_labels(&design, &nets, &library(), &edits);
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert_eq!(plan.removals.len(), 1);
+        assert!(
+            plan.expected_nets.iter().any(|n| n.name_open),
+            "{:#?}",
+            plan.expected_nets
+        );
+    }
+
+    #[test]
+    fn a_box_goes_around_parts_and_carries_a_title() {
+        let (_, design, nets) = tidy_design();
+        let parts: Vec<String> = design
+            .symbols
+            .iter()
+            .filter(|s| !s.reference.starts_with('#'))
+            .take(2)
+            .map(|s| s.reference.clone())
+            .collect();
+        let plan = crate::edits::plan_draw(
+            &design,
+            &nets,
+            &library(),
+            &[crate::edits::DrawItem::BoxAround {
+                parts: parts.clone(),
+                margin: Nm(5_080_000),
+                title: Some("Power supply".into()),
+                stroke: crate::edits::DEFAULT_STROKE,
+            }],
+        );
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        let rect = plan
+            .operations
+            .iter()
+            .find_map(|op| match op {
+                Operation::AddShape {
+                    kind: crate::schematic::ShapeKind::Rectangle { min, max },
+                    ..
+                } => Some(Rect { min: *min, max: *max }),
+                _ => None,
+            })
+            .expect("a rectangle");
+        for reference in &parts {
+            let s = design.symbols.iter().find(|s| &s.reference == reference).unwrap();
+            let body = library()[&LibraryId::parse(&s.library_id).unwrap()]
+                .body
+                .unwrap()
+                .transformed(s.orientation)
+                .translate(s.position);
+            assert!(
+                rect.min.x <= body.min.x
+                    && rect.min.y <= body.min.y
+                    && rect.max.x >= body.max.x
+                    && rect.max.y >= body.max.y
+            );
+        }
+        assert!(plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::AddText { text, .. } if text == "Power supply")));
+        assert!(
+            !plan.expected_nets.is_empty(),
+            "a drawing must leave every net as it is"
+        );
+        let missing = crate::edits::plan_draw(
+            &design,
+            &nets,
+            &library(),
+            &[crate::edits::DrawItem::BoxAround {
+                parts: vec!["R99".into()],
+                margin: Nm(0),
+                title: None,
+                stroke: crate::edits::DEFAULT_STROKE,
+            }],
+        );
+        assert!(errors(&missing).iter().any(|f| f.code == "DRAW_UNKNOWN_PART"));
+    }
+
+    #[test]
+    fn items_are_removed_or_moved_by_id() {
+        let (_, mut design, nets) = tidy_design();
+        design.texts.push(crate::schematic::DesignText {
+            id: "note-1".into(),
+            text: "hello".into(),
+            position: Point::new(Nm(10_160_000), Nm(10_160_000)),
+            size: crate::text::DEFAULT_SIZE,
+            ..Default::default()
+        });
+        let wire = design.wires.first().unwrap().id.clone();
+        let remove_note = crate::edits::plan_edit_items(&design, &nets, &library(), &["note-1".into()], &[]);
+        assert_eq!(errors(&remove_note), Vec::<&Finding>::new());
+        assert_eq!(remove_note.removals.len(), 1);
+        assert!(!remove_note.expected_nets.is_empty(), "a note changes no net");
+
+        let moved = crate::edits::plan_edit_items(
+            &design,
+            &nets,
+            &library(),
+            &[],
+            &[("note-1".into(), Point::new(Nm(5_080_000), Nm(0)))],
+        );
+        assert_eq!(moved.removals.len(), 1);
+        assert!(moved
+            .operations
+            .iter()
+            .any(|op| matches!(op, Operation::AddText { position, .. } if position.x == Nm(15_240_000))));
+
+        let drop_wire = crate::edits::plan_edit_items(&design, &nets, &library(), std::slice::from_ref(&wire), &[]);
+        assert!(drop_wire.findings.iter().any(|f| f.code == "ITEMS_MAY_CHANGE_NETS"));
+        assert!(
+            drop_wire.expected_nets.is_empty(),
+            "nets are not promised after a wire goes"
+        );
+        let move_wire = crate::edits::plan_edit_items(&design, &nets, &library(), &[], &[(wire, Point::default())]);
+        assert!(errors(&move_wire).iter().any(|f| f.code == "ITEM_CANNOT_MOVE"));
+        let part = design.symbols.first().unwrap().id.clone();
+        let unknown = crate::edits::plan_edit_items(&design, &nets, &library(), &[part], &[]);
+        assert!(errors(&unknown).iter().any(|f| f.code == "ITEM_NOT_FOUND"));
     }
 }

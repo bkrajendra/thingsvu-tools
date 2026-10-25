@@ -142,3 +142,57 @@ pub fn attach_power_pins(design: &SchematicDesign, library: &BTreeMap<LibraryId,
         nets[n].pins.push(pin);
     }
 }
+
+/// The net a point of the sheet is on: the net of a pin at the point, or of any pin on the wires
+/// connected to the point. None when the point touches nothing that belongs to a net.
+pub fn net_at<'a>(
+    design: &SchematicDesign,
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    nets: &'a [NetInfo],
+    point: Point,
+) -> Option<&'a NetInfo> {
+    let wires: Vec<(Point, Point)> = design.wires.iter().map(|w| (w.start, w.end)).collect();
+    let mut parent: Vec<usize> = (0..wires.len()).collect();
+    for i in 0..wires.len() {
+        for j in i + 1..wires.len() {
+            let (a, b) = (wires[i], wires[j]);
+            if [a.0, a.1].iter().any(|&p| on_segment(p, b.0, b.1))
+                || [b.0, b.1].iter().any(|&p| on_segment(p, a.0, a.1))
+            {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                parent[ri] = rj;
+            }
+        }
+    }
+    let roots: Vec<usize> = (0..wires.len()).map(|i| find(&mut parent, i)).collect();
+    let start: Vec<usize> = (0..wires.len())
+        .filter(|&i| on_segment(point, wires[i].0, wires[i].1))
+        .collect();
+    let network: Vec<usize> = (0..wires.len())
+        .filter(|&i| start.iter().any(|&s| roots[s] == roots[i]))
+        .collect();
+    let touches = |p: Point| p == point || network.iter().any(|&i| on_segment(p, wires[i].0, wires[i].1));
+    for symbol in design.symbols.iter().filter(|s| !s.reference.starts_with('#')) {
+        let Some(def) = LibraryId::parse(&symbol.library_id)
+            .ok()
+            .and_then(|id| library.get(&id))
+        else {
+            continue;
+        };
+        for pin in def.pins.iter().filter(|p| p.unit == 0 || p.unit == symbol.unit) {
+            let Some(offset) = symbol.orientation.apply(pin.local) else {
+                continue;
+            };
+            if touches(symbol.position + offset) {
+                if let Some(net) = nets.iter().find(|n| {
+                    n.pins
+                        .iter()
+                        .any(|p| p.reference == symbol.reference && p.pin == pin.number)
+                }) {
+                    return Some(net);
+                }
+            }
+        }
+    }
+    None
+}

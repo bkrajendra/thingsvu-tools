@@ -140,6 +140,14 @@ To steer it, or to arrange a small circuit yourself:
 >
 > Move the regulator to the top right, group R1 and R2 below it, then reconnect everything.
 
+After a tidy or a reconnect, KiCad decides where the text of each part lands, and it can run into a wire or another part's text. Ask for it to be cleaned up:
+
+> Check the schematic for text that overlaps, and move it.
+
+Labels, notes, and drawings can be edited too:
+
+> Put a box around U1, C1 and C2 titled "Regulator", and add a label OUT on R3 pin 2.
+
 Moving, turning, or deleting a part leaves its wires behind, so the circuit is broken until you ask for **reconnect**, which draws every connection again around the parts where they now are (and checks every net against KiCad). Good for the start of a design and for small circuits; for a whole sheet use the tidy.
 
 ## Three ways to work
@@ -168,6 +176,10 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `sch_describe_layout` | Where every part and pin is (mm), its rotation and body, and the net of each pin. Read-only |
 | `sch_arrange_plan` | Plan moving, turning, mirroring, or deleting named parts. Their wires stay and break until reconnected |
 | `sch_reconnect_plan` | Plan drawing all connections again with the parts where they are, for the circuit as it was before the moves |
+| `sch_declutter_plan` | Find text (part references and values, labels) that runs into other text, a wire, or a part, and plan moving it to a free place; `PWR_FLAG` text that has no room is hidden. Only text changes |
+| `sch_label_plan` | Add, rename, turn, or delete net labels. Refuses a label that would give a net a second name or join two nets by accident |
+| `sch_draw_plan` | Draw rectangles, circles, lines, text notes, and a titled box around named parts (for example "Power supply") |
+| `sch_edit_items_plan` | Delete wires, labels, junctions, notes, and drawings by id, or move labels, notes, and drawings |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |

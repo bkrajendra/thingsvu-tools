@@ -107,10 +107,14 @@ async fn lists_tools_and_returns_envelopes() {
             "sch_apply_plan",
             "sch_arrange_plan",
             "sch_create_demo_circuit",
+            "sch_declutter_plan",
             "sch_describe_layout",
+            "sch_draw_plan",
+            "sch_edit_items_plan",
             "sch_export_netlist",
             "sch_get_netlist",
             "sch_get_symbol_pins",
+            "sch_label_plan",
             "sch_list_symbols",
             "sch_plan_changes",
             "sch_reconnect_plan",
@@ -624,10 +628,31 @@ async fn live_review_tidy_and_set_field_through_mcp() {
     assert!(applied["result"]["moved"].as_u64().unwrap() >= 10);
     assert!(applied["result"]["removed"].as_u64().unwrap() >= 30);
 
-    // Reviewed again, it is tidy.
+    // Reviewed again, it is tidy. The text KiCad put beside the parts may still run into things.
     let after = mcp.call("sch_review", json!({ "session_id": id })).await;
     assert_eq!(after["result"]["tidy"]["already_tidy"], true, "{after}");
+    println!("PROBLEMS after tidy: {}", after["result"]["problems"]);
+
+    // Declutter moves that text; afterwards nothing runs into anything.
+    let declutter = mcp.call("sch_declutter_plan", json!({ "session_id": id })).await;
+    assert_eq!(declutter["ok"], true, "{declutter}");
+    println!("DECLUTTER {}", declutter["result"]["field_changes"]);
+    if declutter["result"]["counts"]["field_changes"].as_u64().unwrap_or(0)
+        + declutter["result"]["counts"]["labels"].as_u64().unwrap_or(0)
+        > 0
+    {
+        let applied = mcp
+            .call(
+                "sch_apply_plan",
+                json!({ "session_id": id, "plan_id": declutter["result"]["plan_id"], "confirm": true, "idempotency_key": "declutter-key-0001" }),
+            )
+            .await;
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(applied["result"]["verified"], true, "{applied}");
+    }
+    let after = mcp.call("sch_review", json!({ "session_id": id })).await;
     assert_eq!(after["result"]["problems"], json!([]), "{after}");
+    assert_eq!(after["result"]["tidy"]["already_tidy"], true, "{after}");
 
     // Change one value. It needs confirm, a real part, and sensible text.
     let no_confirm = mcp
@@ -849,6 +874,209 @@ async fn arrange_flow(provider: &str) {
         )
         .await;
     assert_eq!(bad["result"]["can_apply"], false, "{bad}");
+}
+
+/// Drawings, labels, and notes: add, rename, turn, move, delete. Every plan leaves the nets as
+/// they should be, which applying checks against KiCad.
+#[tokio::test]
+async fn live_labels_drawings_and_items_through_mcp() {
+    text_tools_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_labels_drawings_and_items_through_the_api() {
+    text_tools_flow("headless").await;
+}
+
+async fn text_tools_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-text-{provider}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("regulator.kicad_sch");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/v11/regulator-with-notes/regulator.kicad_sch"),
+        &schematic,
+    )
+    .unwrap();
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": provider }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let n = std::process::id();
+    let mut step = 0;
+    let mut apply = |plan: serde_json::Value| {
+        step += 1;
+        json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true,
+                "idempotency_key": format!("text-{provider}-{n}-{step}") })
+    };
+
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    assert_eq!(layout["ok"], true, "{layout}");
+    let drawings_before = layout["result"]["drawings"].as_array().unwrap().len();
+    let notes_before = layout["result"]["notes"].as_array().unwrap().len();
+    assert!(layout["result"]["labels"][0]["id"].is_string(), "{layout}");
+    let label = layout["result"]["labels"][0].clone();
+
+    // Draw: a box around two parts with a title, a note, and a line.
+    let draw = mcp
+        .call(
+            "sch_draw_plan",
+            json!({ "session_id": id, "items": [
+                { "kind": "box_around", "parts": ["U1", "C1"], "title": "Regulator", "margin_mm": 5.0 },
+                { "kind": "text", "x_mm": 30.0, "y_mm": 150.0, "text": "Checked by assistant" },
+                { "kind": "line", "x1_mm": 30.0, "y1_mm": 152.0, "x2_mm": 60.0, "y2_mm": 152.0 },
+                { "kind": "circle", "x_mm": 80.0, "y_mm": 150.0, "radius_mm": 3.0 },
+            ] }),
+        )
+        .await;
+    assert_eq!(draw["ok"], true, "{draw}");
+    assert_eq!(draw["result"]["can_apply"], true, "{draw}");
+    let applied = mcp.call("sch_apply_plan", apply(draw)).await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    assert_eq!(
+        layout["result"]["drawings"].as_array().unwrap().len(),
+        drawings_before + 3,
+        "{layout}"
+    );
+    assert_eq!(
+        layout["result"]["notes"].as_array().unwrap().len(),
+        notes_before + 2,
+        "{layout}"
+    );
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+
+    // Labels: a second name for a named net is refused; renaming works and keeps every net.
+    let second = mcp
+        .call(
+            "sch_label_plan",
+            json!({ "session_id": id, "add": [{ "text": "SECOND", "x_mm": label["at"]["x"], "y_mm": label["at"]["y"] }] }),
+        )
+        .await;
+    assert_eq!(second["result"]["can_apply"], false, "{second}");
+    assert!(
+        second["result"]["findings"]
+            .to_string()
+            .contains("LABEL_NET_ALREADY_NAMED"),
+        "{second}"
+    );
+    let rename = mcp
+        .call(
+            "sch_label_plan",
+            json!({ "session_id": id, "rename": [{ "id": label["id"], "text": "RENAMED" }] }),
+        )
+        .await;
+    assert_eq!(rename["result"]["can_apply"], true, "{rename}");
+    let applied = mcp.call("sch_apply_plan", apply(rename)).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let nets = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert!(nets["result"].to_string().contains("RENAMED"), "{nets}");
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+
+    // Turn a label.
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    let renamed = layout["result"]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["text"] == "RENAMED")
+        .unwrap()
+        .clone();
+    let turn = mcp
+        .call(
+            "sch_label_plan",
+            json!({ "session_id": id, "turn": [{ "id": renamed["id"], "direction": "up" }] }),
+        )
+        .await;
+    let applied = mcp.call("sch_apply_plan", apply(turn)).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+
+    // Items: move the new note, delete the line and the circle, refuse to move a wire.
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    let note = layout["result"]["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["text"] == "Checked by assistant")
+        .unwrap()
+        .clone();
+    let wire = layout["result"]["wires"][0]["id"].clone();
+    let shapes: Vec<serde_json::Value> = layout["result"]["drawings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["shape"].to_string().contains("circle") || d["shape"].to_string().contains("line"))
+        .map(|d| d["id"].clone())
+        .collect();
+    let refused = mcp
+        .call(
+            "sch_edit_items_plan",
+            json!({ "session_id": id, "moves": [{ "id": wire, "dx_mm": 1.0, "dy_mm": 0.0 }] }),
+        )
+        .await;
+    assert_eq!(refused["result"]["can_apply"], false, "{refused}");
+    let edit = mcp
+        .call(
+            "sch_edit_items_plan",
+            json!({ "session_id": id, "remove": shapes, "moves": [{ "id": note["id"], "dx_mm": 10.0, "dy_mm": 5.0 }] }),
+        )
+        .await;
+    assert_eq!(edit["result"]["can_apply"], true, "{edit}");
+    let applied = mcp.call("sch_apply_plan", apply(edit)).await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    assert_eq!(
+        layout["result"]["drawings"].as_array().unwrap().len(),
+        drawings_before + 1,
+        "{layout}"
+    );
+    let moved = layout["result"]["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["text"] == "Checked by assistant")
+        .unwrap();
+    assert_eq!(
+        moved["at"]["x"].as_f64().unwrap(),
+        note["at"]["x"].as_f64().unwrap() + 10.16,
+        "snapped to the grid: {moved}"
+    );
+    // Text: after a tidy, move whatever text runs into something. The placements read back.
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let tidy = mcp.call("sch_tidy_plan", json!({ "session_id": id })).await;
+    assert_eq!(tidy["result"]["can_apply"], true, "{tidy}");
+    let applied = mcp.call("sch_apply_plan", apply(tidy)).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let declutter = mcp.call("sch_declutter_plan", json!({ "session_id": id })).await;
+    assert_eq!(declutter["result"]["can_apply"], true, "{declutter}");
+    let changes = declutter["result"]["counts"]["field_changes"].as_u64().unwrap_or(0)
+        + declutter["result"]["counts"]["labels"].as_u64().unwrap_or(0);
+    println!("DECLUTTER ({provider}): {changes} changes");
+    if changes > 0 {
+        let applied = mcp.call("sch_apply_plan", apply(declutter)).await;
+        assert_eq!(applied["ok"], true, "{applied}");
+        assert_eq!(applied["result"]["verified"], true, "{applied}");
+        assert!(applied["result"]["placements_checked"].as_u64().unwrap_or(0) > 0 || changes > 0);
+    }
+    let review = mcp.call("sch_review", json!({ "session_id": id })).await;
+    let problems = review["result"]["problems"].to_string();
+    assert!(!problems.contains("runs into"), "text still overlaps: {problems}");
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!("ERC after text tools ({provider}): {} errors", erc["result"]["errors"]);
 }
 
 #[tokio::test]
@@ -1075,6 +1303,75 @@ async fn gui_arrange_demo() {
         erc_before["result"]["errors"], erc_after["result"]["errors"]
     );
     assert!(erc_after["result"]["errors"].as_u64() <= erc_before["result"]["errors"].as_u64());
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: look at the editor; Ctrl+Z undoes the steps");
+}
+
+/// Against a real KiCad 11 editor: report text that runs into things, move it, draw a titled box
+/// around the first two parts, and report again. Open a **copy**, press "KiCad AI: connect", then
+/// run with THINGSVU_GUI_TEXT=1. Ctrl+Z in the editor undoes each step.
+#[tokio::test]
+async fn gui_text_demo() {
+    if std::env::var("THINGSVU_GUI_TEXT").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_TEXT=1 with a registered KiCad editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("session_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let review = mcp.call("sch_review", json!({ "session_id": id })).await;
+    println!("GUI TEXT PROBLEMS BEFORE {}", review["result"]["problems"]);
+
+    let declutter = mcp.call("sch_declutter_plan", json!({ "session_id": id })).await;
+    println!(
+        "GUI DECLUTTER counts={} changes={} findings={}",
+        declutter["result"]["counts"], declutter["result"]["field_changes"], declutter["result"]["findings"]
+    );
+    assert_eq!(declutter["result"]["can_apply"], true, "{declutter}");
+    let changes = declutter["result"]["counts"]["field_changes"].as_u64().unwrap_or(0)
+        + declutter["result"]["counts"]["labels"].as_u64().unwrap_or(0);
+    if changes > 0 {
+        let applied = mcp
+            .call(
+                "sch_apply_plan",
+                json!({ "session_id": id, "plan_id": declutter["result"]["plan_id"], "confirm": true,
+                        "idempotency_key": format!("gui-declutter-{}", std::process::id()) }),
+            )
+            .await;
+        println!("GUI DECLUTTER APPLY {applied}");
+        assert_eq!(applied["result"]["verified"], true, "{applied}");
+    }
+
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    let parts: Vec<&str> = layout["result"]["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["reference"].as_str())
+        .filter(|r| !r.starts_with('#'))
+        .take(2)
+        .collect();
+    let draw = mcp
+        .call(
+            "sch_draw_plan",
+            json!({ "session_id": id, "items": [{ "kind": "box_around", "parts": parts, "title": "Assistant box" }] }),
+        )
+        .await;
+    assert_eq!(draw["result"]["can_apply"], true, "{draw}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": draw["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("gui-draw-{}", std::process::id()) }),
+        )
+        .await;
+    println!("GUI DRAW APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+
+    let review = mcp.call("sch_review", json!({ "session_id": id })).await;
+    println!("GUI TEXT PROBLEMS AFTER {}", review["result"]["problems"]);
     let closed = mcp.call("session_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: look at the editor; Ctrl+Z undoes the steps");

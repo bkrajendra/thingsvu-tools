@@ -212,6 +212,172 @@ pub struct TidyArgs {
     pub near: Vec<NearHintArgs>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DirArg {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl From<DirArg> for kicad_domain::Dir {
+    fn from(d: DirArg) -> Self {
+        match d {
+            DirArg::Left => kicad_domain::Dir::Left,
+            DirArg::Right => kicad_domain::Dir::Right,
+            DirArg::Up => kicad_domain::Dir::Up,
+            DirArg::Down => kicad_domain::Dir::Down,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelAddArgs {
+    /// The net name the label gives (up to 128 characters).
+    pub text: String,
+    /// Put it on a part's pin: `R1.2` (reference, a dot, the pin number).
+    #[serde(default)]
+    pub pin: Option<String>,
+    /// Or on a wire or pin at this place, in mm (give both).
+    #[serde(default)]
+    pub x_mm: Option<f64>,
+    #[serde(default)]
+    pub y_mm: Option<f64>,
+    /// The way the text runs from its anchor; chosen to keep clear of other text when omitted.
+    #[serde(default)]
+    pub direction: Option<DirArg>,
+    /// Allow the label to join this net with an existing net of the same name.
+    #[serde(default)]
+    pub allow_join: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelRenameArgs {
+    /// The label's id (from sch_describe_layout).
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelTurnArgs {
+    pub id: String,
+    pub direction: DirArg,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LabelPlanArgs {
+    pub session_id: String,
+    /// Labels to add.
+    #[serde(default)]
+    pub add: Vec<LabelAddArgs>,
+    /// Labels to give another text (the net takes the new name).
+    #[serde(default)]
+    pub rename: Vec<LabelRenameArgs>,
+    /// Labels to turn to run another way.
+    #[serde(default)]
+    pub turn: Vec<LabelTurnArgs>,
+    /// Ids of labels to delete.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignArg {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DrawItemArgs {
+    /// A rectangle from its top left corner.
+    Rectangle {
+        x_mm: f64,
+        y_mm: f64,
+        width_mm: f64,
+        height_mm: f64,
+        #[serde(default)]
+        stroke_mm: Option<f64>,
+        #[serde(default)]
+        filled: bool,
+    },
+    Circle {
+        x_mm: f64,
+        y_mm: f64,
+        radius_mm: f64,
+        #[serde(default)]
+        stroke_mm: Option<f64>,
+        #[serde(default)]
+        filled: bool,
+    },
+    Line {
+        x1_mm: f64,
+        y1_mm: f64,
+        x2_mm: f64,
+        y2_mm: f64,
+        #[serde(default)]
+        stroke_mm: Option<f64>,
+    },
+    /// A text note anchored at its left end (or as `align` says), sitting on its baseline.
+    Text {
+        x_mm: f64,
+        y_mm: f64,
+        text: String,
+        #[serde(default)]
+        size_mm: Option<f64>,
+        #[serde(default)]
+        rotate_deg: Option<u16>,
+        #[serde(default)]
+        align: Option<AlignArg>,
+    },
+    /// A rectangle around the named parts (bodies, pins, and their text) with an optional title
+    /// inside at the top left, for marking a block such as "Power supply".
+    BoxAround {
+        parts: Vec<String>,
+        #[serde(default)]
+        margin_mm: Option<f64>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        stroke_mm: Option<f64>,
+    },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DrawArgs {
+    pub session_id: String,
+    pub items: Vec<DrawItemArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ItemMoveArgs {
+    /// Id from sch_describe_layout.
+    pub id: String,
+    pub dx_mm: f64,
+    pub dy_mm: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditItemsArgs {
+    pub session_id: String,
+    /// Ids of wires, labels, junctions, notes, and drawings to delete.
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Labels, notes, and drawings to move by an offset.
+    #[serde(default)]
+    pub moves: Vec<ItemMoveArgs>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReconnectArgs {
@@ -525,6 +691,43 @@ impl KicadAiServer {
         Ok((design, plan))
     }
 
+    /// What the planners that edit labels, drawings, and text need: the sheet, its nets, and the
+    /// library symbols of its parts.
+    async fn edit_context(
+        &self,
+        session: &Arc<AnySession>,
+    ) -> Result<
+        (
+            kicad_domain::SchematicDesign,
+            Vec<kicad_domain::NetInfo>,
+            BTreeMap<kicad_domain::LibraryId, kicad_domain::plan::LibrarySymbol>,
+        ),
+        ToolError,
+    > {
+        let design = session.design().await?;
+        let nets = session.netlist().await?;
+        let library = session
+            .library_symbols(&kicad_domain::design_library_ids(&design))
+            .await?;
+        Ok((design, nets, library))
+    }
+
+    /// Stores a planner's result and answers with the plan.
+    async fn store_and_reply(
+        &self,
+        cid: &str,
+        session: &Arc<AnySession>,
+        plan: Result<OperationPlan, ToolError>,
+    ) -> CallToolResult {
+        match plan {
+            Ok(plan) => match self.store_plan(session, plan).await {
+                Ok(view) => envelope::ok(cid, view, live(session), vec![]),
+                Err(e) => envelope::error(cid, &e),
+            },
+            Err(e) => envelope::error(cid, &e),
+        }
+    }
+
     async fn describe_layout(&self, session: &Arc<AnySession>) -> Result<serde_json::Value, ToolError> {
         let design = session.design().await?;
         let nets = session.netlist().await?;
@@ -584,16 +787,26 @@ impl KicadAiServer {
                 "mirror": match (s.orientation.mirror_x, s.orientation.mirror_y) {
                     (false, false) => "none", (true, false) => "x", (false, true) => "y", (true, true) => "both" },
                 "body": body.map(|b| serde_json::json!({ "min": mm(b.min), "max": mm(b.max) })),
+                "text": s.fields.iter().map(|f| serde_json::json!({
+                    "field": f.name, "text": f.text, "at": mm(f.position), "hidden": f.hidden,
+                    "area": f.bounds().map(|b| serde_json::json!({ "min": mm(b.min), "max": mm(b.max) })) })).collect::<Vec<_>>(),
                 "pins": pins,
             }));
         }
+        let dir = |d: kicad_domain::Dir| facing(d);
         Ok(serde_json::json!({
             "units": "mm; x grows right, y grows down; the grid is 1.27 mm",
             "parts": parts,
             "power_symbols": design.symbols.iter().filter(|s| s.reference.starts_with("#PWR")).count(),
-            "wires": design.wires.len(),
-            "labels": design.labels.len(),
-            "notes": design.notes.iter().map(|r| serde_json::json!({ "min": mm(r.min), "max": mm(r.max) })).collect::<Vec<_>>(),
+            "wires": design.wires.iter().map(|w| serde_json::json!({ "id": w.id, "from": mm(w.start), "to": mm(w.end) })).collect::<Vec<_>>(),
+            "labels": design.labels.iter().map(|l| serde_json::json!({
+                "id": l.id, "text": l.text, "at": mm(l.position), "direction": dir(l.direction) })).collect::<Vec<_>>(),
+            "junctions": design.junctions.iter().map(|j| serde_json::json!({ "id": j.id, "at": mm(j.position) })).collect::<Vec<_>>(),
+            "notes": design.texts.iter().map(|t| serde_json::json!({
+                "id": t.id, "text": t.text, "at": mm(t.position), "size": round2(t.size.to_mm()),
+                "area": { "min": mm(t.bounds().min), "max": mm(t.bounds().max) } })).collect::<Vec<_>>(),
+            "drawings": design.shapes.iter().map(|s| serde_json::json!({
+                "id": s.id, "shape": s.kind, "filled": s.filled })).collect::<Vec<_>>(),
         }))
     }
 
@@ -1020,6 +1233,11 @@ much it would change. Read-only. Use sch_render to see it."
                         .iter()
                         .map(|n| format!("{n} is named by a label; a power symbol would be clearer")),
                 )
+                .chain(
+                    r.text_overlaps
+                        .iter()
+                        .map(|(a, b)| format!("the text of {a} runs into {b}")),
+                )
                 .collect(),
             None => vec![],
         };
@@ -1184,6 +1402,114 @@ reported. No part moves. After sch_apply_plan the nets are verified against KiCa
             },
             Err(e) => envelope::error(&cid, &e),
         }
+    }
+
+    #[tool(
+        name = "sch_declutter_plan",
+        description = "Find text that runs into other text, a wire, or a part (part references and values, \
+labels, notes) and plan moving it to the nearest free place beside its part, or turning a label to face \
+another way. The text of a PWR_FLAG that cannot be placed anywhere is hidden. Only text changes, so every \
+net stays as it is. Run it after sch_tidy_plan or sch_reconnect_plan, whose parts KiCad labels where it \
+likes. The extent of text is estimated, so check the result with sch_render. Returns a plan_id."
+    )]
+    pub async fn sch_declutter_plan(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let (design, nets, library) = self.edit_context(&session).await?;
+            Ok::<_, ToolError>(kicad_domain::plan_declutter(&design, &nets, &library))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
+    }
+
+    #[tool(
+        name = "sch_label_plan",
+        description = "Add, rename, turn, or delete net labels. A label names the net it sits on (on a pin \
+`R1.2`, or on a wire at x_mm/y_mm). Refused when it would give a net a second name, or join two nets by \
+accident (pass allow_join to join on purpose). Ids come from sch_describe_layout. Every net is checked \
+against KiCad after applying. Returns a plan_id."
+    )]
+    pub async fn sch_label_plan(&self, Parameters(args): Parameters<LabelPlanArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let edits = match label_edits(&args) {
+            Ok(e) => e,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let (design, nets, library) = self.edit_context(&session).await?;
+            Ok::<_, ToolError>(kicad_domain::plan_labels(&design, &nets, &library, &edits))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
+    }
+
+    #[tool(
+        name = "sch_draw_plan",
+        description = "Draw on the sheet: rectangles, circles, lines, text notes, and a titled box around \
+named parts (kind box_around, e.g. title \"Power supply\"). Drawings carry no electrical meaning, so \
+every net is checked unchanged after applying. Positions in mm (y grows downward) snap to the 1.27 mm \
+grid. Returns a plan_id."
+    )]
+    pub async fn sch_draw_plan(&self, Parameters(args): Parameters<DrawArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let items = match draw_items(&args) {
+            Ok(i) => i,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let (design, nets, library) = self.edit_context(&session).await?;
+            Ok::<_, ToolError>(kicad_domain::plan_draw(&design, &nets, &library, &items))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
+    }
+
+    #[tool(
+        name = "sch_edit_items_plan",
+        description = "Delete wires, labels, junctions, notes, and drawings by id, or move labels, notes, \
+and drawings by an offset (a label may only move along its own wire). Wires and junctions cannot be moved: \
+move parts with sch_arrange_plan and redraw with sch_reconnect_plan. Deleting a wire, label, or junction \
+can split or rename nets, which the plan warns about. Ids come from sch_describe_layout. Returns a plan_id."
+    )]
+    pub async fn sch_edit_items_plan(&self, Parameters(args): Parameters<EditItemsArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let moves: Result<Vec<(String, kicad_domain::Point)>, ToolError> = args
+            .moves
+            .iter()
+            .map(|m| Ok((m.id.clone(), mm_point(m.dx_mm, m.dy_mm)?)))
+            .collect();
+        let moves = match moves {
+            Ok(m) => m,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let (design, nets, library) = self.edit_context(&session).await?;
+            Ok::<_, ToolError>(kicad_domain::plan_edit_items(
+                &design,
+                &nets,
+                &library,
+                &args.remove,
+                &moves,
+            ))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
     }
 
     #[tool(
@@ -1589,6 +1915,137 @@ fn arrange_edits(args: &ArrangeArgs) -> Result<Vec<kicad_domain::PartEdit>, Tool
                 by,
                 rotate_deg: e.rotate_deg,
                 mirror: e.mirror.map(Into::into),
+            })
+        })
+        .collect()
+}
+
+fn label_edits(args: &LabelPlanArgs) -> Result<kicad_domain::LabelEdits, ToolError> {
+    let bad = |m: String| ToolError::new(ErrorCode::InvalidArgument, m);
+    let mut edits = kicad_domain::LabelEdits::default();
+    for a in &args.add {
+        let at = match (&a.pin, a.x_mm, a.y_mm) {
+            (Some(pin), None, None) => {
+                let (reference, number) = pin
+                    .split_once('.')
+                    .ok_or_else(|| bad(format!("pin '{pin}': write it as REF.PIN, e.g. R1.2")))?;
+                kicad_domain::LabelAt::Pin {
+                    reference: reference.to_owned(),
+                    pin: number.to_owned(),
+                }
+            }
+            (None, Some(x), Some(y)) => kicad_domain::LabelAt::Point(mm_point(x, y)?),
+            _ => {
+                return Err(bad(format!(
+                    "label '{}': give either pin, or both x_mm and y_mm",
+                    a.text
+                )))
+            }
+        };
+        edits.add.push(kicad_domain::LabelAdd {
+            text: a.text.clone(),
+            at,
+            direction: a.direction.map(Into::into),
+            allow_join: a.allow_join,
+        });
+    }
+    edits.rename = args.rename.iter().map(|r| (r.id.clone(), r.text.clone())).collect();
+    edits.turn = args.turn.iter().map(|t| (t.id.clone(), t.direction.into())).collect();
+    edits.remove = args.remove.clone();
+    Ok(edits)
+}
+
+fn draw_items(args: &DrawArgs) -> Result<Vec<kicad_domain::DrawItem>, ToolError> {
+    let nm = |mm: f64| {
+        kicad_domain::Nm::from_mm(mm).map_err(|e| ToolError::new(ErrorCode::InvalidArgument, format!("{mm} mm: {e}")))
+    };
+    let stroke = |s: Option<f64>| match s {
+        Some(v) if v >= 0.0 => nm(v),
+        Some(v) => Err(ToolError::new(
+            ErrorCode::InvalidArgument,
+            format!("stroke_mm {v} is negative"),
+        )),
+        None => Ok(kicad_domain::edits::DEFAULT_STROKE),
+    };
+    args.items
+        .iter()
+        .map(|item| {
+            Ok(match item {
+                DrawItemArgs::Rectangle {
+                    x_mm,
+                    y_mm,
+                    width_mm,
+                    height_mm,
+                    stroke_mm,
+                    filled,
+                } => kicad_domain::DrawItem::Rectangle {
+                    min: mm_point(*x_mm, *y_mm)?,
+                    max: mm_point(x_mm + width_mm, y_mm + height_mm)?,
+                    stroke: stroke(*stroke_mm)?,
+                    filled: *filled,
+                },
+                DrawItemArgs::Circle {
+                    x_mm,
+                    y_mm,
+                    radius_mm,
+                    stroke_mm,
+                    filled,
+                } => kicad_domain::DrawItem::Circle {
+                    center: mm_point(*x_mm, *y_mm)?,
+                    radius: nm(*radius_mm)?,
+                    stroke: stroke(*stroke_mm)?,
+                    filled: *filled,
+                },
+                DrawItemArgs::Line {
+                    x1_mm,
+                    y1_mm,
+                    x2_mm,
+                    y2_mm,
+                    stroke_mm,
+                } => kicad_domain::DrawItem::Line {
+                    start: mm_point(*x1_mm, *y1_mm)?,
+                    end: mm_point(*x2_mm, *y2_mm)?,
+                    stroke: stroke(*stroke_mm)?,
+                },
+                DrawItemArgs::Text {
+                    x_mm,
+                    y_mm,
+                    text,
+                    size_mm,
+                    rotate_deg,
+                    align,
+                } => kicad_domain::DrawItem::Text {
+                    text: text.clone(),
+                    position: mm_point(*x_mm, *y_mm)?,
+                    size: match size_mm {
+                        Some(v) if *v > 0.0 => nm(*v)?,
+                        Some(v) => {
+                            return Err(ToolError::new(
+                                ErrorCode::InvalidArgument,
+                                format!("size_mm {v} must be positive"),
+                            ))
+                        }
+                        None => kicad_domain::text::DEFAULT_SIZE,
+                    },
+                    angle_deg: rotate_deg.unwrap_or(0),
+                    h: match align {
+                        Some(AlignArg::Center) => kicad_domain::text::HAlign::Center,
+                        Some(AlignArg::Right) => kicad_domain::text::HAlign::Right,
+                        _ => kicad_domain::text::HAlign::Left,
+                    },
+                    v: kicad_domain::text::VAlign::Bottom,
+                },
+                DrawItemArgs::BoxAround {
+                    parts,
+                    margin_mm,
+                    title,
+                    stroke_mm,
+                } => kicad_domain::DrawItem::BoxAround {
+                    parts: parts.clone(),
+                    margin: nm(margin_mm.unwrap_or(5.08).max(0.0))?,
+                    title: title.clone(),
+                    stroke: stroke(*stroke_mm)?,
+                },
             })
         })
         .collect()

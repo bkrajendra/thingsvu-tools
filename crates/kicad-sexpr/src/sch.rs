@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Reading a `.kicad_sch` file: what is placed, and which symbol definitions it carries.
 
-use kicad_domain::{DesignJunction, DesignLabel, DesignSymbol, DesignWire, Nm, Orientation, Point, SchematicDesign};
+use kicad_domain::schematic::{DesignField, DesignShape, DesignText, ShapeKind};
+use kicad_domain::text::{HAlign, VAlign};
+use kicad_domain::{
+    DesignJunction, DesignLabel, DesignSymbol, DesignWire, Dir, Nm, Orientation, Point, SchematicDesign,
+};
 
 use crate::node::{parse, Node, ParseError};
 
@@ -126,6 +130,32 @@ impl Document {
     pub fn design(&self) -> SchematicDesign {
         let mut design = SchematicDesign::default();
         for s in self.symbols() {
+            let fields = self
+                .item("symbol", &s.uuid)
+                .map(|node| {
+                    ["Reference", "Value"]
+                        .into_iter()
+                        .filter_map(|name| {
+                            let property = node.children("property").find(|p| p.arg_text(0) == Some(name))?;
+                            let at = property.child("at")?;
+                            let look = look(property);
+                            Some(DesignField {
+                                name: name.to_owned(),
+                                text: property.arg_text(1).unwrap_or_default().to_owned(),
+                                position: Point::new(
+                                    Nm((at.arg_f64(0)? * 1e6).round() as i64),
+                                    Nm((at.arg_f64(1)? * 1e6).round() as i64),
+                                ),
+                                angle_deg: angle(at.arg_f64(2)),
+                                size: look.size,
+                                hidden: look.hidden,
+                                h: look.h,
+                                v: look.v,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             design.symbols.push(DesignSymbol {
                 id: s.uuid,
                 reference: s.reference,
@@ -135,6 +165,7 @@ impl Document {
                 position: s.position,
                 orientation: s.orientation,
                 unit: s.unit,
+                fields,
             });
         }
         let point = |n: &Node| {
@@ -162,6 +193,12 @@ impl Document {
                             id,
                             text: text.to_owned(),
                             position,
+                            direction: match angle(item.child("at").and_then(|a| a.arg_f64(2))) {
+                                90 => Dir::Up,
+                                180 => Dir::Left,
+                                270 => Dir::Down,
+                                _ => Dir::Right,
+                            },
                         });
                     }
                 }
@@ -178,20 +215,65 @@ impl Document {
                 // Notes and graphics stay where they are.
                 "text" | "text_box" | "polyline" | "rectangle" | "circle" | "arc" | "bezier" | "image" => {
                     design.annotations += 1;
-                    if head == "text" {
-                        if let (Some(text), Some(at)) = (item.arg_text(0), item.child("at").and_then(point)) {
-                            let size = item
-                                .child("effects")
-                                .and_then(|e| e.child("font"))
-                                .and_then(|f| f.child("size"))
-                                .and_then(|s| s.arg_f64(0))
-                                .unwrap_or(1.27);
-                            design.notes.push(kicad_domain::schematic::note_area(
-                                at,
-                                text,
-                                Nm((size * 1e6).round() as i64),
-                            ));
+                    match head {
+                        "text" => {
+                            if let (Some(text), Some(at)) = (item.arg_text(0), item.child("at").and_then(point)) {
+                                let look = look(item);
+                                let note = DesignText {
+                                    id,
+                                    text: text.to_owned(),
+                                    position: at,
+                                    size: look.size,
+                                    angle_deg: angle(item.child("at").and_then(|a| a.arg_f64(2))),
+                                    h: look.h,
+                                    v: look.v,
+                                };
+                                design.notes.push(note.bounds());
+                                design.texts.push(note);
+                            }
                         }
+                        "rectangle" | "circle" | "polyline" => {
+                            let kind = match head {
+                                "rectangle" => item
+                                    .child("start")
+                                    .and_then(point)
+                                    .zip(item.child("end").and_then(point))
+                                    .map(|(a, b)| ShapeKind::Rectangle {
+                                        min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+                                        max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+                                    }),
+                                "circle" => item.child("center").and_then(point).zip(item.child_f64("radius")).map(
+                                    |(center, r)| ShapeKind::Circle {
+                                        center,
+                                        radius: Nm((r * 1e6).round() as i64),
+                                    },
+                                ),
+                                _ => {
+                                    let ends: Vec<Point> = item
+                                        .child("pts")
+                                        .map(|p| p.children("xy").filter_map(point).collect())
+                                        .unwrap_or_default();
+                                    match ends[..] {
+                                        [start, end] => Some(ShapeKind::Line { start, end }),
+                                        _ => None,
+                                    }
+                                }
+                            };
+                            if let Some(kind) = kind {
+                                design.shapes.push(DesignShape {
+                                    id,
+                                    kind,
+                                    stroke: Nm((item.child("stroke").and_then(|s| s.child_f64("width")).unwrap_or(0.0)
+                                        * 1e6)
+                                        .round() as i64),
+                                    filled: item
+                                        .child("fill")
+                                        .and_then(|f| f.child_text("type"))
+                                        .is_some_and(|t| t != "none"),
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -199,6 +281,47 @@ impl Document {
         }
         design
     }
+}
+
+/// A text angle as a whole number of degrees in 0..360.
+fn angle(a: Option<f64>) -> u16 {
+    a.unwrap_or(0.0).rem_euclid(360.0).round() as u16 % 360
+}
+
+/// How a node's `effects` set its text: size, justification, and whether it is hidden.
+struct Look {
+    size: Nm,
+    h: HAlign,
+    v: VAlign,
+    hidden: bool,
+}
+
+fn look(node: &Node) -> Look {
+    let effects = node.child("effects");
+    let size = effects
+        .and_then(|e| e.child("font"))
+        .and_then(|f| f.child("size"))
+        .and_then(|s| s.arg_f64(0))
+        .map(|mm| Nm((mm * 1e6).round() as i64))
+        .unwrap_or(kicad_domain::text::DEFAULT_SIZE);
+    let (mut h, mut v) = (HAlign::Center, VAlign::Center);
+    if let Some(justify) = effects.and_then(|e| e.child("justify")) {
+        for word in justify.items().iter().skip(1).filter_map(|n| n.text()) {
+            match word {
+                "left" => h = HAlign::Left,
+                "right" => h = HAlign::Right,
+                "top" => v = VAlign::Top,
+                "bottom" => v = VAlign::Bottom,
+                _ => {}
+            }
+        }
+    }
+    // `(hide yes)` sits on the property in current files, and inside `effects` in older ones.
+    let hidden = [Some(node), effects]
+        .into_iter()
+        .flatten()
+        .any(|n| n.child_text("hide") == Some("yes"));
+    Look { size, h, v, hidden }
 }
 
 fn placed(node: &Node) -> Option<PlacedSymbol> {

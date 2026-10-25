@@ -10,6 +10,8 @@ use crate::circuit::CircuitSpec;
 use crate::geometry::{Dir, Nm, Orientation, Point, Rect};
 use crate::ids::{LibraryId, LogicalId};
 use crate::layout;
+use crate::schematic::ShapeKind;
+use crate::text::{HAlign, VAlign};
 use crate::validation::{has_errors, validate_circuit, Finding, Severity};
 
 /// Upper bound on operations in one plan (plan §10 suggested 50; drawn schematics need more).
@@ -78,13 +80,31 @@ pub enum Operation {
     AddJunction {
         position: Point,
     },
+    /// A free text note.
+    AddText {
+        text: String,
+        position: Point,
+        size: Nm,
+        angle_deg: u16,
+        h: HAlign,
+        v: VAlign,
+    },
+    /// A line, rectangle, or circle (not a wire).
+    AddShape {
+        kind: ShapeKind,
+        stroke: Nm,
+        filled: bool,
+    },
 }
 
 /// The pins a net must contain after applying, as `REF.PIN`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ExpectedNet {
     pub name: String,
     pub pins: BTreeSet<String>,
+    /// The name is not checked: the plan removes a label, and the net may fall back to another name.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub name_open: bool,
 }
 
 /// An existing symbol moved to a new place (and orientation). Its identity, fields, and
@@ -111,6 +131,27 @@ pub enum RemovedKind {
     PowerSymbol,
     /// A part the user asked to delete.
     Symbol,
+    /// A free text note.
+    Text,
+    /// A drawn line, rectangle, or circle.
+    Shape,
+}
+
+/// Text of an existing part (its reference or value) moved to another place or hidden. The text
+/// keeps its size and angle; only where it sits (and how it is justified) changes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FieldChange {
+    /// The symbol's id in the document (its UUID).
+    pub id: String,
+    pub reference: String,
+    /// `Reference` or `Value`.
+    pub field: String,
+    pub from: Point,
+    pub position: Point,
+    pub h: HAlign,
+    pub v: VAlign,
+    /// Hide the text (it stays in the symbol).
+    pub hide: bool,
 }
 
 /// An existing drawing item the plan deletes.
@@ -133,6 +174,9 @@ pub struct OperationPlan {
     /// Existing items to delete (tidying an existing schematic).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub removals: Vec<Removal>,
+    /// Existing parts' text to move or hide.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub field_changes: Vec<FieldChange>,
     pub expected_nets: Vec<ExpectedNet>,
     /// Component logical id → planned reference.
     pub references: BTreeMap<LogicalId, String>,
@@ -150,6 +194,9 @@ pub struct OperationPlan {
 pub struct OperationCounts {
     pub moves: usize,
     pub removals: usize,
+    pub field_changes: usize,
+    pub texts: usize,
+    pub shapes: usize,
     pub symbols: usize,
     pub power_symbols: usize,
     pub wires: usize,
@@ -162,6 +209,7 @@ impl OperationPlan {
         let mut c = OperationCounts {
             moves: self.moves.len(),
             removals: self.removals.len(),
+            field_changes: self.field_changes.len(),
             ..Default::default()
         };
         for op in &self.operations {
@@ -171,6 +219,8 @@ impl OperationPlan {
                 Operation::AddWire { .. } => c.wires += 1,
                 Operation::AddLabel { .. } => c.labels += 1,
                 Operation::AddJunction { .. } => c.junctions += 1,
+                Operation::AddText { .. } => c.texts += 1,
+                Operation::AddShape { .. } => c.shapes += 1,
             }
         }
         c
@@ -272,6 +322,14 @@ pub(crate) fn readability_findings(readability: &crate::readability::Readability
             objects: vec![net.clone(), reference.clone()],
         });
     }
+    for (a, b) in &readability.text_overlaps {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "TEXT_OVERLAP",
+            message: format!("the text of {a} runs into {b}"),
+            objects: vec![a.clone(), b.clone()],
+        });
+    }
     findings
 }
 
@@ -339,6 +397,7 @@ pub fn plan_circuit(
         plan.expected_nets.push(ExpectedNet {
             name: net.name.clone(),
             pins,
+            ..Default::default()
         });
     }
 
@@ -465,6 +524,11 @@ pub(crate) mod tests {
                 | Operation::AddLabel { position, .. }
                 | Operation::AddJunction { position } => vec![*position],
                 Operation::AddWire { start, end, .. } => vec![*start, *end],
+                Operation::AddText { position, .. } => vec![*position],
+                Operation::AddShape { kind, .. } => {
+                    let b = kind.bounds();
+                    vec![b.min, b.max]
+                }
             })
             .collect()
     }

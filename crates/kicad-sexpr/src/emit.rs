@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use kicad_domain::plan::{Operation, OperationPlan, RemovedKind, SymbolMove};
+use kicad_domain::plan::{FieldChange, Operation, OperationPlan, RemovedKind, SymbolMove};
+use kicad_domain::schematic::ShapeKind;
+use kicad_domain::text::{HAlign, VAlign};
 use kicad_domain::{Dir, LibraryId, Nm, Orientation, Point};
 
 use crate::node::{mm, quote, Node};
@@ -220,6 +222,75 @@ fn label_node(net: &str, position: Point, direction: Dir) -> Node {
     )
 }
 
+/// `(justify …)` words for an anchor; none when text is centred both ways.
+fn justify_words(h: HAlign, v: VAlign) -> Vec<&'static str> {
+    let mut words = Vec::new();
+    match h {
+        HAlign::Left => words.push("left"),
+        HAlign::Right => words.push("right"),
+        HAlign::Center => {}
+    }
+    match v {
+        VAlign::Top => words.push("top"),
+        VAlign::Bottom => words.push("bottom"),
+        VAlign::Center => {}
+    }
+    words
+}
+
+fn text_node(text: &str, position: Point, size: Nm, angle: u16, h: HAlign, v: VAlign) -> Node {
+    let mut effects = vec![item("font", vec![item("size", vec![num(size), num(size)])])];
+    let words = justify_words(h, v);
+    if !words.is_empty() {
+        effects.push(item("justify", words.into_iter().map(atom).collect()));
+    }
+    item(
+        "text",
+        vec![
+            Node::string(text),
+            word("exclude_from_sim", "no"),
+            at(position, angle),
+            item("effects", effects),
+            uuid(),
+        ],
+    )
+}
+
+fn shape_node(kind: ShapeKind, stroke: Nm, filled: bool) -> Node {
+    let stroke = item(
+        "stroke",
+        vec![item("width", vec![num(stroke)]), word("type", "default")],
+    );
+    let fill = item("fill", vec![word("type", if filled { "outline" } else { "none" })]);
+    let xy = |p: Point| item("xy", vec![num(p.x), num(p.y)]);
+    match kind {
+        ShapeKind::Rectangle { min, max } => item(
+            "rectangle",
+            vec![
+                item("start", vec![num(min.x), num(min.y)]),
+                item("end", vec![num(max.x), num(max.y)]),
+                stroke,
+                fill,
+                uuid(),
+            ],
+        ),
+        ShapeKind::Circle { center, radius } => item(
+            "circle",
+            vec![
+                item("center", vec![num(center.x), num(center.y)]),
+                item("radius", vec![num(radius)]),
+                stroke,
+                fill,
+                uuid(),
+            ],
+        ),
+        ShapeKind::Line { start, end } => item(
+            "polyline",
+            vec![item("pts", vec![xy(start), xy(end)]), stroke, fill, uuid()],
+        ),
+    }
+}
+
 fn junction_node(position: Point) -> Node {
     item(
         "junction",
@@ -337,6 +408,54 @@ fn move_edits(text: &str, node: &Node, from: &PlacedSymbol, to: &SymbolMove) -> 
     Ok(edits)
 }
 
+/// The edits that put one field's text somewhere else, justify it differently, or hide it. The
+/// text itself, its size, and its angle stay as they are.
+fn field_edits(text: &str, symbol: &Node, change: &FieldChange) -> Result<Vec<Edit>, EmitError> {
+    let property = symbol
+        .children("property")
+        .find(|p| p.arg_text(0) == Some(change.field.as_str()))
+        .ok_or_else(|| EmitError::ItemNotFound("property", change.field.clone()))?;
+    let field_at = property
+        .child("at")
+        .ok_or(EmitError::NoInsertPoint("a field without a position"))?;
+    let mut edits = vec![Edit {
+        range: field_at.span.clone(),
+        text: at_text(change.position, field_at.arg_text(2).unwrap_or("0")),
+    }];
+    if change.hide {
+        if property.child_text("hide") != Some("yes") {
+            edits.push(Edit {
+                range: field_at.span.end..field_at.span.end,
+                text: "\n\t\t\t(hide yes)".to_owned(),
+            });
+        }
+        return Ok(edits);
+    }
+    let words = justify_words(change.h, change.v);
+    if let Some(effects) = property.child("effects") {
+        let justify = words.iter().map(|w| format!(" {w}")).collect::<String>();
+        match (effects.child("justify"), words.is_empty()) {
+            (Some(existing), false) => edits.push(Edit {
+                range: existing.span.clone(),
+                text: format!("(justify{justify})"),
+            }),
+            (Some(existing), true) => edits.push(Edit {
+                range: removal_range(text, existing),
+                text: String::new(),
+            }),
+            (None, false) => {
+                let close = effects.span.end - 1;
+                edits.push(Edit {
+                    range: close..close,
+                    text: format!("\t(justify{justify})\n\t\t\t"),
+                });
+            }
+            (None, true) => {}
+        }
+    }
+    Ok(edits)
+}
+
 /// `doc`'s text with the text of one property (`Value`, `Footprint`, …) of the symbol with this
 /// uuid replaced; everything else is untouched.
 pub fn set_property(doc: &Document, uuid: &str, name: &str, text: &str) -> Result<String, EmitError> {
@@ -428,6 +547,15 @@ pub fn add_plan(
                 direction,
             } => label_node(net, *position, *direction),
             Operation::AddJunction { position } => junction_node(*position),
+            Operation::AddText {
+                text,
+                position,
+                size,
+                angle_deg,
+                h,
+                v,
+            } => text_node(text, *position, *size, *angle_deg, *h, *v),
+            Operation::AddShape { kind, stroke, filled } => shape_node(*kind, *stroke, *filled),
         };
         if let Operation::PlaceSymbol { library_id, .. } | Operation::PlacePowerSymbol { library_id, .. } = op {
             if doc.embedded(&library_id_text(library_id)).is_none() && added.insert(library_id) {
@@ -455,10 +583,17 @@ pub fn add_plan(
             RemovedKind::Junction => ("junction", "junction"),
             RemovedKind::PowerSymbol => ("symbol", "power symbol"),
             RemovedKind::Symbol => ("symbol", "part"),
+            RemovedKind::Text => ("text", "text note"),
+            RemovedKind::Shape => ("rectangle", "shape"),
         };
-        let node = doc
-            .item(head, &removal.id)
-            .ok_or_else(|| EmitError::ItemNotFound(what, removal.id.clone()))?;
+        let node = if removal.kind == RemovedKind::Shape {
+            ["rectangle", "circle", "polyline"]
+                .into_iter()
+                .find_map(|head| doc.item(head, &removal.id))
+        } else {
+            doc.item(head, &removal.id)
+        }
+        .ok_or_else(|| EmitError::ItemNotFound(what, removal.id.clone()))?;
         edits.push(Edit {
             range: removal_range(text, node),
             text: String::new(),
@@ -476,6 +611,12 @@ pub fn add_plan(
                 .ok_or_else(|| EmitError::ItemNotFound("symbol", m.id.clone()))?;
             edits.extend(move_edits(text, node, from, m)?);
         }
+    }
+    for change in &plan.field_changes {
+        let node = doc
+            .item("symbol", &change.id)
+            .ok_or_else(|| EmitError::ItemNotFound("symbol", change.id.clone()))?;
+        edits.extend(field_edits(text, node, change)?);
     }
     if !items.is_empty() {
         edits.push(insertion(match root.child("sheet_instances") {

@@ -66,6 +66,59 @@ async fn remove_and_move(
             ));
         }
     }
+    for change in &plan.field_changes {
+        let mut symbol = instances
+            .iter()
+            .find(|s| s.id.as_ref().is_some_and(|k| k.value.eq_ignore_ascii_case(&change.id)))
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::new(
+                    ErrorCode::StalePlan,
+                    format!("{} is no longer in the schematic; make a new plan", change.reference),
+                )
+            })?;
+        symbol.definition = None;
+        let (field, path) = match change.field.as_str() {
+            "Reference" => (&mut symbol.reference_field, "reference_field"),
+            "Value" => (&mut symbol.value_field, "value_field"),
+            other => {
+                return Err(ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "{}: only the reference and value text can be moved, not '{other}'",
+                        change.reference
+                    ),
+                ))
+            }
+        };
+        if let Some(f) = field.as_mut() {
+            if change.hide {
+                f.visible = false;
+            } else if let Some(text) = f.text.as_mut() {
+                text.position = vector(change.position);
+                let attributes = text.attributes.get_or_insert_with(Default::default);
+                attributes.horizontal_alignment = match change.h {
+                    kicad_domain::text::HAlign::Left => 1,
+                    kicad_domain::text::HAlign::Center => 2,
+                    kicad_domain::text::HAlign::Right => 3,
+                };
+                attributes.vertical_alignment = match change.v {
+                    kicad_domain::text::VAlign::Top => 1,
+                    kicad_domain::text::VAlign::Center => 2,
+                    kicad_domain::text::VAlign::Bottom => 3,
+                };
+            }
+        }
+        send_symbol_update(client, header, symbol, vec![path.into()])
+            .await
+            .map_err(|mut e| {
+                e.message = format!(
+                    "moving the {} text of {}: {}",
+                    change.field, change.reference, e.message
+                );
+                e
+            })?;
+    }
     for m in &plan.moves {
         let mut symbol = instances
             .iter()
@@ -337,6 +390,9 @@ impl Session {
             backup_path: None,
             moved: plan.moves.len(),
             removed: plan.removals.len(),
+            fields_changed: plan.field_changes.len(),
+            placements_checked: 0,
+            placement_problems: vec![],
         })
     }
 

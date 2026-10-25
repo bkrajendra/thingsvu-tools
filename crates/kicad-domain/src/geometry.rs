@@ -186,10 +186,11 @@ impl Orientation {
 }
 
 /// One of the four drawing directions, in sheet axes (y down).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dir {
     Left,
+    #[default]
     Right,
     Up,
     Down,

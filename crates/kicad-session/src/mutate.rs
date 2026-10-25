@@ -24,7 +24,7 @@ use kicad_ipc::proto::kiapi::schematic::commands::PlaceSymbolFromLibrary;
 use kicad_ipc::proto::kiapi::schematic::types::{
     Junction, LocalLabel, SchematicGraphicShape, SchematicLabelSpinStyle, SchematicLine, SchematicLineType,
     SchematicPin, SchematicPinOrientation, SchematicSymbol, SchematicSymbolInstance, SchematicSymbolOrientation,
-    SchematicSymbolTransform, SchematicSymbolType,
+    SchematicSymbolTransform, SchematicSymbolType, SchematicText,
 };
 use kicad_ipc::Client;
 use prost::Name;
@@ -94,6 +94,15 @@ pub struct ApplyReport {
     pub moved: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub removed: usize,
+    /// Reference or value text moved or hidden.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fields_changed: usize,
+    /// Positions and turns read back from the document and compared with the plan.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub placements_checked: usize,
+    /// What differed (empty when every placement was as planned).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub placement_problems: Vec<String>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -296,7 +305,7 @@ impl Session {
             ));
         }
 
-        if !plan.moves.is_empty() || !plan.removals.is_empty() {
+        if !plan.moves.is_empty() || !plan.removals.is_empty() || !plan.field_changes.is_empty() {
             return self.apply_edit(plan).await;
         }
 
@@ -354,6 +363,9 @@ impl Session {
             backup_path: None,
             moved: 0,
             removed: 0,
+            fields_changed: 0,
+            placements_checked: 0,
+            placement_problems: vec![],
         })
     }
 
@@ -772,6 +784,99 @@ async fn finish(
                     ..Default::default()
                 }))?);
             }
+            Operation::AddText {
+                text,
+                position,
+                size,
+                angle_deg,
+                h,
+                v,
+            } => {
+                labels += 1;
+                items.push(encode(Any::from_msg(&SchematicText {
+                    text: Some(Text {
+                        position: vector(*position),
+                        text: text.clone(),
+                        attributes: Some(kicad_ipc::proto::kiapi::common::types::TextAttributes {
+                            size: vector(Point::new(*size, *size)),
+                            angle: Some(kicad_ipc::proto::kiapi::common::types::Angle {
+                                value_degrees: f64::from(*angle_deg),
+                            }),
+                            horizontal_alignment: match h {
+                                kicad_domain::text::HAlign::Left => 1,
+                                kicad_domain::text::HAlign::Center => 2,
+                                kicad_domain::text::HAlign::Right => 3,
+                            },
+                            vertical_alignment: match v {
+                                kicad_domain::text::VAlign::Top => 1,
+                                kicad_domain::text::VAlign::Center => 2,
+                                kicad_domain::text::VAlign::Bottom => 3,
+                            },
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))?);
+            }
+            Operation::AddShape { kind, stroke, filled } => {
+                labels += 1;
+                let stroke_attrs = Some(kicad_ipc::proto::kiapi::common::types::StrokeAttributes {
+                    width: Some(kicad_ipc::proto::kiapi::common::types::Distance { value_nm: stroke.0 }),
+                    ..Default::default()
+                });
+                match kind {
+                    kicad_domain::schematic::ShapeKind::Line { start, end } => {
+                        items.push(encode(Any::from_msg(&SchematicLine {
+                            start: vector(*start),
+                            end: vector(*end),
+                            r#type: SchematicLineType::SltGraphic as i32,
+                            stroke: stroke_attrs,
+                            ..Default::default()
+                        }))?);
+                    }
+                    _ => {
+                        let geometry = match kind {
+                            kicad_domain::schematic::ShapeKind::Rectangle { min, max } => {
+                                graphic_shape::Geometry::Rectangle(
+                                    kicad_ipc::proto::kiapi::common::types::GraphicRectangleAttributes {
+                                        top_left: vector(*min),
+                                        bottom_right: vector(*max),
+                                        corner_radius: None,
+                                    },
+                                )
+                            }
+                            kicad_domain::schematic::ShapeKind::Circle { center, radius } => {
+                                graphic_shape::Geometry::Circle(
+                                    kicad_ipc::proto::kiapi::common::types::GraphicCircleAttributes {
+                                        center: vector(*center),
+                                        radius_point: vector(Point::new(center.x + *radius, center.y)),
+                                    },
+                                )
+                            }
+                            kicad_domain::schematic::ShapeKind::Line { .. } => unreachable!("handled above"),
+                        };
+                        items.push(encode(Any::from_msg(&SchematicGraphicShape {
+                            shape: Some(GraphicShape {
+                                attributes: Some(kicad_ipc::proto::kiapi::common::types::GraphicAttributes {
+                                    stroke: stroke_attrs,
+                                    fill: Some(kicad_ipc::proto::kiapi::common::types::GraphicFillAttributes {
+                                        fill_type: if *filled {
+                                            kicad_ipc::proto::kiapi::common::types::GraphicFillType::GftFilled as i32
+                                        } else {
+                                            kicad_ipc::proto::kiapi::common::types::GraphicFillType::GftUnfilled as i32
+                                        },
+                                        color: None,
+                                    }),
+                                }),
+                                geometry: Some(geometry),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }))?);
+                    }
+                }
+            }
             Operation::PlaceSymbol { .. } | Operation::PlacePowerSymbol { .. } => {}
         }
     }
@@ -824,6 +929,10 @@ fn item_kiid(any: &Any) -> Option<String> {
         any.to_msg::<LocalLabel>().ok()?.id.map(|k| k.value)
     } else if any.type_url == Junction::type_url() {
         any.to_msg::<Junction>().ok()?.id.map(|k| k.value)
+    } else if any.type_url == SchematicText::type_url() {
+        any.to_msg::<SchematicText>().ok()?.id.map(|k| k.value)
+    } else if any.type_url == SchematicGraphicShape::type_url() {
+        any.to_msg::<SchematicGraphicShape>().ok()?.id.map(|k| k.value)
     } else {
         None
     }
@@ -882,7 +991,7 @@ pub(crate) fn verify_nets(
                     .collect()
             })
             .unwrap_or_default();
-        let name_ok = found.is_some_and(|n| n.name.trim_start_matches('/') == expected.name);
+        let name_ok = found.is_some_and(|n| expected.name_open || n.name.trim_start_matches('/') == expected.name);
         checks.push(NetCheck {
             net: expected.name.clone(),
             ok: actual == wanted && name_ok,

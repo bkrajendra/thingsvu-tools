@@ -67,6 +67,7 @@ fn plan_expecting_a_net() -> OperationPlan {
         expected_nets: vec![ExpectedNet {
             name: "N".into(),
             pins: BTreeSet::from(["R1.1".to_owned()]),
+            ..Default::default()
         }],
         ..Default::default()
     }

@@ -660,6 +660,9 @@ impl FileSession {
             backup_path,
             moved: plan.moves.len(),
             removed: plan.removals.len(),
+            fields_changed: plan.field_changes.len(),
+            placements_checked: 0,
+            placement_problems: vec![],
         })
     }
 

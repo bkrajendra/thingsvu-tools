@@ -710,6 +710,8 @@ Exit: all Tier 2 acceptance criteria.
 ### Phase 8 — Review and tidy existing schematics
 **Done.** The whole sheet (parts, wires, labels, junctions, notes) is read from a live KiCad or a file; `sch_review` reports what is untidy; `sch_tidy_plan` re-lays out an existing circuit with the Phase 5 engine as moves, removals, and additions, applied by `sch_apply_plan` with the same verification (identical nets, no new ERC errors) on the editor, headless, and file providers; `sch_set_field` changes a value or footprint. Parts keep their identity and fields. Refused: buses, global or hierarchical labels, sheets, no-connect flags. Completed in v0.3.0: `sch_describe_layout`, `sch_arrange_plan` (move, turn, mirror, delete named parts; wires stay and break), `sch_reconnect_plan` (a router redraws every connection around the parts where they are, checked against the remembered circuit), and layout hints (`keep`, `place`, `near`) on `sch_tidy_plan`. Details and decisions: docs/tasks.md, Phase 8.
 
+**Phase 9 (v0.4.0).** Text-aware checks (`TEXT_OVERLAP`) from estimated text boxes, `sch_declutter_plan`, `sch_label_plan`, `sch_draw_plan` (shapes, notes, titled boxes), `sch_edit_items_plan`, ids for every item in `sch_describe_layout`, and read-back of every written position, turn, and text move. Details: docs/tasks.md, Phase 9.
+
 ### Later
 PCB tools on IPC (both versions), hierarchical sheets, multi-unit symbols, BOM/part tooling, design-review checks, simulation hand-off, MCP prompts/resources and a bundled skill with KiCad conventions, on-demand tool groups, enclosure integration (§16.1).
 

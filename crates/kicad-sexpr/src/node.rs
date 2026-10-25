@@ -230,6 +230,11 @@ impl Node {
     }
 
     /// First argument of the child `name`: `child_text("uuid")` for `(uuid "…")`.
+    /// The first argument of the child `name`, as a number.
+    pub fn child_f64(&self, name: &str) -> Option<f64> {
+        self.child(name)?.arg_f64(0)
+    }
+
     pub fn child_text(&self, name: &str) -> Option<&str> {
         self.child(name)?.arg_text(0)
     }
