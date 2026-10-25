@@ -22,6 +22,7 @@ pub mod plan;
 pub mod readability;
 pub mod reconnect;
 pub mod result;
+pub mod routing;
 pub mod schematic;
 pub mod text;
 pub mod tidy;

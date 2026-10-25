@@ -642,6 +642,7 @@ impl BoardSession {
                 }
             }
         }
+        let copper_names = board.copper_layers.clone();
         let decode_err = |what: &str, e: prost::DecodeError| {
             ToolError::new(ErrorCode::KicadError, format!("undecodable {what}: {e}"))
         };
@@ -673,6 +674,33 @@ impl BoardSession {
                         // Pad positions come back already placed on the board.
                         at: at(&p.position),
                         net: net_name(&p.net),
+                        size: p
+                            .pad_stack
+                            .as_ref()
+                            .and_then(|s| s.copper_layers.first())
+                            .and_then(|l| l.size)
+                            .map(|v| (Nm(v.x_nm), Nm(v.y_nm))),
+                        angle_deg: p
+                            .pad_stack
+                            .as_ref()
+                            .and_then(|s| s.angle)
+                            .map(|a| a.value_degrees)
+                            .unwrap_or(0.0),
+                        layers: {
+                            let named: Vec<String> = p
+                                .pad_stack
+                                .iter()
+                                .flat_map(|s| s.layers.iter())
+                                .map(|l| layer_name(*l))
+                                .filter(|n| n.ends_with(".Cu"))
+                                .collect();
+                            // A hole through the board reaches every copper layer.
+                            if p.r#type == 1 {
+                                copper_names.clone()
+                            } else {
+                                named
+                            }
+                        },
                         number: p.number,
                     })
                     .collect();

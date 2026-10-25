@@ -11,7 +11,7 @@ use crate::geometry::{Nm, Point, Rect};
 use crate::schematic::SchematicDesign;
 use crate::validation::Severity;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct BoardPad {
     pub number: String,
     /// `smd`, `thru_hole`, `np_thru_hole`, or `connect`.
@@ -19,6 +19,31 @@ pub struct BoardPad {
     /// Where the pad's centre is on the board.
     pub at: Point,
     pub net: String,
+    /// The copper's width and height before the pad is turned, when known.
+    #[serde(skip)]
+    pub size: Option<(Nm, Nm)>,
+    /// The pad's turn on the board, degrees counter-clockwise on screen.
+    #[serde(skip)]
+    pub angle_deg: f64,
+    /// The copper layers the pad is on (`F.Cu`, `B.Cu`, ...).
+    #[serde(skip)]
+    pub layers: Vec<String>,
+}
+
+impl BoardPad {
+    /// The box around the pad's copper on the board, when its size is known.
+    pub fn copper(&self) -> Option<Rect> {
+        let (w, h) = self.size?;
+        let local = Rect {
+            min: Point::new(Nm(-w.0 / 2), Nm(-h.0 / 2)),
+            max: Point::new(Nm(w.0 / 2), Nm(h.0 / 2)),
+        };
+        Some(place_rect(self.at, self.angle_deg, local))
+    }
+
+    pub fn on_layer(&self, layer: &str) -> bool {
+        self.layers.iter().any(|l| l == layer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -448,6 +473,7 @@ mod tests {
                     kind: "smd".into(),
                     at: p(at.x.to_mm() + x, at.y.to_mm() + y),
                     net: (*net).into(),
+                    ..Default::default()
                 })
                 .collect(),
             courtyard: Some(

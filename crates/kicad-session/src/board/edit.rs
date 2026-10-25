@@ -15,7 +15,8 @@ use kicad_domain::board_edit::{BoardEditPlan, BoardOp};
 use kicad_domain::{ErrorCode, MutationState, Nm, Point, Rect, ToolError};
 use kicad_ipc::proto::kiapi::board::commands::{BoardFlipDirection, FlipItems, FlipItemsResponse};
 use kicad_ipc::proto::kiapi::board::types::{
-    BoardGraphicShape, BoardLayer, BoardText, BoardTextBox, Field, FieldId, Footprint, FootprintInstance, Pad, Zone,
+    BoardGraphicShape, BoardLayer, BoardText, BoardTextBox, DrillProperties, Field, FieldId, Footprint,
+    FootprintInstance, Net, Pad, PadStack, PadStackLayer, PadStackShape, PadStackType, Track, Via, ViaType, Zone,
 };
 use kicad_ipc::proto::kiapi::common::commands::{
     BeginCommit, BeginCommitResponse, CommitAction, CreateItems, CreateItemsResponse, DeleteItems, EndCommit, GetItems,
@@ -48,6 +49,13 @@ pub struct EditReport {
     pub placed: Vec<String>,
     pub moved: Vec<String>,
     pub flipped: Vec<String>,
+    pub tracks_and_vias: usize,
+}
+
+/// `F.Cu` to `BL_F_Cu`.
+fn board_layer(name: &str) -> Result<BoardLayer, ToolError> {
+    BoardLayer::from_str_name(&format!("BL_{}", name.replace('.', "_")))
+        .ok_or_else(|| ToolError::new(ErrorCode::InvalidArgument, format!("unknown layer {name}")))
 }
 
 fn kerr(message: impl Into<String>) -> ToolError {
@@ -520,6 +528,7 @@ impl BoardSession {
         let message = match plan.kind {
             "outline" => "AI: board outline",
             "place" => "AI: place footprints",
+            "route" => "AI: route",
             _ => "AI: move footprints",
         };
         let result = apply_steps(client, &header, plan).await;
@@ -708,7 +717,95 @@ async fn apply_steps(
         }
     }
 
-    // 4. Moves: flips first (KiCad's own flip mirrors the footprint top to bottom), then every
+    // 4. Tracks and vias, in one request. A via needs its pad stack spelled out: one sent without
+    // sizes is created with none (the Phase 12 probe).
+    let mut copper = Vec::new();
+    for op in &plan.operations {
+        let encoded = match op {
+            BoardOp::AddTrack {
+                net,
+                start,
+                end,
+                width,
+                layer,
+            } => Any::from_msg(&Track {
+                start: vector(*start),
+                end: vector(*end),
+                width: Some(Distance { value_nm: width.0 }),
+                layer: board_layer(layer)? as i32,
+                net: Some(Net {
+                    name: net.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            BoardOp::AddVia {
+                net,
+                at,
+                diameter,
+                drill,
+            } => Any::from_msg(&Via {
+                position: vector(*at),
+                net: Some(Net {
+                    name: net.clone(),
+                    ..Default::default()
+                }),
+                r#type: ViaType::VtThrough as i32,
+                pad_stack: Some(PadStack {
+                    r#type: PadStackType::PstNormal as i32,
+                    layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+                    drill: Some(DrillProperties {
+                        start_layer: BoardLayer::BlFCu as i32,
+                        end_layer: BoardLayer::BlBCu as i32,
+                        diameter: Some(Vector2 {
+                            x_nm: drill.0,
+                            y_nm: drill.0,
+                        }),
+                        ..Default::default()
+                    }),
+                    copper_layers: vec![PadStackLayer {
+                        layer: BoardLayer::BlFCu as i32,
+                        shape: PadStackShape::PssCircle as i32,
+                        size: Some(Vector2 {
+                            x_nm: diameter.0,
+                            y_nm: diameter.0,
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            _ => continue,
+        };
+        copper.push(encoded.map_err(|e| kerr(e.to_string()))?);
+    }
+    if !copper.is_empty() {
+        let n = copper.len();
+        let r: CreateItemsResponse = client
+            .call(&CreateItems {
+                header: header(),
+                items: copper,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        let failed: Vec<String> = r
+            .created_items
+            .iter()
+            .filter_map(|c| status_ok(&c.status).err())
+            .collect();
+        if !failed.is_empty() || r.created_items.len() != n {
+            return Err(kerr(format!(
+                "KiCad created {} of {n} tracks and vias: {}",
+                r.created_items.len() - failed.len(),
+                failed.join("; ")
+            )));
+        }
+        report.tracks_and_vias = n;
+    }
+
+    // 5. Moves: flips first (KiCad's own flip mirrors the footprint top to bottom), then every
     // footprint sent once with all its items turned and shifted, and its lock.
     let moves: Vec<(&String, &String, &kicad_domain::board_edit::Placement, bool)> = plan
         .operations
@@ -797,4 +894,79 @@ async fn apply_steps(
     }
     update(client, header, items).await?;
     Ok(report)
+}
+
+impl BoardSession {
+    /// The rules routing follows: each net's class (clearance, track width, via), and the board's
+    /// minimums (track width, copper to edge), from the live board.
+    pub async fn routing_rules(&self, nets: &[String]) -> Result<kicad_domain::routing::BoardRules, ToolError> {
+        use kicad_domain::routing::{BoardRules, NetRules};
+        use kicad_ipc::proto::kiapi::board::commands::{
+            BoardDesignRulesResponse, GetBoardDesignRules, GetNetClassForNets, NetClassForNetsResponse,
+        };
+        let ipc = self.ipc.as_ref().ok_or_else(|| {
+            ToolError::new(
+                ErrorCode::FeatureUnavailable,
+                "routing needs a live KiCad 11 session (headless or gui)",
+            )
+        })?;
+        let mut ipc = ipc.lock().await;
+        let document = ipc.document.clone();
+        let classes: NetClassForNetsResponse = ipc
+            .client
+            .call(&GetNetClassForNets {
+                net: nets
+                    .iter()
+                    .map(|n| Net {
+                        name: n.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, false))?;
+        let rules: BoardDesignRulesResponse = ipc
+            .client
+            .call(&GetBoardDesignRules { board: Some(document) })
+            .await
+            .map_err(|e| from_ipc_error(&e, false))?;
+        let defaults = NetRules::default();
+        let mut out = BoardRules::default();
+        for (net, class) in &classes.classes {
+            let Some(b) = class.board.as_ref() else {
+                continue;
+            };
+            let via = b.via_stack.as_ref();
+            out.nets.insert(
+                net.clone(),
+                NetRules {
+                    clearance: b.clearance.map(|d| Nm(d.value_nm)).unwrap_or(defaults.clearance),
+                    track_width: b.track_width.map(|d| Nm(d.value_nm)).unwrap_or(defaults.track_width),
+                    via_diameter: via
+                        .and_then(|v| v.copper_layers.first())
+                        .and_then(|l| l.size)
+                        .map(|s| Nm(s.x_nm))
+                        .filter(|n| n.0 > 0)
+                        .unwrap_or(defaults.via_diameter),
+                    via_drill: via
+                        .and_then(|v| v.drill.as_ref())
+                        .and_then(|d| d.diameter)
+                        .map(|s| Nm(s.x_nm))
+                        .filter(|n| n.0 > 0)
+                        .unwrap_or(defaults.via_drill),
+                },
+            );
+        }
+        if let Some(c) = rules.rules.and_then(|r| r.constraints) {
+            out.copper_edge_clearance = Nm(c.copper_edge_clearance.map(|d| d.value_nm).unwrap_or(500_000));
+            out.min_track_width = Nm(c.min_track_width.map(|d| d.value_nm).unwrap_or(0));
+            // A board minimum clearance above a class's wins.
+            let min = c.min_clearance.map(|d| d.value_nm).unwrap_or(0);
+            for r in out.nets.values_mut() {
+                r.clearance = Nm(r.clearance.0.max(min));
+            }
+            out.default.clearance = Nm(out.default.clearance.0.max(min));
+        }
+        Ok(out)
+    }
 }

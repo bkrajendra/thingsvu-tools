@@ -10,6 +10,7 @@ use std::time::Duration;
 use kicad_domain::board::{place_rect, Board};
 use kicad_domain::board_edit::{self, BoardEditPlan, BoardOp, HolePlacement, MoveRequest, OutlineRequest};
 use kicad_domain::placement::{self, NearHint, PinnedPlace, PlaceHints, PlaceOptions};
+use kicad_domain::routing;
 use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
 use kicad_session::{BoardSession, Provider};
 use rmcp::handler::server::wrapper::Parameters;
@@ -210,6 +211,46 @@ pub struct PcbPlaceArgs {
     /// Space kept between courtyards, mm (default 1), for reference text and routing.
     #[serde(default)]
     pub spacing_mm: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutePointArg {
+    /// A pad, REF.PAD (e.g. U1.2). Or give x_mm and y_mm.
+    #[serde(default)]
+    pub pad: Option<String>,
+    #[serde(default)]
+    pub x_mm: Option<f64>,
+    #[serde(default)]
+    pub y_mm: Option<f64>,
+    /// The layer of the segment that leaves this point (F.Cu, B.Cu, ...). A change of layer puts a
+    /// via here (none at a through-hole pad).
+    #[serde(default)]
+    pub layer: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RouteArg {
+    /// The net; taken from the pads when left out.
+    #[serde(default)]
+    pub net: Option<String>,
+    /// Two or more points. With two and no layers on them, a path is found: straight, a 45°
+    /// dogleg, or an L, on the asked layer or either outer layer.
+    pub points: Vec<RoutePointArg>,
+    /// The layer to route on (default: the pads' common layer, front first).
+    #[serde(default)]
+    pub layer: Option<String>,
+    /// Track width, mm (default: the net class's).
+    #[serde(default)]
+    pub width_mm: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbRouteArgs {
+    pub session_id: String,
+    pub routes: Vec<RouteArg>,
 }
 
 /// What a pending board plan does.
@@ -1122,8 +1163,56 @@ impl KicadAiServer {
     }
 
     #[tool(
+        name = "pcb_route_plan",
+        description = "Plan tracks and vias for named nets. Each route is a list of points (pads as \\nREF.PAD, or x_mm/y_mm); a point's layer applies to the segment leaving it, and a change of layer puts a \\nvia there from the net class (none at a through-hole pad). A route of two points with no layers is given \\na path: straight if clear, else a 45° dogleg or an L, on the asked layer or either outer layer, the \\nshortest that keeps clearance. Widths, clearances, and vias come from the board's net classes and \\nminimums. Every segment and via is checked against other nets' pads, tracks, vias, and holes and the \\nboard edge; a route that cannot keep clearance refuses the whole plan with the reason. Zones are not \\nchecked (a pour is refilled around tracks). Needs a live KiCad 11 session. Apply with pcb_apply_plan, \\nwhich runs DRC before and after."
+    )]
+    pub async fn pcb_route_plan(&self, Parameters(args): Parameters<PcbRouteArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let data = board.read().await?;
+            let rules = board.routing_rules(&data.nets).await?;
+            let requests = args
+                .routes
+                .iter()
+                .enumerate()
+                .map(|(i, r)| route_request(i, r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (plan, summaries) = routing::plan_routes(&data, &rules, &requests)?;
+            let used: BTreeMap<&str, serde_json::Value> = summaries
+                .iter()
+                .map(|s| {
+                    let r = rules.of(&s.net);
+                    (
+                        s.net.as_str(),
+                        serde_json::json!({
+                            "clearance": mm(r.clearance.0), "track_width": mm(r.track_width.0),
+                            "via_diameter": mm(r.via_diameter.0), "via_drill": mm(r.via_drill.0),
+                        }),
+                    )
+                })
+                .collect();
+            let measured = serde_json::json!({
+                "routes": summaries,
+                "rules": used,
+                "copper_edge_clearance": mm(rules.copper_edge_clearance.0),
+            });
+            Ok::<_, ToolError>((plan, measured, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, measured, fp)) => self.store_edit_plan_with(&cid, &board, plan, fp, Some(measured)).await,
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1376,7 +1465,12 @@ fn footprint_json(f: &kicad_domain::board::BoardFootprint, pads: bool) -> serde_
         v["pads"] = f
             .pads
             .iter()
-            .map(|p| serde_json::json!({ "number": p.number, "kind": p.kind, "at": pt(p.at), "net": p.net }))
+            .map(|p| {
+                serde_json::json!({
+                    "number": p.number, "kind": p.kind, "at": pt(p.at), "net": p.net,
+                    "copper": p.copper().map(rect), "layers": p.layers,
+                })
+            })
             .collect();
     }
     v
@@ -1403,6 +1497,43 @@ fn drc_json(report: &kicad_cli_runner::pcb::DrcReport) -> serde_json::Value {
         "unrouted": report.unconnected_items.len(),
         "unrouted_items": report.unconnected_items.iter().take(50).map(show).collect::<Vec<_>>(),
         "schematic_parity": report.schematic_parity.iter().take(50).map(show).collect::<Vec<_>>(),
+    })
+}
+
+fn route_request(i: usize, r: &RouteArg) -> Result<routing::RouteRequest, ToolError> {
+    let points = r
+        .points
+        .iter()
+        .map(|p| {
+            let at = match (&p.pad, p.x_mm, p.y_mm) {
+                (Some(pad), None, None) => {
+                    let (reference, number) = pad
+                        .split_once('.')
+                        .ok_or_else(|| bad_arg(format!("route {}: a pad is REF.PAD, like U1.2, not {pad}", i + 1)))?;
+                    routing::RouteEnd::Pad {
+                        reference: reference.to_owned(),
+                        number: number.to_owned(),
+                    }
+                }
+                (None, Some(x), Some(y)) => routing::RouteEnd::At(point_arg(x, y)?),
+                _ => {
+                    return Err(bad_arg(format!(
+                        "route {}: each point is a pad or x_mm and y_mm",
+                        i + 1
+                    )))
+                }
+            };
+            Ok(routing::RoutePoint {
+                at,
+                layer: p.layer.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ToolError>>()?;
+    Ok(routing::RouteRequest {
+        net: r.net.clone(),
+        points,
+        layer: r.layer.clone(),
+        width: r.width_mm.map(|w| nm_arg("width_mm", w)).transpose()?,
     })
 }
 
@@ -1481,6 +1612,23 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
         } => {
             serde_json::json!({ "op": "place_footprint", "reference": reference, "footprint": lib_id, "at": pt(*at) })
         }
+        BoardOp::AddTrack {
+            net,
+            start,
+            end,
+            width,
+            layer,
+        } => serde_json::json!({
+            "op": "add_track", "net": net, "from": pt(*start), "to": pt(*end), "width": mm(width.0), "layer": layer,
+        }),
+        BoardOp::AddVia {
+            net,
+            at,
+            diameter,
+            drill,
+        } => serde_json::json!({
+            "op": "add_via", "net": net, "at": pt(*at), "diameter": mm(diameter.0), "drill": mm(drill.0),
+        }),
         BoardOp::MoveFootprint {
             reference,
             from,
@@ -1560,21 +1708,49 @@ impl KicadAiServer {
                     "the board changed since the plan was made; make a new plan",
                 ));
             }
+            // A route is judged by DRC too: run before and after.
+            let drc_before = if plan.kind == "route" {
+                self.run_drc(cid, board, false).await.ok()
+            } else {
+                None
+            };
             let report = board.apply_edit(plan).await?;
+            let drc_after = if plan.kind == "route" {
+                self.run_drc(cid, board, false).await.ok()
+            } else {
+                None
+            };
             let mut after = board.read().await?;
             let libs = self.footprint_libraries_in(board.document_path().parent()).await;
             fill_courtyards(&mut after, &libs);
-            Ok::<_, ToolError>((report, after))
+            Ok::<_, ToolError>((report, after, drc_before, drc_after))
         }
         .await;
-        let (report, after) = match result {
+        let (report, after, drc_before, drc_after) = match result {
             Ok(r) => r,
             Err(e) => return envelope::error(cid, &e),
         };
         if let Some(p) = self.state.pending_updates.lock().await.get_mut(&args.plan_id) {
             p.applied_with = Some(args.idempotency_key.clone());
         }
-        let problems = board_edit::verify_edit(plan, &after);
+        let mut problems = board_edit::verify_edit(plan, &after);
+        let drc = match (&drc_before, &drc_after) {
+            (Some(b), Some(a)) => {
+                problems.extend(drc_worse(b, a));
+                Some(serde_json::json!({
+                    "unrouted_before": b.unconnected_items.len(),
+                    "unrouted_after": a.unconnected_items.len(),
+                    "errors_before": b.count("error"),
+                    "errors_after": a.count("error"),
+                    "after": drc_json(a),
+                }))
+            }
+            _ if plan.kind == "route" => {
+                problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
+                None
+            }
+            _ => None,
+        };
         let verified = problems.is_empty();
         let undo = match board.provider() {
             Provider::Gui => "one undo step in the PCB editor (Ctrl+Z)",
@@ -1586,6 +1762,7 @@ impl KicadAiServer {
             "kind": plan.kind,
             "report": report,
             "measured_after": board_edit::measure(&after),
+            "drc": drc,
             "problems": problems,
             "undo": undo,
             "next": "Check with pcb_review or pcb_render, then save with pcb_save.",
@@ -1602,4 +1779,25 @@ impl KicadAiServer {
             )
         }
     }
+}
+
+/// DRC error types that have more violations after a change than before.
+fn drc_worse(before: &kicad_cli_runner::pcb::DrcReport, after: &kicad_cli_runner::pcb::DrcReport) -> Vec<String> {
+    let count = |r: &kicad_cli_runner::pcb::DrcReport| {
+        let mut m: BTreeMap<String, usize> = BTreeMap::new();
+        for v in r.violations.iter().filter(|v| v.severity == "error") {
+            *m.entry(v.kind.clone()).or_default() += 1;
+        }
+        m
+    };
+    let (b, a) = (count(before), count(after));
+    a.iter()
+        .filter(|(k, n)| **n > b.get(*k).copied().unwrap_or(0))
+        .map(|(k, n)| {
+            format!(
+                "DRC: {} more '{k}' error(s) than before ({n} now)",
+                n - b.get(k).copied().unwrap_or(0)
+            )
+        })
+        .collect()
 }

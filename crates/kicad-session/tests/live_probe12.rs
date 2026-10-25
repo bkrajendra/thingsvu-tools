@@ -717,6 +717,121 @@ async fn how_a_headless_board_is_edited() {
         );
     }
 
+    // 5b. Routing facts (12.5): net classes, the board's minimums, a pad's copper, and a via made
+    // from the net class's pad stack.
+    let classes: Result<kicad_ipc::proto::kiapi::board::commands::NetClassForNetsResponse, _> = board
+        .raw_call(&kicad_ipc::proto::kiapi::board::commands::GetNetClassForNets {
+            net: vec![
+                Net {
+                    name: "GND".into(),
+                    ..Default::default()
+                },
+                Net {
+                    name: "+3V3".into(),
+                    ..Default::default()
+                },
+            ],
+        })
+        .await;
+    let mut via_stack = None;
+    match &classes {
+        Ok(r) => {
+            for (net, class) in &r.classes {
+                let b = class.board.as_ref();
+                println!(
+                    "NETCLASS {net}: {} clearance {:?} track {:?} via {:?}",
+                    class.name,
+                    b.and_then(|b| b.clearance),
+                    b.and_then(|b| b.track_width),
+                    b.and_then(|b| b.via_stack.as_ref()).map(|v| (
+                        v.drill.as_ref().and_then(|d| d.diameter),
+                        v.copper_layers.first().and_then(|l| l.size)
+                    ))
+                );
+                via_stack = via_stack.or(b.and_then(|b| b.via_stack.clone()));
+            }
+        }
+        Err(e) => println!("NETCLASS failed: {e}"),
+    }
+    let rules: Result<kicad_ipc::proto::kiapi::board::commands::BoardDesignRulesResponse, _> = board
+        .raw_call(&kicad_ipc::proto::kiapi::board::commands::GetBoardDesignRules {
+            board: Some(document.clone()),
+        })
+        .await;
+    println!(
+        "RULES {:?}",
+        rules.map(|r| r.rules.and_then(|r| r.constraints).map(|c| (
+            c.min_clearance,
+            c.min_track_width,
+            c.copper_edge_clearance,
+            c.min_via_size,
+            c.min_through_drill
+        )))
+    );
+    if let Some(u1) = footprints().await.into_iter().find(|f| reference(f) == "U1") {
+        for p in u1
+            .definition
+            .iter()
+            .flat_map(|d| d.items.iter())
+            .filter(|i| i.type_url == Pad::type_url())
+            .filter_map(|i| i.to_msg::<Pad>().ok())
+            .take(4)
+        {
+            let s = p.pad_stack.as_ref();
+            println!(
+                "U1 PAD {} type {} at {:?} angle {:?} layers {:?} copper {:?}",
+                p.number,
+                p.r#type,
+                p.position,
+                s.and_then(|s| s.angle),
+                s.map(|s| s.layers.clone()),
+                s.map(|s| s
+                    .copper_layers
+                    .iter()
+                    .map(|l| (l.layer, l.shape, l.size))
+                    .collect::<Vec<_>>())
+            );
+        }
+    }
+    if let Some(stack) = via_stack {
+        let via = Via {
+            position: v(140.0, 112.0),
+            net: net("GND"),
+            pad_stack: Some(stack),
+            r#type: kicad_ipc::proto::kiapi::board::types::ViaType::VtThrough as i32,
+            ..Default::default()
+        };
+        let created: Result<CreateItemsResponse, _> = board
+            .raw_call(&CreateItems {
+                header: header(),
+                items: vec![Any::from_msg(&via).unwrap()],
+                ..Default::default()
+            })
+            .await;
+        match created {
+            Ok(r) => {
+                let back = r
+                    .created_items
+                    .first()
+                    .and_then(|c| c.item.as_ref())
+                    .and_then(|a| a.to_msg::<Via>().ok());
+                println!(
+                    "VIA FROM NETCLASS status {:?} drill {:?} size {:?}",
+                    r.created_items.first().map(|c| c.status.clone()),
+                    back.as_ref()
+                        .and_then(|v| v.pad_stack.as_ref())
+                        .and_then(|p| p.drill.as_ref())
+                        .and_then(|d| d.diameter),
+                    back.as_ref()
+                        .and_then(|v| v.pad_stack.as_ref())
+                        .and_then(|p| p.copper_layers.first())
+                        .and_then(|l| l.size)
+                );
+            }
+            Err(e) => println!("VIA FROM NETCLASS failed: {e}"),
+        }
+    }
+
     // 6. The saved file, read with our own reader.
     let copy = dir.join("copy");
     std::fs::create_dir_all(&copy).unwrap();

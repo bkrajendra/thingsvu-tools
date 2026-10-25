@@ -123,6 +123,7 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
     let mut nets: std::collections::BTreeSet<String> = table.values().filter(|n| !n.is_empty()).cloned().collect();
 
     let mut outline: Vec<Point> = Vec::new();
+    let copper = board.copper_layers.clone();
     for item in root.items() {
         match item.head() {
             Some("footprint") | Some("module") => {
@@ -143,16 +144,33 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
                 let pads: Vec<BoardPad> = item
                     .children("pad")
                     .filter_map(|p| {
-                        let local = p.child("at").and_then(point)?;
+                        let at = p.child("at")?;
+                        let local = point(at)?;
                         let net = net_of(p, &table);
                         if !net.is_empty() {
                             nets.insert(net.clone());
                         }
+                        let kind = p.arg_text(1).unwrap_or("smd").to_owned();
+                        let mut layers: Vec<String> = Vec::new();
+                        for l in p.child("layers").map(|l| l.items()).unwrap_or_default().iter().skip(1) {
+                            match l.text() {
+                                Some("*.Cu") | Some("F&B.Cu") => layers.extend(copper.iter().cloned()),
+                                Some(name) if name.ends_with(".Cu") => layers.push(name.to_owned()),
+                                _ => {}
+                            }
+                        }
+                        layers.dedup();
                         Some(BoardPad {
                             number: p.arg_text(0)?.to_owned(),
-                            kind: p.arg_text(1).unwrap_or("smd").to_owned(),
                             at: place_point(position, rotation_deg, local),
                             net,
+                            size: p
+                                .child("size")
+                                .and_then(|s| Some((nm(s.arg_f64(0)?), nm(s.arg_f64(1)?)))),
+                            // The angle in the file is the pad's own turn on the board.
+                            angle_deg: at.arg_f64(2).unwrap_or(0.0),
+                            layers,
+                            kind,
                         })
                     })
                     .collect();

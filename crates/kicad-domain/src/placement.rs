@@ -1108,6 +1108,7 @@ mod tests {
                     kind: "smd".into(),
                     at: at + p(*x, *y),
                     net: (*net).into(),
+                    ..Default::default()
                 })
                 .collect(),
             courtyard: Some(Rect::from_points([at + p(-w / 2.0, -h / 2.0), at + p(w / 2.0, h / 2.0)]).unwrap()),

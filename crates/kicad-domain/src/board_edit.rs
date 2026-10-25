@@ -64,6 +64,21 @@ pub enum BoardOp {
         /// Its reference text goes below it (a hole near the top edge), else above.
         reference_below: bool,
     },
+    /// A track (straight segment) on a copper layer.
+    AddTrack {
+        net: String,
+        start: Point,
+        end: Point,
+        width: Nm,
+        layer: String,
+    },
+    /// A through via.
+    AddVia {
+        net: String,
+        at: Point,
+        diameter: Nm,
+        drill: Nm,
+    },
     /// A footprint moved, turned, or flipped, and its lock set.
     MoveFootprint {
         reference: String,
@@ -192,6 +207,17 @@ pub fn moved(f: &BoardFootprint, to: Placement) -> BoardFootprint {
     out.layer = if to.back { "B.Cu" } else { "F.Cu" }.to_owned();
     for pad in &mut out.pads {
         pad.at = place_point(to.at, to.rotation_deg, local(pad.at));
+        let own = pad.angle_deg - from.rotation_deg;
+        pad.angle_deg = normalize_deg(to.rotation_deg + if flip { -own } else { own });
+        if flip {
+            for l in &mut pad.layers {
+                *l = match l.as_str() {
+                    "F.Cu" => "B.Cu".to_owned(),
+                    "B.Cu" => "F.Cu".to_owned(),
+                    other => other.to_owned(),
+                };
+            }
+        }
     }
     let court_local = f.courtyard_local.map(|r| {
         if flip {
@@ -610,6 +636,48 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                 }
                 None => problems.push(format!("{reference} is not on the board")),
             },
+            BoardOp::AddTrack {
+                net,
+                start,
+                end,
+                width,
+                layer,
+            } => {
+                let found = after.tracks.iter().any(|t| {
+                    &t.net == net
+                        && &t.layer == layer
+                        && (t.width.0 - width.0).abs() <= PLACE_TOLERANCE_NM
+                        && ((near(t.start, *start) && near(t.end, *end)) || (near(t.start, *end) && near(t.end, *start)))
+                });
+                if !found {
+                    problems.push(format!(
+                        "no {net} track from ({:.3}, {:.3}) to ({:.3}, {:.3}) mm on {layer} after applying",
+                        start.x.to_mm(),
+                        start.y.to_mm(),
+                        end.x.to_mm(),
+                        end.y.to_mm()
+                    ));
+                }
+            }
+            BoardOp::AddVia {
+                net, at, diameter, drill,
+            } => {
+                let found = after.vias.iter().any(|v| {
+                    &v.net == net
+                        && near(v.at, *at)
+                        && (v.diameter.0 - diameter.0).abs() <= PLACE_TOLERANCE_NM
+                        && (v.drill.0 - drill.0).abs() <= PLACE_TOLERANCE_NM
+                });
+                if !found {
+                    problems.push(format!(
+                        "no {net} via of {:.2}/{:.2} mm at ({:.3}, {:.3}) mm after applying",
+                        diameter.to_mm(),
+                        drill.to_mm(),
+                        at.x.to_mm(),
+                        at.y.to_mm()
+                    ));
+                }
+            }
             BoardOp::MoveFootprint {
                 reference, to, locked, ..
             } => {
@@ -704,12 +772,14 @@ mod tests {
                     kind: "smd".into(),
                     at: at + p(-1.0, 0.0),
                     net: "A".into(),
+                    ..Default::default()
                 },
                 BoardPad {
                     number: "2".into(),
                     kind: "smd".into(),
                     at: at + p(1.0, 0.0),
                     net: "B".into(),
+                    ..Default::default()
                 },
             ],
             courtyard: Some(Rect::from_points([at + p(-2.0, -1.0), at + p(2.0, 1.0)]).unwrap()),

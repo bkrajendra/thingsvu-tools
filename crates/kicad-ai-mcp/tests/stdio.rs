@@ -122,6 +122,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_place_plan",
             "pcb_render",
             "pcb_review",
+            "pcb_route_plan",
             "pcb_run_drc",
             "pcb_save",
             "pcb_update_from_schematic_plan",
@@ -2097,6 +2098,15 @@ async fn live_board_outline_and_moves() {
         )
         .await;
     assert_eq!(footprint(&list, "R3")["pads"], r3["pads"], "{list}");
+    // The pads' copper is known on both sides and turned with the part: an 0603 pad is 0.8 mm wide
+    // and 0.95 mm tall at 0°, so 0.95 x 0.8 at 90°.
+    let copper = &r3["pads"][0]["copper"];
+    assert_eq!(
+        (copper["width"].as_f64(), copper["height"].as_f64()),
+        (Some(0.95), Some(0.8)),
+        "{r3}"
+    );
+    assert_eq!(r3["pads"][0]["layers"], json!(["F.Cu"]), "{r3}");
     assert_eq!(
         footprint(&list, "H4")["library_id"],
         "MountingHole:MountingHole_3.2mm_M3"
@@ -2351,4 +2361,208 @@ async fn gui_pcb_place_demo() {
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: the footprints are placed; Ctrl+Z undoes it (and once more the outline, if one was added)");
+}
+
+/// The placed regulator board gets tracks: every two-pad net routed pad to pad where a simple path
+/// is clear, and one route through a via; DRC before and after, read back, saved.
+#[tokio::test]
+async fn live_board_is_routed() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("route", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-route-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+
+    // Refusals: two nets, an unknown pad, no layer in common.
+    let short = mcp
+        .call(
+            "pcb_route_plan",
+            json!({ "session_id": id, "routes": [{ "points": [{ "pad": "U1.1" }, { "pad": "U1.2" }] }] }),
+        )
+        .await;
+    assert_eq!(short["ok"], false, "{short}");
+    assert!(short["error"]["message"].as_str().unwrap().contains("short"), "{short}");
+    let unknown = mcp
+        .call(
+            "pcb_route_plan",
+            json!({ "session_id": id, "routes": [{ "points": [{ "pad": "U1.1" }, { "pad": "U9.2" }] }] }),
+        )
+        .await;
+    assert_eq!(unknown["ok"], false, "{unknown}");
+
+    // Every net with two pads, pad to pad; keep the ones a simple path can do.
+    let nets = mcp.call("pcb_list_nets", json!({ "session_id": id })).await;
+    let mut routable = Vec::new();
+    for (name, net) in nets["result"]["nets"].as_object().unwrap() {
+        let pads = net["pads"].as_array().unwrap();
+        if pads.len() != 2 {
+            continue;
+        }
+        let route = json!({ "points": [{ "pad": pads[0] }, { "pad": pads[1] }] });
+        let one = mcp
+            .call("pcb_route_plan", json!({ "session_id": id, "routes": [route.clone()] }))
+            .await;
+        println!(
+            "ROUTE {name}: {}",
+            if one["ok"] == true {
+                one["result"]["measured"]["routes"][0].to_string()
+            } else {
+                one["error"]["message"].to_string()
+            }
+        );
+        if one["ok"] == true {
+            routable.push(route);
+        }
+    }
+    assert!(!routable.is_empty(), "at least one two-pad net has a simple path");
+
+    // One route through a via: from a pad of the first routable net down on the back and back up.
+    let all = mcp
+        .call("pcb_route_plan", json!({ "session_id": id, "routes": routable }))
+        .await;
+    assert_eq!(all["ok"], true, "{all}");
+    let tracks: usize = all["result"]["measured"]["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["segments"].as_u64().unwrap() as usize)
+        .sum();
+    let applied = apply_board(&mut mcp, &id, &all, &key("routes")).await;
+    println!("ROUTE APPLY {}", applied["result"]["drc"]);
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let drc = &applied["result"]["drc"];
+    assert!(
+        drc["unrouted_after"].as_u64().unwrap() < drc["unrouted_before"].as_u64().unwrap(),
+        "{drc}"
+    );
+    assert!(
+        drc["errors_after"].as_u64().unwrap() <= drc["errors_before"].as_u64().unwrap(),
+        "{drc}"
+    );
+
+    // A via route on GND: a free spot on the front, down to the back, along, and back up.
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    let o = &info["result"]["outline"];
+    let (x0, y0) = (o["min"]["x"].as_f64().unwrap(), o["min"]["y"].as_f64().unwrap());
+    let (x1, y1) = (o["max"]["x"].as_f64().unwrap(), o["max"]["y"].as_f64().unwrap());
+    let via_route = json!({ "net": "GND", "points": [
+        { "x_mm": x1 - 4.0, "y_mm": y0 + 4.0, "layer": "F.Cu" },
+        { "x_mm": x1 - 4.0, "y_mm": y0 + 7.0, "layer": "B.Cu" },
+        { "x_mm": x1 - 8.0, "y_mm": y0 + 7.0, "layer": "F.Cu" },
+        { "x_mm": x1 - 8.0, "y_mm": y0 + 4.0 }
+    ] });
+    let _ = (x0, y1);
+    let plan = mcp
+        .call("pcb_route_plan", json!({ "session_id": id, "routes": [via_route] }))
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["measured"]["routes"][0]["vias"], 2, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("via")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let listed = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    let vias = listed["result"]["vias"].as_array().unwrap();
+    assert_eq!(vias.len(), 2, "{listed}");
+    assert!(
+        vias.iter().all(|v| v["diameter"] == 0.6 && v["drill"] == 0.3),
+        "{listed}"
+    );
+
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    mcp.call("pcb_close", json!({ "session_id": id })).await;
+    let file = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    let fid = file["result"]["session_id"].clone();
+    let listed = mcp.call("pcb_list_tracks", json!({ "session_id": fid })).await;
+    assert_eq!(
+        listed["result"]["track_count"].as_u64().unwrap() as usize,
+        tracks + 3,
+        "{listed}"
+    );
+}
+
+/// Against a real KiCad 11 PCB editor: every two-pad net that a simple path can reach is routed,
+/// one undo step, with DRC before and after. Open a **copy** of a placed board in the PCB Editor,
+/// press "KiCad AI: connect" there, then run with THINGSVU_GUI_PCB_ROUTE=1.
+#[tokio::test]
+async fn gui_pcb_route_demo() {
+    if std::env::var("THINGSVU_GUI_PCB_ROUTE").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_PCB_ROUTE=1 with a registered KiCad PCB editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let nets = mcp.call("pcb_list_nets", json!({ "session_id": id })).await;
+    let mut routes = Vec::new();
+    for (name, net) in nets["result"]["nets"].as_object().unwrap() {
+        let pads = net["pads"].as_array().unwrap();
+        if pads.len() != 2 || net["tracks"] != 0 {
+            continue;
+        }
+        let route = json!({ "points": [{ "pad": pads[0] }, { "pad": pads[1] }] });
+        let one = mcp
+            .call("pcb_route_plan", json!({ "session_id": id, "routes": [route.clone()] }))
+            .await;
+        println!(
+            "GUI ROUTE {name}: {}",
+            if one["ok"] == true {
+                "clear"
+            } else {
+                one["error"]["message"].as_str().unwrap_or("")
+            }
+        );
+        if one["ok"] == true {
+            routes.push(route);
+        }
+    }
+    assert!(
+        !routes.is_empty(),
+        "no two-pad net has a clear simple path; place the parts first"
+    );
+    let plan = mcp
+        .call("pcb_route_plan", json!({ "session_id": id, "routes": routes }))
+        .await;
+    let applied = apply_board(&mut mcp, &id, &plan, &format!("gui-pcb-route-{}", std::process::id())).await;
+    println!(
+        "GUI ROUTE APPLY verified {} unrouted {} -> {}, errors {} -> {}",
+        applied["result"]["verified"],
+        applied["result"]["drc"]["unrouted_before"],
+        applied["result"]["drc"]["unrouted_after"],
+        applied["result"]["drc"]["errors_before"],
+        applied["result"]["drc"]["errors_after"]
+    );
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: the tracks are on the board; Ctrl+Z undoes them");
 }
