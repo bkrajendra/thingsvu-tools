@@ -49,5 +49,6 @@ Board sessions (`pcb_open`) are separate from schematic sessions. They have no p
 | Render (`pcb_render`) | kicad_cli (KiCad 11 only) | kicad_cli (KiCad 11 only) | kicad_cli (KiCad 11 only) |
 | Review (`pcb_review`) | ipc + kicad_cli | ipc + kicad_cli | project_file + kicad_cli |
 | Update from the schematic (`pcb_update_from_schematic_plan`, `pcb_apply_plan`) | ipc (`ImportNetlist`); the board stays unsaved until `pcb_save` | ipc; live in the editor | not available |
+| Outline and moves (`pcb_outline_plan`, `pcb_move_plan`, `pcb_apply_plan`) | ipc, one commit; unsaved until `pcb_save` | ipc, one commit (one undo step); not yet tried live | not available (D3) |
 | Save (`pcb_save`) | ipc | ipc | not applicable |
 

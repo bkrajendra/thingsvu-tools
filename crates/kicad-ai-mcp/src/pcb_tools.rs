@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kicad_domain::board::{place_rect, Board};
+use kicad_domain::board_edit::{self, BoardEditPlan, BoardOp, HolePlacement, MoveRequest, OutlineRequest};
 use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
 use kicad_session::{BoardSession, Provider};
 use rmcp::handler::server::wrapper::Parameters;
@@ -130,13 +131,108 @@ pub struct PcbApplyArgs {
     pub idempotency_key: String,
 }
 
-/// An update of the board from the schematic, planned and waiting to be applied.
+/// What a pending board plan does.
+pub enum PendingWork {
+    /// An update of the board from the schematic.
+    Update { netlist: PathBuf, schematic: PathBuf },
+    /// An outline or moves (Phase 12).
+    Edit(Box<BoardEditPlan>),
+}
+
+/// A board plan waiting to be applied.
 pub struct PendingUpdate {
     pub session_id: String,
-    pub netlist: PathBuf,
     pub fingerprint: String,
     pub applied_with: Option<String>,
-    pub schematic: PathBuf,
+    pub work: PendingWork,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct XyMm {
+    pub x_mm: f64,
+    pub y_mm: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbOutlineArgs {
+    pub session_id: String,
+    /// Board width and height in mm. Leave both out to fit the outline around the footprints.
+    #[serde(default)]
+    pub width_mm: Option<f64>,
+    #[serde(default)]
+    pub height_mm: Option<f64>,
+    /// Top-left corner of a sized outline, in mm. Default: centred on the footprints.
+    #[serde(default)]
+    pub origin: Option<XyMm>,
+    /// Margin around the footprints for a fitted outline (default 2 mm).
+    #[serde(default)]
+    pub margin_mm: Option<f64>,
+    /// Corner radius in mm (default 0, square corners).
+    #[serde(default)]
+    pub corner_radius_mm: Option<f64>,
+    /// Replace the outline the board already has (its Edge.Cuts drawings are deleted).
+    #[serde(default)]
+    pub replace: bool,
+    /// Mounting holes: "none" (default) or "corners" (one in each corner, hole_inset_mm from both
+    /// edges). Or give hole_positions instead.
+    #[serde(default)]
+    pub mounting_holes: Option<String>,
+    /// Hole centres in mm, inside the outline.
+    #[serde(default)]
+    pub hole_positions: Option<Vec<XyMm>>,
+    /// How far a corner hole's centre is from both edges (default 4 mm).
+    #[serde(default)]
+    pub hole_inset_mm: Option<f64>,
+    /// The hole footprint, Library:Name (default MountingHole:MountingHole_3.2mm_M3).
+    #[serde(default)]
+    pub hole_footprint: Option<String>,
+    /// Grid the corners and holes snap to, in mm (default 0.5; 0 for none).
+    #[serde(default)]
+    pub grid_mm: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MoveArg {
+    /// The footprint's reference, e.g. U1.
+    pub reference: String,
+    /// Absolute place of the footprint's anchor, in mm.
+    #[serde(default)]
+    pub x_mm: Option<f64>,
+    #[serde(default)]
+    pub y_mm: Option<f64>,
+    /// Or an offset from where it is, in mm.
+    #[serde(default)]
+    pub dx_mm: Option<f64>,
+    #[serde(default)]
+    pub dy_mm: Option<f64>,
+    /// Absolute turn in degrees, counter-clockwise on screen.
+    #[serde(default)]
+    pub rotation_deg: Option<f64>,
+    /// Or a turn added to the current one.
+    #[serde(default)]
+    pub rotate_by_deg: Option<f64>,
+    /// "front" or "back"; a change flips the footprint as KiCad does.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Lock (true) or unlock (false) the footprint.
+    #[serde(default)]
+    pub lock: Option<bool>,
+    /// Move it although it is locked. Locked footprints are refused otherwise.
+    #[serde(default)]
+    pub allow_locked: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbMoveArgs {
+    pub session_id: String,
+    pub moves: Vec<MoveArg>,
+    /// Grid absolute places snap to, in mm (default 0.5; 0 for none). Offsets are not snapped.
+    #[serde(default)]
+    pub grid_mm: Option<f64>,
 }
 
 fn mm(v: i64) -> f64 {
@@ -175,6 +271,8 @@ fn fingerprint(board: &Board) -> String {
             f.position.x.0,
             f.position.y.0,
             f.layer.as_str(),
+            (f.rotation_deg * 1000.0).round() as i64,
+            f.locked,
         )
             .hash(&mut h);
         for p in &f.pads {
@@ -184,6 +282,9 @@ fn fingerprint(board: &Board) -> String {
     board.tracks.len().hash(&mut h);
     board.vias.len().hash(&mut h);
     board.zones.len().hash(&mut h);
+    for e in &board.edges {
+        (&e.id, e.locked).hash(&mut h);
+    }
     format!("{:016x}", h.finish())
 }
 
@@ -226,6 +327,7 @@ fn fill_courtyards(board: &mut Board, libs: &kicad_session::footprints::Footprin
                 };
             }
             f.courtyard = Some(place_rect(f.position, f.rotation_deg, local));
+            f.courtyard_local = Some(local);
         }
     }
 }
@@ -706,10 +808,12 @@ impl KicadAiServer {
                     plan_id.clone(),
                     PendingUpdate {
                         session_id: board.id().to_owned(),
-                        netlist,
                         fingerprint: fp,
                         applied_with: None,
-                        schematic: schematic.clone(),
+                        work: PendingWork::Update {
+                            netlist,
+                            schematic: schematic.clone(),
+                        },
                     },
                 );
                 let can_apply = dry.errors == 0;
@@ -735,8 +839,111 @@ impl KicadAiServer {
     }
 
     #[tool(
+        name = "pcb_outline_plan",
+        description = "Plan a board outline on Edge.Cuts: a rectangle (rounded with corner_radius_mm), of \\nwidth_mm x height_mm at origin (default centred on the parts), or fitted around the footprints with \\nmargin_mm (default 2 mm). Optional mounting holes in the corners (mounting_holes: \"corners\") or at \\nhole_positions, named H1, H2, ... A board that has an outline is refused unless replace is true. Corners \\nand holes snap to grid_mm (0.5). The plan shows the outline, the holes, and footprints outside the new \\noutline or hit by a hole. Needs a live KiCad 11 session. Apply with pcb_apply_plan."
+    )]
+    pub async fn pcb_outline_plan(&self, Parameters(args): Parameters<PcbOutlineArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let mut data = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut data, &libs);
+            let size = match (args.width_mm, args.height_mm) {
+                (Some(w), Some(h)) => Some((nm_arg("width_mm", w)?, nm_arg("height_mm", h)?)),
+                (None, None) => None,
+                _ => {
+                    return Err(bad_arg(
+                        "give both width_mm and height_mm, or neither to fit the outline",
+                    ))
+                }
+            };
+            let hole_footprint = args
+                .hole_footprint
+                .clone()
+                .unwrap_or_else(|| board_edit::DEFAULT_HOLE_FOOTPRINT.to_owned());
+            let holes = match (args.mounting_holes.as_deref(), &args.hole_positions) {
+                (Some(_), Some(_)) => return Err(bad_arg("give mounting_holes or hole_positions, not both")),
+                (None | Some("none"), None) => HolePlacement::None,
+                (Some("corners"), None) => HolePlacement::Corners {
+                    inset: nm_arg(
+                        "hole_inset_mm",
+                        args.hole_inset_mm.unwrap_or(board_edit::DEFAULT_HOLE_INSET_MM),
+                    )?,
+                },
+                (Some(other), None) => return Err(bad_arg(format!("mounting_holes is none or corners, not {other}"))),
+                (None, Some(points)) => HolePlacement::At(
+                    points
+                        .iter()
+                        .map(|p| point_arg(p.x_mm, p.y_mm))
+                        .collect::<Result<_, _>>()?,
+                ),
+            };
+            let hole_courtyard = if matches!(holes, HolePlacement::None) {
+                None
+            } else {
+                let fp = libs.get(&hole_footprint).ok_or_else(|| {
+                    ToolError::new(
+                        ErrorCode::SymbolNotFound,
+                        format!("no footprint {hole_footprint} in the libraries (use fp_search)"),
+                    )
+                })?;
+                fp.courtyard
+            };
+            let request = OutlineRequest {
+                size,
+                origin: args.origin.as_ref().map(|o| point_arg(o.x_mm, o.y_mm)).transpose()?,
+                margin: nm_arg("margin_mm", args.margin_mm.unwrap_or(board_edit::DEFAULT_FIT_MARGIN_MM))?,
+                corner_radius: nm_arg("corner_radius_mm", args.corner_radius_mm.unwrap_or(0.0))?,
+                replace: args.replace,
+                holes,
+                hole_footprint,
+                hole_courtyard,
+                grid_mm: args.grid_mm.unwrap_or(board_edit::DEFAULT_GRID_MM),
+            };
+            let plan = board_edit::plan_outline(&data, &request)?;
+            Ok::<_, ToolError>((plan, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, fp)) => self.store_edit_plan(&cid, &board, plan, fp).await,
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_move_plan",
+        description = "Plan moving named footprints: each entry gives a reference and an absolute place \n(x_mm, y_mm) or an offset (dx_mm, dy_mm), a turn (rotation_deg, or rotate_by_deg), a side (front or \nback; a flip as in KiCad), and lock true or false. Absolute places snap to grid_mm (0.5; 0 for none); \noffsets are exact. Locked footprints are refused unless allow_locked is true. The plan lists every move \nwith the overlaps and footprints outside the outline before and after. Needs a live KiCad 11 session. \nApply with pcb_apply_plan; every pad is read back."
+    )]
+    pub async fn pcb_move_plan(&self, Parameters(args): Parameters<PcbMoveArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let mut data = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut data, &libs);
+            let requests = args.moves.iter().map(move_request).collect::<Result<Vec<_>, _>>()?;
+            let plan = board_edit::plan_moves(&data, &requests, args.grid_mm.unwrap_or(board_edit::DEFAULT_GRID_MM))?;
+            Ok::<_, ToolError>((plan, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, fp)) => self.store_edit_plan(&cid, &board, plan, fp).await,
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a plan from pcb_update_from_schematic_plan after the user has reviewed it \\n(confirm: true). Refused if the board changed since planning. Runs the netlist import, then reads the board \\nback and checks that every footprint of the schematic is there and every pad is on the net the netlist \\ngives it. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline or a move is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -762,7 +969,7 @@ impl KicadAiServer {
             Ok(b) => b,
             Err(e) => return envelope::error(&cid, &e),
         };
-        let (netlist, fp, schematic) = {
+        let (fp, work) = {
             let mut pending = self.state.pending_updates.lock().await;
             let Some(plan) = pending.get_mut(&args.plan_id) else {
                 return envelope::error(
@@ -791,7 +998,15 @@ impl KicadAiServer {
                     ),
                 );
             }
-            (plan.netlist.clone(), plan.fingerprint.clone(), plan.schematic.clone())
+            let work = match &plan.work {
+                PendingWork::Update { netlist, schematic } => Err((netlist.clone(), schematic.clone())),
+                PendingWork::Edit(edit) => Ok(edit.clone()),
+            };
+            (plan.fingerprint.clone(), work)
+        };
+        let (netlist, schematic) = match work {
+            Ok(edit) => return self.apply_board_edit(&cid, &board, &args, &fp, &edit).await,
+            Err(update) => update,
         };
         let result = async {
             let before = board.read().await?;
@@ -1009,4 +1224,185 @@ fn drc_json(report: &kicad_cli_runner::pcb::DrcReport) -> serde_json::Value {
         "unrouted_items": report.unconnected_items.iter().take(50).map(show).collect::<Vec<_>>(),
         "schematic_parity": report.schematic_parity.iter().take(50).map(show).collect::<Vec<_>>(),
     })
+}
+
+fn bad_arg(message: impl Into<String>) -> ToolError {
+    ToolError::new(ErrorCode::InvalidArgument, message)
+}
+
+fn nm_arg(name: &str, mm: f64) -> Result<kicad_domain::Nm, ToolError> {
+    if !mm.is_finite() || mm.abs() > 2000.0 {
+        return Err(bad_arg(format!("{name} must be a number of mm up to 2000")));
+    }
+    Ok(kicad_domain::Nm((mm * 1e6).round() as i64))
+}
+
+fn point_arg(x_mm: f64, y_mm: f64) -> Result<Point, ToolError> {
+    Ok(Point::new(nm_arg("x_mm", x_mm)?, nm_arg("y_mm", y_mm)?))
+}
+
+fn refuse_unless_live(board: &BoardSession) -> Result<(), ToolError> {
+    if board.is_live() {
+        Ok(())
+    } else {
+        Err(ToolError::new(
+            ErrorCode::FeatureUnavailable,
+            "editing a board needs a live KiCad 11 session; open it with provider headless or gui (a file session only reads)",
+        ))
+    }
+}
+
+fn move_request(m: &MoveArg) -> Result<MoveRequest, ToolError> {
+    let pair = |x: Option<f64>, y: Option<f64>, what: &str| match (x, y) {
+        (Some(x), Some(y)) => point_arg(x, y).map(Some),
+        (None, None) => Ok(None),
+        _ => Err(bad_arg(format!("{}: give both {what}", m.reference))),
+    };
+    let angle = |a: Option<f64>| match a {
+        Some(d) if !d.is_finite() || d.abs() > 3600.0 => Err(bad_arg(format!("{}: a turn is in degrees", m.reference))),
+        other => Ok(other),
+    };
+    Ok(MoveRequest {
+        reference: m.reference.clone(),
+        at: pair(m.x_mm, m.y_mm, "x_mm and y_mm")?,
+        offset: pair(m.dx_mm, m.dy_mm, "dx_mm and dy_mm")?,
+        rotation_deg: angle(m.rotation_deg)?,
+        rotate_by_deg: angle(m.rotate_by_deg)?,
+        back: match m.side.as_deref() {
+            None => None,
+            Some("front") => Some(false),
+            Some("back") => Some(true),
+            Some(other) => return Err(bad_arg(format!("{}: side is front or back, not {other}", m.reference))),
+        },
+        lock: m.lock,
+        allow_locked: m.allow_locked,
+    })
+}
+
+fn placement_json(p: &board_edit::Placement) -> serde_json::Value {
+    serde_json::json!({ "at": pt(p.at), "rotation_deg": round2(p.rotation_deg), "side": if p.back { "back" } else { "front" } })
+}
+
+fn op_json(op: &BoardOp) -> serde_json::Value {
+    match op {
+        BoardOp::RemoveEdge { id, kind } => {
+            serde_json::json!({ "op": "remove_outline_drawing", "id": id, "kind": kind })
+        }
+        BoardOp::AddOutline {
+            rect: r,
+            corner_radius,
+            line_width,
+        } => serde_json::json!({
+            "op": "add_outline", "outline": rect(*r), "corner_radius": mm(corner_radius.0), "line_width": mm(line_width.0),
+            "layer": "Edge.Cuts",
+        }),
+        BoardOp::PlaceFootprint { reference, lib_id, at } => {
+            serde_json::json!({ "op": "place_footprint", "reference": reference, "footprint": lib_id, "at": pt(*at) })
+        }
+        BoardOp::MoveFootprint {
+            reference,
+            from,
+            to,
+            locked,
+            ..
+        } => serde_json::json!({
+            "op": "move_footprint", "reference": reference, "from": placement_json(from), "to": placement_json(to),
+            "locked": locked,
+        }),
+    }
+}
+
+impl KicadAiServer {
+    /// Keeps an outline or move plan for pcb_apply_plan and shows it.
+    async fn store_edit_plan(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        plan: BoardEditPlan,
+        fp: String,
+    ) -> CallToolResult {
+        let plan_id = self.next_pcb_plan_id();
+        let body = serde_json::json!({
+            "plan_id": plan_id,
+            "kind": plan.kind,
+            "can_apply": true,
+            "operations": plan.operations.iter().map(op_json).collect::<Vec<_>>(),
+            "before": plan.before,
+            "after": plan.after,
+            "warnings": plan.warnings,
+            "units": "mm; x grows right, y grows down; turns counter-clockwise on screen",
+            "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
+        });
+        let warnings = plan.warnings.clone();
+        self.state.pending_updates.lock().await.insert(
+            plan_id,
+            PendingUpdate {
+                session_id: board.id().to_owned(),
+                fingerprint: fp,
+                applied_with: None,
+                work: PendingWork::Edit(Box::new(plan)),
+            },
+        );
+        envelope::ok(cid, body, board_provenance(board), warnings)
+    }
+
+    /// Applies an outline or move plan, reads the board back, and compares it with the plan.
+    async fn apply_board_edit(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        args: &PcbApplyArgs,
+        fp: &str,
+        plan: &BoardEditPlan,
+    ) -> CallToolResult {
+        let result = async {
+            let before = board.read().await?;
+            if fingerprint(&before) != fp {
+                return Err(ToolError::new(
+                    ErrorCode::StalePlan,
+                    "the board changed since the plan was made; make a new plan",
+                ));
+            }
+            let report = board.apply_edit(plan).await?;
+            let mut after = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut after, &libs);
+            Ok::<_, ToolError>((report, after))
+        }
+        .await;
+        let (report, after) = match result {
+            Ok(r) => r,
+            Err(e) => return envelope::error(cid, &e),
+        };
+        if let Some(p) = self.state.pending_updates.lock().await.get_mut(&args.plan_id) {
+            p.applied_with = Some(args.idempotency_key.clone());
+        }
+        let problems = board_edit::verify_edit(plan, &after);
+        let verified = problems.is_empty();
+        let undo = match board.provider() {
+            Provider::Gui => "one undo step in the PCB editor (Ctrl+Z)",
+            _ => "not saved yet; pcb_save writes it, closing with discard_unsaved drops it",
+        };
+        let body = serde_json::json!({
+            "applied": true,
+            "verified": verified,
+            "kind": plan.kind,
+            "report": report,
+            "measured_after": board_edit::measure(&after),
+            "problems": problems,
+            "undo": undo,
+            "next": "Check with pcb_review or pcb_render, then save with pcb_save.",
+        });
+        if verified {
+            envelope::ok(cid, body, board_provenance(board), plan.warnings.clone())
+        } else {
+            envelope::ok_with_state(
+                cid,
+                kicad_domain::ResultState::Partial,
+                body,
+                board_provenance(board),
+                vec!["applied, but the board read back differs from the plan; see problems".to_owned()],
+            )
+        }
+    }
 }

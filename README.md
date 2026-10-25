@@ -144,7 +144,13 @@ To look at a board:
 
 > Open D:/projects/mydesign/mydesign.kicad_pcb, review it, and tell me what the schematic has that the board lacks.
 
-Boards are opened with `pcb_open` (headless needs KiCad 11 or the 10.99 nightly; the file provider also reads KiCad 10 boards for reading, DRC, and render). A board can be brought up to date from its schematic: the assistant shows what KiCad's own netlist import would add, and applies it only after you confirm. New footprints arrive stacked near the origin; placing them comes with the next phase.
+Boards are opened with `pcb_open` (headless needs KiCad 11 or the 10.99 nightly; the file provider also reads KiCad 10 boards for reading, DRC, and render). A board can be brought up to date from its schematic: the assistant shows what KiCad's own netlist import would add, and applies it only after you confirm. New footprints arrive stacked near the origin.
+
+An assistant can then give the board an outline and move parts, through a live session (headless or the PCB editor; a file session only reads):
+
+> Put a 50 x 40 mm outline with 2 mm rounded corners and an M3 hole in each corner around the parts, then turn U1 by 90 degrees and move C1 to the back.
+
+Each change is shown as a plan first, applied as one step (one Ctrl+Z in the editor), and read back: the outline, and every moved footprint's place, turn, side, lock, pads, and nets. Locked footprints stay where they are unless you say otherwise. Placing all parts automatically and routing come later in Phase 12.
 
 To get a schematic ready to order parts:
 
@@ -203,6 +209,8 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_run_drc` / `pcb_render` | Design rules check (with unrouted connections) and a 3D picture of the board |
 | `pcb_review` | What stands out: overlaps, parts outside the outline, no outline, schematic and board that disagree, far connectors and decoupling capacitors, DRC |
 | `pcb_update_from_schematic_plan` / `pcb_apply_plan` | Update the board from its schematic: a dry run first, then apply after you confirm; every footprint and pad net is checked afterwards |
+| `pcb_outline_plan` | A board outline (rectangle, rounded corners) of a given size or fitted around the parts, with mounting holes in the corners or at given places; applied with `pcb_apply_plan` |
+| `pcb_move_plan` | Move, turn, flip, and lock named footprints (places on a grid, exact offsets); shows overlaps before and after; applied with `pcb_apply_plan`, every pad read back |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |

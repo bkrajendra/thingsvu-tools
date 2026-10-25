@@ -25,6 +25,9 @@ use crate::errors::from_ipc_error;
 use crate::headless::HeadlessServer;
 use crate::session::{new_session_id, Provider, SessionConfig};
 
+mod edit;
+pub use edit::EditReport;
+
 /// What `pcb_update_from_schematic` reports, from a dry run or the real import.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImportReport {
@@ -312,6 +315,16 @@ impl BoardSession {
         ipc.lock().await.client.call(request).await
     }
 
+    /// One request whose answer is empty or not needed, for probes and tests.
+    #[doc(hidden)]
+    pub async fn raw_call_any<Req: prost::Name>(
+        &self,
+        request: &Req,
+    ) -> Result<Option<prost_types::Any>, kicad_ipc::Error> {
+        let ipc = self.ipc.as_ref().expect("raw_call_any needs a live board session");
+        ipc.lock().await.client.call_any(request).await
+    }
+
     /// The document identifier KiCad assigned (live sessions).
     #[doc(hidden)]
     pub async fn document_specifier(&self) -> Option<DocumentSpecifier> {
@@ -506,14 +519,14 @@ impl BoardSession {
 
 // ---------------------------------------------------------------- reading
 
-use kicad_domain::board::{Board, BoardFootprint, BoardPad, BoardTrack, BoardVia, BoardZone};
+use kicad_domain::board::{Board, BoardEdge, BoardFootprint, BoardPad, BoardTrack, BoardVia, BoardZone};
 use kicad_domain::{Nm, Point, Rect};
 use kicad_ipc::proto::kiapi::board::commands::{
     BoardBoundingBoxMode, BoardBoundingBoxResponse, BoardEnabledLayersResponse, GetBoardBoundingBox,
     GetBoardEnabledLayers, GetNets, NetsResponse,
 };
 use kicad_ipc::proto::kiapi::board::types::{
-    Arc as ArcTrack, BoardLayer, FootprintInstance, Net, Pad, Track, Via, Zone,
+    Arc as ArcTrack, BoardGraphicShape, BoardLayer, FootprintInstance, Net, Pad, Track, Via, Zone,
 };
 use kicad_ipc::proto::kiapi::common::commands::{GetItems, GetItemsResponse};
 use kicad_ipc::proto::kiapi::common::types::{ItemHeader, KiCadObjectType, Vector2};
@@ -675,6 +688,7 @@ impl BoardSession {
                     dnp: f.attributes.is_some_and(|a| a.do_not_populate),
                     pads,
                     courtyard: None,
+                    courtyard_local: None,
                 });
             } else if url == Track::type_url() {
                 let t: Track = any.to_msg().map_err(|e| decode_err("track", e))?;
@@ -730,6 +744,18 @@ impl BoardSession {
                 });
             } else {
                 board.drawings += 1;
+                if url == BoardGraphicShape::type_url() {
+                    let s: BoardGraphicShape = any.to_msg().map_err(|e| decode_err("drawing", e))?;
+                    if s.layer == BoardLayer::BlEdgeCuts as i32 {
+                        let (kind, bounds) = s.shape.as_ref().map(edit::shape_bounds).unwrap_or(("other", None));
+                        board.edges.push(BoardEdge {
+                            id: s.id.map(|k| k.value).unwrap_or_default(),
+                            kind: kind.to_owned(),
+                            bounds,
+                            locked: s.locked == 2,
+                        });
+                    }
+                }
             }
         }
         Ok(board)

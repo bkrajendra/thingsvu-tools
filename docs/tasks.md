@@ -342,7 +342,7 @@ Known limits (Phase 9): drawings are free items, not tied to the parts they surr
 
 ---
 
-## Phases 10 to 13 — Parts, BOM, and PCB (planned, not started)
+## Phases 10 to 13 — Parts, BOM, and PCB (10 and 11 done, 12 in progress)
 
 The reasoning, the KiCad facts, the decisions D1 to D7, and the risks are in [pcb-and-bom-plan.md](pcb-and-bom-plan.md). Each phase below ends with the usual steps: tests (offline, then `KICAD_LIVE=1`), docs and architecture diagram, README tools table and examples, version bump (which publishes the release), and a push with CI checked.
 
@@ -382,12 +382,15 @@ Known limits (Phase 11): no board editing yet (Phase 12); a KiCad 10.0 board fil
 
 **Attention — please try on the live editor (v0.6.0):** open a **copy** of a project in the **PCB Editor**, press **KiCad AI: connect** there, and run `THINGSVU_GUI_PCB=1 cargo test -p kicad-ai-mcp --test stdio gui_pcb_demo -- --nocapture` (Git Bash; in PowerShell: `$env:THINGSVU_GUI_PCB='1'; cargo test ...`). It prints the board info, the review with DRC, and a dry-run update plan; it changes nothing. Or ask the assistant: *"Open the board in my PCB editor, review it, and tell me what the schematic has that the board lacks."* Applying an update through the editor (`pcb_apply_plan`) is the one thing I could not try; do it on a copy.
 
-### Phase 12 — PCB editing: outline, placement, routing (v0.7.0)
+### Phase 12 — PCB editing: outline, placement, routing (in progress; v0.7.0 when done)
 
 Exit criteria: the 555 board gets an outline, placement, routing, and a ground pour on two layers, DRC clean on the default rules, on the editor and headless providers; every footprint, track, and via is read back as planned; the unrouted count is zero.
 
-- [ ] **12.1 `pcb_outline_plan`** — rectangle or rounded rectangle on `Edge.Cuts`, size or "fit around the parts with a margin", corner radius, mounting holes (footprints from the library).
-- [ ] **12.2 `pcb_move_plan`** — bare move, turn, flip, and lock of named footprints, by absolute place or offset, on a grid. Locked footprints are refused unless named.
+- [x] **12.0 Probe** — `crates/kicad-session/tests/live_probe12.rs`; findings in docs/kicad-api-compatibility.md ("Board editing"). Outline rectangles (with corner radius), deleting shapes, commits and their drop, flips, locks, tracks, vias, zones, and refills all work headless. **Two surprises:** (1) `UpdateItems` on a footprint moves only its anchor; its pads, drawings, and text keep their old places on the board (a footprint sent without them loses them); (2) a footprint placed with `PlaceFootprintFromLibrary` inside a commit cannot be renamed until the commit ends. The API also moves a locked footprint without complaint.
+- [x] **12.1 `pcb_outline_plan`** — a rectangle on `Edge.Cuts`, rounded with `corner_radius_mm`, of a given size at an origin (default centred on the parts) or fitted around the footprints with a margin (default 2 mm); corners on the grid (0.5 mm). Mounting holes in the four corners (inset from both edges) or at given places, named `H1`, `H2`, … (the next free numbers), default footprint `MountingHole:MountingHole_3.2mm_M3`, checked in the libraries at plan time. A board with an outline is refused unless `replace: true`, and a locked outline drawing is never deleted. The plan reports footprints outside the new outline and holes that hit a part. Applied as one commit; read back: the outline box (within the line width), each hole's place and library id.
+  - **Review:** (1) Holes are not made with `PlaceFootprintFromLibrary`, because a footprint placed that way cannot be renamed in the same commit; the server takes the library definition (`GetItemsFromLibrary`), writes the reference (silkscreen, 1 mm above the courtyard) and value (fabrication layer, below), moves every item to the place, and creates it with `CreateItems`, so the outline and its holes are one undo step. (2) A fitted outline does not grow to make room for corner holes; the plan warns when a hole hits a part. (3) Only rectangles; other shapes can be drawn in KiCad.
+- [x] **12.2 `pcb_move_plan`** — move (absolute place, snapped to the grid, or an exact offset), turn (absolute or relative), flip to the other side, and lock or unlock named footprints. Unknown and repeated references are refused; a locked footprint is refused unless the entry has `allow_locked: true` (or unlocks it). The plan lists every move and the overlaps and parts outside the outline before and after, and warns about new overlaps. Applied as one commit: flips first through `FlipItems`, then every footprint sent once with all its items turned and shifted. Read back: place, turn, side, lock, every pad's place (within 2 µm), and every pad's net.
+  - **Review:** (1) Because of the anchor-only move (12.0), the server turns and shifts every pad, shape, text, field, and zone of the footprint itself; a footprint holding an item it does not know is refused rather than half moved, and a text box can only be turned by a multiple of 90°. A rectangle turned by another angle becomes a polygon, as in KiCad. (2) Offsets are not snapped, so a part keeps its relation to its neighbours; absolute places are. (3) A flip mirrors the footprint top to bottom (KiCad's `BFD_TOP_BOTTOM`); the planned turn is applied after it.
 - [ ] **12.3 Placement engine** — constructive placement with the D5 rules (connectors to the edge, main IC central, decoupling beside the pins they serve, blocks from the schematic's grouping), then an improvement loop on wire length with overlap and boundary penalties. Deterministic. Reports measured results before and after.
 - [ ] **12.4 `pcb_place_plan`** — the engine with hints `keep`, `place`, `near`, `edge`, `group`, `side`; unknown parts refused; plan shows every move and the measured result.
 - [ ] **12.5 `pcb_route_plan`** — explicit tracks and vias for named nets at the netclass width and clearance, on a layer, with via placement; refuses anything that crosses another net's copper (checked against the board's geometry, then DRC after applying).
@@ -396,6 +399,10 @@ Exit criteria: the 555 board gets an outline, placement, routing, and a ground p
 - [ ] **12.8 Verification and read-back** — footprint positions, sides, tracks, vias, and zones read back; unrouted count and DRC no worse; failures roll back as far as the provider allows (headless reload, editor undo steps reported), as for schematics.
 - [ ] **12.9 (optional) KiCad 10 board editing** through `kicad-sexpr` — only if asked (D3).
 - [ ] **12.10 Tests, docs, release** — domain tests for the engine and router geometry, live tests on headless and file, `gui_pcb_edit_demo`; v0.7.0.
+
+Known limits (12.0 to 12.2): board editing needs a live KiCad 11 session (headless or the PCB editor); a file session only reads (D3). Only the headless provider was tested live; the PCB editor path is the same API calls, not yet tried (see below). The version stays 0.6.0 until Phase 12 is done.
+
+**Attention — please try on the live editor:** open a **copy** of a project in the **PCB Editor**, press **KiCad AI: connect** there, and run `THINGSVU_GUI_PCB_EDIT=1 cargo test -p kicad-ai-mcp --test stdio gui_pcb_edit_demo -- --nocapture` (Git Bash; in PowerShell: `$env:THINGSVU_GUI_PCB_EDIT='1'; cargo test ...`). It replaces the outline with one fitted around the parts (3 mm margin, 1 mm corners) and turns the first unlocked footprint by 90°; Ctrl+Z twice undoes both. Or ask the assistant: *"Put a 50 x 40 mm outline with rounded corners and four M3 holes around the parts, then turn U1 by 90 degrees."*
 
 ### Phase 13 — Manufacturing outputs and the mechanical exchange (v0.8.0)
 

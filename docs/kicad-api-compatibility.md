@@ -168,3 +168,19 @@ Observed 25 Oct 2026 with `crates/kicad-session/tests/live_probe11.rs` (`KICAD_L
 | `kicad-cli pcb render` | 3D render to PNG, 0.2 s for the small board; options for side, size, background, quality; 10.99 only (KiCad 10.0's `kicad-cli` has no `pcb render`) |
 
 | Library loading and slow answers | `LoadAllLibraries` returns at once, but the headless server keeps loading in the background and answers later requests slowly until it is done: with several servers running in parallel, `SaveCopyOfDocument` on a board timed out twice at 30 s. A board session therefore asks for the footprint libraries only when an import needs them, not when it is opened, and a copy that times out is asked for again once |
+
+## Board editing (10.99, Phase 12 probe)
+
+Observed 25 Oct 2026 with `crates/kicad-session/tests/live_probe12.rs` (`KICAD_LIVE=1 cargo test -p kicad-session --test live_probe12 -- --nocapture`), on a copy of the regulator board.
+
+| Topic | Observation |
+|---|---|
+| Commits | `BeginCommit` / `EndCommit` work on a headless board. `CMA_DROP` undoes everything the commit did (checked: a failed outline apply left the board unchanged) |
+| Outline | `CreateItems` with a `BoardGraphicShape` rectangle on `BL_Edge_Cuts` works, with `corner_radius` (saved as `(gr_rect … (radius 2))`). `GetBoardBoundingBox` with `BBBM_BOARD_EDGES_ONLY` then includes half the line width on every side (a 50 x 40 mm rectangle drawn 0.05 mm wide is reported 50.05 x 40.05 mm). `DeleteItems` removes a shape by id |
+| `PlaceFootprintFromLibrary` | Works, but answers "not found" while a headless server is still loading the libraries (up to about 30 s after `LoadAllLibraries`). The footprint arrives named `REF**`. **Inside an open commit it cannot be updated** ("an item with UUID … does not exist") until the commit ends, so it cannot be renamed in the same undo step |
+| A footprint from the library, created in a commit | `GetItemsFromLibrary` (footprint type) returns the `Footprint` definition: pads and shapes at the footprint's own coordinates, **no reference or value field**. A `FootprintInstance` built from it, with fields written by the client and every item moved to the place, is accepted by `CreateItems` in a commit, keeps the library id, and is saved with the given reference |
+| **Moving a footprint with `UpdateItems`** | Changing `position` or `orientation` moves **only the anchor**: the pads, drawings, and text in the definition are sent back with their old places on the board, and KiCad keeps them, so the saved footprint has pads tens of millimetres from its origin. The field mask is ignored. A footprint sent with only id, position, orientation, and layer **loses its pads and fields** (reference becomes empty). What works: every item of the definition (pads with their pad-stack angle, shapes, texts, fields, zones) turned and shifted by the client, then the whole instance sent. `Footprint3DModel` items need no change |
+| Lock | `locked: LS_LOCKED` through `UpdateItems` works. **The API moves a locked footprint anyway**, so the tools refuse it themselves |
+| Flip | `FlipItems` flips a footprint with its pads (`BFD_LEFT_RIGHT` mirrors x and reports 180°; `BFD_TOP_BOTTOM` mirrors y). Setting `layer` to `B.Cu` through `UpdateItems` changes the layer but does not mirror the pads |
+| Tracks, vias, zones (for 12.5 and 12.6) | `CreateItems` accepts a `Track` (width, layer, net by name), a `Via` (net; diameter and drill left at zero come back as zero and must be set), and a copper `Zone` (layers, outline, net). `RefillZones` with no ids fills every zone; the zone then reports `filled` with one polygon |
+

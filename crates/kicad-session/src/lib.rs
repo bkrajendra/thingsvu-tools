@@ -21,7 +21,7 @@ mod schematic;
 mod session;
 
 pub use any::AnySession;
-pub use board::{BoardSession, BoardStatus, ImportReport};
+pub use board::{BoardSession, BoardStatus, EditReport, ImportReport};
 pub use capability_map::capabilities_from_probe;
 pub use errors::from_ipc_error;
 pub use file::FileSession;

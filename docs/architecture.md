@@ -243,9 +243,11 @@ flowchart LR
     APPLY --> EXPORT["bom_export<br/>CSV via kicad-cli<br/>generic or JLCPCB"]
 ```
 
-### Boards (Phase 11)
+### Boards (Phases 11 and 12)
 
 A board is a second kind of session, with its own tools (`pcb_*`) and its own model. One board model (footprints with placed pads, tracks, vias, zones, outline, nets) is filled from a live KiCad (the headless server or the PCB editor, through the API) or from the `.kicad_pcb` file (KiCad 10 or 11). DRC and the 3D render run through `kicad-cli` on a snapshot of the live board. The review compares the board with the schematic next to it. Updating the board uses KiCad's own netlist import: a dry run is the plan, and applying it is read back and compared with the netlist.
+
+Board edits (Phase 12: outline, mounting holes, moves) are planned in `kicad-domain::board_edit` from the board model: the plan lists the operations and the board it should leave, measured (overlaps, parts outside the outline) before and after. `pcb_apply_plan` applies a plan in one API commit (dropped on any failure, so nothing stays half done) and `verify_edit` compares the board read back with the plan, down to every pad's place and net. Because KiCad moves only a footprint's anchor when its position changes, the session turns and shifts every item inside the footprint itself (`kicad-session::board::edit`).
 
 ```mermaid
 flowchart LR
@@ -259,6 +261,10 @@ flowchart LR
     SCH["Schematic file<br/>next to the board"] -->|"netlist export"| PLAN["pcb_update_from_schematic_plan<br/>ImportNetlist dry run"]
     PLAN --> APPLY["pcb_apply_plan<br/>real import, read back,<br/>every pad net checked"]
     APPLY --> LIVE
+    MODEL --> EDIT["pcb_outline_plan, pcb_move_plan<br/>board_edit: operations +<br/>expected board, measured"]
+    EDIT --> APPLYE["pcb_apply_plan<br/>one commit: shapes, holes,<br/>flips, footprints moved<br/>with every item"]
+    APPLYE --> LIVE
+    APPLYE -->|"read back"| VERIFY["verify_edit<br/>outline, places, turns,<br/>sides, locks, pads, nets"]
 ```
 
 How the three providers apply it:

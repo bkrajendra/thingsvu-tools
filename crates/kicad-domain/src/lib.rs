@@ -6,6 +6,7 @@
 
 pub mod arrange;
 pub mod board;
+pub mod board_edit;
 pub mod bom;
 pub mod capability;
 pub mod circuit;

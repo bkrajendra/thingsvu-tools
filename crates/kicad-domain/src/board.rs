@@ -38,6 +38,10 @@ pub struct BoardFootprint {
     pub pads: Vec<BoardPad>,
     /// The courtyard's bounding box on the board, when known.
     pub courtyard: Option<Rect>,
+    /// The courtyard's box in the footprint's own coordinates (unturned; mirrored for the back
+    /// side), when known; what a move turns and places again.
+    #[serde(skip)]
+    pub courtyard_local: Option<Rect>,
 }
 
 impl BoardFootprint {
@@ -84,6 +88,16 @@ pub struct BoardZone {
     pub locked: bool,
 }
 
+/// A drawing on `Edge.Cuts` (part of the outline).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BoardEdge {
+    pub id: String,
+    /// `rectangle`, `segment`, `arc`, `circle`, `polygon`, or `other`.
+    pub kind: String,
+    pub bounds: Option<Rect>,
+    pub locked: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Board {
     pub footprints: Vec<BoardFootprint>,
@@ -97,6 +111,8 @@ pub struct Board {
     pub nets: Vec<String>,
     /// Graphic items and text on the board itself (not in footprints).
     pub drawings: usize,
+    /// The drawings on `Edge.Cuts`.
+    pub edges: Vec<BoardEdge>,
 }
 
 /// Rotates `local` by `deg` degrees counter-clockwise on screen (y down) and adds `origin`.
@@ -434,6 +450,7 @@ mod tests {
                 ])
                 .unwrap(),
             ),
+            courtyard_local: Some(Rect::from_points([p(-size_mm, -size_mm), p(size_mm, size_mm)]).unwrap()),
         }
     }
 

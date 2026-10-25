@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use kicad_domain::board::{place_point, place_rect, Board, BoardFootprint, BoardPad, BoardTrack, BoardVia, BoardZone};
+use kicad_domain::board::{
+    place_point, place_rect, Board, BoardEdge, BoardFootprint, BoardPad, BoardTrack, BoardVia, BoardZone,
+};
 use kicad_domain::{Nm, Point, Rect};
 
 use crate::node::{parse, Node, ParseError};
@@ -182,7 +184,8 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
                         .child("attr")
                         .is_some_and(|a| a.items().iter().any(|i| i.text() == Some("dnp"))),
                     pads,
-                    courtyard: bounds(local_court).map(|r| place_rect(position, rotation_deg, r)),
+                    courtyard: bounds(local_court.iter().copied()).map(|r| place_rect(position, rotation_deg, r)),
+                    courtyard_local: bounds(local_court),
                 });
             }
             Some("segment") | Some("arc") => {
@@ -249,7 +252,22 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
             Some(head) if head.starts_with("gr_") => {
                 board.drawings += 1;
                 if layer_of(item) == "Edge.Cuts" {
-                    outline.extend(shape_points(item));
+                    let points = shape_points(item);
+                    board.edges.push(BoardEdge {
+                        id: item.child_text("uuid").unwrap_or_default().to_owned(),
+                        kind: match head {
+                            "gr_rect" => "rectangle",
+                            "gr_line" => "segment",
+                            "gr_arc" => "arc",
+                            "gr_circle" => "circle",
+                            "gr_poly" => "polygon",
+                            _ => "other",
+                        }
+                        .to_owned(),
+                        bounds: bounds(points.iter().copied()),
+                        locked: is_yes(item, "locked"),
+                    });
+                    outline.extend(points);
                 }
             }
             _ => {}
@@ -321,6 +339,11 @@ mod tests {
             (nm(2.0), nm(4.0)),
             "the courtyard turns with the part"
         );
+        let local = f.courtyard_local.unwrap();
+        assert_eq!((local.width(), local.height()), (nm(4.0), nm(2.0)), "unturned");
+        assert_eq!(board.edges.len(), 1);
+        assert_eq!(board.edges[0].kind, "rectangle");
+        assert!(!board.edges[0].locked);
 
         let new = r#"(kicad_pcb (version 20261018)
             (footprint "L:F" (layer "B.Cu") (transform (translate 3 4) (rotate 180) (scale 1 1))

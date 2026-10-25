@@ -116,7 +116,9 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_list_footprints",
             "pcb_list_nets",
             "pcb_list_tracks",
+            "pcb_move_plan",
             "pcb_open",
+            "pcb_outline_plan",
             "pcb_render",
             "pcb_review",
             "pcb_run_drc",
@@ -1889,4 +1891,261 @@ async fn gui_pcb_demo() {
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: nothing was changed");
+}
+
+/// Applies a board plan and returns the result.
+async fn apply_board(mcp: &mut Mcp, id: &Value, plan: &Value, key: &str) -> Value {
+    mcp.call(
+        "pcb_apply_plan",
+        json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true, "idempotency_key": key }),
+    )
+    .await
+}
+
+fn footprint<'a>(list: &'a Value, reference: &str) -> &'a Value {
+    list["result"]["footprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["reference"] == reference)
+        .unwrap_or_else(|| panic!("no {reference} in {list}"))
+}
+
+/// An outline with mounting holes, then footprints moved, turned, flipped, and locked; each plan
+/// applied, read back, saved, and read again from the file.
+#[tokio::test]
+async fn live_board_outline_and_moves() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("edit", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-edit-{n}-{}", std::process::id());
+
+    // A file session only reads.
+    let file = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    let refused = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": file["result"]["session_id"] }),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], "FEATURE_UNAVAILABLE", "{refused}");
+    mcp.call("pcb_close", json!({ "session_id": file["result"]["session_id"] }))
+        .await;
+
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    // 40 x 30 mm, rounded, centred on the parts, a hole in each corner.
+    let plan = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 40, "height_mm": 30, "corner_radius_mm": 2,
+                    "mounting_holes": "corners", "hole_inset_mm": 3.5 }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    println!("OUTLINE PLAN {}", plan["result"]);
+    let ops = plan["result"]["operations"].as_array().unwrap();
+    assert_eq!(ops.len(), 5, "an outline and four holes: {plan}");
+    assert_eq!(ops[0]["outline"]["width"], 40.0, "{plan}");
+    assert_eq!(plan["result"]["after"]["outside_outline"], json!([]), "{plan}");
+    let outline = ops[0]["outline"].clone();
+    let applied = apply_board(&mut mcp, &id, &plan, &key("outline")).await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(
+        applied["result"]["report"]["placed"],
+        json!(["H1", "H2", "H3", "H4"]),
+        "{applied}"
+    );
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert!(
+        (info["result"]["outline"]["width"].as_f64().unwrap() - 40.05).abs() < 0.02,
+        "{info}"
+    );
+    assert_eq!(info["result"]["counts"]["footprints"], 15, "{info}");
+
+    // A second outline is refused unless it replaces the first.
+    let again = mcp.call("pcb_outline_plan", json!({ "session_id": id })).await;
+    assert_eq!(again["ok"], false, "{again}");
+    let replace = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "replace": true, "margin_mm": 3 }),
+        )
+        .await;
+    assert_eq!(replace["ok"], true, "{replace}");
+    assert_eq!(
+        replace["result"]["operations"][0]["op"], "remove_outline_drawing",
+        "{replace}"
+    );
+
+    // Moves: R3 turned and placed, C1 to the back, U1 shifted and locked.
+    let before = mcp
+        .call("pcb_list_footprints", json!({ "session_id": id, "include_pads": true }))
+        .await;
+    let u1_before = footprint(&before, "U1")["at"].clone();
+    let plan = mcp
+        .call(
+            "pcb_move_plan",
+            json!({ "session_id": id, "moves": [
+                { "reference": "R3", "x_mm": 22, "y_mm": 4, "rotation_deg": 90 },
+                { "reference": "C1", "side": "back" },
+                { "reference": "U1", "dx_mm": 1, "dy_mm": 0, "lock": true }
+            ] }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    println!("MOVE PLAN {}", plan["result"]);
+    let applied = apply_board(&mut mcp, &id, &plan, &key("move")).await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(applied["result"]["report"]["flipped"], json!(["C1"]), "{applied}");
+    let after = mcp
+        .call("pcb_list_footprints", json!({ "session_id": id, "include_pads": true }))
+        .await;
+    let r3 = footprint(&after, "R3");
+    assert_eq!(r3["at"], json!({ "x": 22.0, "y": 4.0 }), "{r3}");
+    assert_eq!(r3["rotation_deg"], 90.0, "{r3}");
+    // Turned 90°: the pads are one above the other, about the new place.
+    let pads = r3["pads"].as_array().unwrap();
+    assert!((pads[0]["at"]["x"].as_f64().unwrap() - 22.0).abs() < 0.01, "{r3}");
+    assert!((pads[1]["at"]["x"].as_f64().unwrap() - 22.0).abs() < 0.01, "{r3}");
+    assert!(
+        (pads[0]["at"]["y"].as_f64().unwrap() - pads[1]["at"]["y"].as_f64().unwrap()).abs() > 1.0,
+        "{r3}"
+    );
+    assert_eq!(footprint(&after, "C1")["side"], "back");
+    let u1 = footprint(&after, "U1");
+    assert_eq!(u1["locked"], true, "{u1}");
+    assert!(
+        (u1["at"]["x"].as_f64().unwrap() - u1_before["x"].as_f64().unwrap() - 1.0).abs() < 0.011,
+        "{u1}"
+    );
+
+    // A locked footprint stays unless the move allows it.
+    let locked = mcp
+        .call(
+            "pcb_move_plan",
+            json!({ "session_id": id, "moves": [{ "reference": "U1", "dx_mm": 2, "dy_mm": 0 }] }),
+        )
+        .await;
+    assert_eq!(locked["ok"], false, "{locked}");
+    let unknown = mcp
+        .call(
+            "pcb_move_plan",
+            json!({ "session_id": id, "moves": [{ "reference": "U9", "x_mm": 2, "y_mm": 0 }] }),
+        )
+        .await;
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    // A plan made before another change is stale.
+    let stale = mcp
+        .call(
+            "pcb_move_plan",
+            json!({ "session_id": id, "moves": [{ "reference": "D1", "dx_mm": 1, "dy_mm": 0 }] }),
+        )
+        .await;
+    let other = mcp
+        .call(
+            "pcb_move_plan",
+            json!({ "session_id": id, "moves": [{ "reference": "D2", "dx_mm": 1, "dy_mm": 0 }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &other, &key("d2")).await["result"]["verified"],
+        true
+    );
+    let late = apply_board(&mut mcp, &id, &stale, &key("d1")).await;
+    assert_eq!(late["error"]["code"], "STALE_PLAN", "{late}");
+
+    let drc = mcp.call("pcb_run_drc", json!({ "session_id": id })).await;
+    assert_eq!(
+        drc["result"]["by_type"]["invalid_outline"],
+        Value::Null,
+        "the outline is closed: {drc}"
+    );
+    println!("DRC AFTER EDITS {}", drc["result"]["by_type"]);
+    let render = mcp
+        .call("pcb_render", json!({ "session_id": id, "width": 800, "height": 500 }))
+        .await;
+    assert_eq!(render["ok"], true, "{render}");
+
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    mcp.call("pcb_close", json!({ "session_id": id })).await;
+
+    // The file says the same.
+    let file = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    let fid = file["result"]["session_id"].clone();
+    let info = mcp.call("pcb_info", json!({ "session_id": fid })).await;
+    assert_eq!(info["result"]["outline"]["width"], outline["width"], "{info}");
+    let list = mcp
+        .call(
+            "pcb_list_footprints",
+            json!({ "session_id": fid, "include_pads": true }),
+        )
+        .await;
+    assert_eq!(footprint(&list, "R3")["pads"], r3["pads"], "{list}");
+    assert_eq!(
+        footprint(&list, "H4")["library_id"],
+        "MountingHole:MountingHole_3.2mm_M3"
+    );
+    assert_eq!(footprint(&list, "U1")["locked"], true);
+}
+
+/// Against a real KiCad 11 PCB editor: an outline around the parts and one part turned, each one
+/// undo step. Open a **copy** of a project in the PCB Editor, press "KiCad AI: connect" there,
+/// then run with THINGSVU_GUI_PCB_EDIT=1.
+#[tokio::test]
+async fn gui_pcb_edit_demo() {
+    if std::env::var("THINGSVU_GUI_PCB_EDIT").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_PCB_EDIT=1 with a registered KiCad PCB editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let key = |n: &str| format!("gui-pcb-edit-{n}-{}", std::process::id());
+    let plan = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "margin_mm": 3, "corner_radius_mm": 1, "replace": true }),
+        )
+        .await;
+    println!("GUI OUTLINE PLAN {plan}");
+    assert_eq!(plan["ok"], true, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("outline")).await;
+    println!("GUI OUTLINE APPLY {applied}");
+    let list = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
+    let first = list["result"]["footprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["locked"] == false)
+        .expect("an unlocked footprint")["reference"]
+        .clone();
+    let plan = mcp
+        .call(
+            "pcb_move_plan",
+            json!({ "session_id": id, "moves": [{ "reference": first, "rotate_by_deg": 90 }] }),
+        )
+        .await;
+    println!("GUI MOVE PLAN {plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("move")).await;
+    println!("GUI MOVE APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: {first} is turned and the board has an outline; Ctrl+Z twice undoes both");
 }
