@@ -172,7 +172,7 @@ Exit criteria: golden circuits (3.3 V regulator first) laid out with signal flow
 - [x] **5.8 Readability checks** — `kicad-domain::readability` checks a plan's geometry independently of the layout: shorts between nets (error `LAYOUT_SHORT`), overlapping symbol bodies and wires through bodies (warnings `SYMBOLS_OVERLAP`, `WIRE_THROUGH_SYMBOL`), and power nets drawn as labels. The report is in the `sch_plan_circuit` result (`readability`). Unit tests require both golden circuits to be clean against the test library, and the live harness requires the same against KiCad's real libraries.
   - **Review:** a wire that leaves a symbol's own pin is not counted as passing through it, because some graphics (LED arrows) overhang the pin end.
   - **Attention:** field text (reference, value, and flag text) is not measured, only kept clear by spacing. Next to a two-pin connector the `PWR_FLAG` text can still crowd nearby wires (visible beside J1 in both renders).
-- [~] **5.9 Layout hints and editing tools** — deferred.
+- [~] **5.9 Layout hints and editing tools** — partly done in Phase 8: the tidy and `sch_set_field` exist; move/rotate/delete tools and layout hints are not built (see 8.5 and 8.6).
   - **Review:** optional layout hints and `sch_move_symbol` / `sch_rotate_symbol` / `sch_add_wire` / `sch_delete_items` are not done. Proposal: do them early in Phase 7, or as their own small phase if you want them before the KiCad 10 fallback.
 
 Phase 5 notes for review:
@@ -184,7 +184,7 @@ Phase 5 notes for review:
 
 Exit criteria (plan §14): all Tier 2 acceptance criteria — with KiCad 10.0.7 and no KiCad running, the same agent request produces a correct schematic on a closed project, and its connectivity matches the KiCad 11 build of the same circuit.
 
-- [x] **6.1 `kicad-sexpr` crate** — a parser that keeps each node's byte span; a symbol library reader (`.kicad_sym`, including `extends` flattening) that produces the same `LibrarySymbol` geometry as KiCad's API; a schematic reader (placed symbols, embedded definitions, project name); and a writer that **inserts** text at two places (the end of `lib_symbols`, and before `sheet_instances`), so every other byte of the file is untouched. 18 unit tests.
+- [x] **6.1 `kicad-sexpr` crate** — a parser that keeps each node's byte span; a symbol library reader (`.kicad_sym`, including `extends` flattening) that produces the same `LibrarySymbol` geometry as KiCad's API; a schematic reader (placed symbols, embedded definitions, project name); and a writer that **inserts** text at two places (the end of `lib_symbols`, and before `sheet_instances`), so every other byte of the file is untouched (Phase 8 added deleting items and changing a symbol's numbers in place, still touching nothing else). 18 unit tests.
   - **Review:** the plan (§5.3) asks for a lossless syntax tree. This is lossless by construction, because the file is never re-printed: only insertions are made. A general edit API (moving or deleting items) would need more; it belongs with the editing tools of 5.9.
   - **Review:** `kicad-cli-runner` keeps its own small s-expression parser for netlists. Two parsers exist now; merging them is a cleanup for Phase 7.
 - [x] **6.2 File provider** — `provider: "file"` in `session_open` (also `create: true`, which writes an empty schematic at once). `FileSession` reads the file for symbols and pins and uses `kicad-cli`'s netlister for connectivity. `AnySession` lets every tool work the same on an API session or a file session, with the capability matrix saying which backend serves what (`project_file`, `kicad_cli`).
@@ -238,3 +238,42 @@ Phase 7 verification (25 Oct 2026):
 - Push `0ed6f5d` produced release **v0.1.0** (pre-release) on that commit, with the Windows zip, PCM zip, Linux archive, `install.ps1`, and `SHA256SUMS.txt`. CI and Release both passed.
 - The published `install.ps1`, run from an empty folder against sandbox directories, downloaded the release, verified its checksum, and installed a working `kicad-ai-mcp 0.1.0` and the plugin.
 - Not verified: the PCM package through KiCad itself, and the plugin button in a KiCad 11 editor after an installer-made install (it is the same plugin folder layout the Phase 4 test used).
+
+---
+
+## Phase 8 — Review and tidy existing schematics
+
+Motivation (25 Oct 2026): the project owner asked an assistant to make the schematic open in the KiCad editor neat and readable. The tools could only add parts, so the assistant started editing the file on its own. This phase gives it a safe way to do that.
+
+Exit criteria: an assistant can read a whole existing sheet, say what is untidy, plan a cleaner layout, and apply it with the same guarantees as for a new circuit — every net identical afterwards, nothing changed before the user confirms — on the live editor, on a headless session, and on a file.
+
+- [x] **8.1 Read the whole sheet** — `SchematicDesign` (parts, wires, labels, junctions, text notes, and a count of items tidying cannot handle) read the same way from a live KiCad (`GetItems` for every item kind) and from a file (`kicad-sexpr`). Net-naming power symbols and flags that `kicad-cli`'s netlister leaves out are attached to their nets from the drawing, so file and API sessions report the same netlist.
+- [x] **8.2 `sch_review`** — read-only. Reports counts, overlapping symbols and wires through parts (the same geometric checks used for new layouts), whether a tidy is possible and why not, and how much it would change.
+- [x] **8.3 `sch_tidy_plan` and apply** — the circuit is read back from the design (parts and KiCad's nets), laid out again by the engine that lays out new circuits, and the difference becomes a plan: **move** each part, **remove** the old wires, labels, junctions, and net-naming power symbols, **add** the new drawing. Parts keep their identity, values, footprints, and fields. The existing `sch_apply_plan` applies it:
+  - *file:* one verified copy, then atomic replace, as before; a part's text moves with it, in place, touching only the numbers that change;
+  - *headless:* two commits, and a failed tidy reloads the saved file (so it refuses to start with unsaved changes);
+  - *editor:* two commits (two undo steps); if something fails after the first, the error says how many times to press Ctrl+Z.
+  Applying must leave **exactly the same nets**; ERC must not get worse (a live test asserts both on both backends). Tidying a tidy schematic changes nothing (`NOTHING_TO_CHANGE`).
+  - **Decision:** the plan includes `moves` and `removals` next to `operations`, so one plan store, one apply tool, and one confirmation flow serve both new circuits and tidies.
+- [x] **8.4 `sch_set_field`** — change one part's value or footprint, nothing else. One undo step in an editor; a file change must load in `kicad-cli` before it replaces the file.
+- [~] **8.5 Move, rotate, rewire, and delete tools** — **not built; replaced by the tidy.**
+  - **Review:** a move tool is not useful alone: KiCad does not drag wires when a symbol moves through the API, so a move would break the circuit unless the wires around it are redrawn too. Tidy does exactly that for the whole sheet. Piecemeal moves would need their own routing and checking, for little the tidy does not already give. Say if you want them anyway (`sch_move_symbol` with local re-routing is the natural form).
+- [~] **8.6 Layout hints** — not done. The tidy takes no hints (for example "keep J1 where it is" or "group C1 and C2"); notes are the only thing it works around. Natural next step if tidy results need steering.
+
+Things the tidy deliberately does or does not do (please review):
+- **Refuses** sheets with buses, bus entries, global or hierarchical labels, directive labels, sheets, groups, tables, rule areas, or no-connect flags, and unannotated references. It says which, and changes nothing. Only flat, single-sheet designs.
+- **Text notes and graphics stay where they are.** If the new layout would land on a note it is placed lower, below it (`TIDY_PLACED_BELOW_NOTES`). Other graphics (lines, boxes, images) are not avoided.
+- **Labels stay labels.** A net the design names with a label (e.g. `VBUS`) keeps a label; a power symbol there would be a power input nothing drives, and ERC would start to complain. Nets that already have a power symbol get one again.
+- **Unnamed nets** (`Net-(R1-Pad2)`) get no label when they are fully wired.
+- **Power symbols are replaced**, not moved: their references are renumbered unless a symbol would be drawn exactly where it already is.
+- The layout is the Phase 5 engine's: one row, with shunts below and hub layout for ICs. A design that was carefully hand-arranged will be rearranged to that style.
+- Wires are compared as runs along a line, because KiCad joins wires that meet end to end.
+
+Findings during the work (kept for the record):
+- **Through the API a moved symbol's text stays behind.** The API moves the symbol and leaves its reference and value where they were, so the live path moves each field itself, keeping its place relative to the symbol. The text angle is stored relative to the symbol (as in the file) and is left alone.
+- **`kicad-cli`'s netlist omits power symbols and flags** — see docs/kicad-api-compatibility.md. A flag joined to its net only through a ground symbol's name needed the name-based attachment.
+- **Flags need `#`-prefixed references to validate** (`#FLG01`); the reference check now allows a leading `#`.
+
+**Attention — please try on the live editor:** I could not drive your KiCad GUI. Open a **copy** of a design in the nightly Schematic Editor, press **KiCad AI: connect**, and run `THINGSVU_GUI_TIDY=1 cargo test -p kicad-ai-mcp --test stdio gui_tidy_demo -- --nocapture` (or ask the assistant to review and tidy it). It prints the review, the plan counts, the result, and ERC before and after; Ctrl+Z twice undoes it. The same code path was verified live on the headless server with the same API.
+
+- **Decision:** the version is now **0.2.0**, so this push publishes release `v0.2.0` (a pre-release) with the new tools.

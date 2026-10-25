@@ -110,3 +110,17 @@ Do this when KiCad 11.0 is released (the nightly `10.99` stops being the target)
 4. Run the whole live suite: `$env:KICAD_LIVE = '1'; cargo test --workspace -- --test-threads=1`. The `library_geometry_matches_kicads_own` and `both_backends_build_the_same_circuit` tests in `kicad-session` are the ones that notice a format or geometry change.
 5. If the schematic format version changed, extend the supported range (`MIN_VERSION` / `MAX_VERSION` in `crates/kicad-sexpr/src/sch.rs`) only after the live tests pass on files of the new format, and add its series to `format_of` in `crates/kicad-session/src/file.rs`.
 6. Update `docs/capability-matrix.md`, the README's supported-version table, and the badges.
+
+## Reading and editing a whole sheet over the API (10.99, Phase 8)
+
+Observed 25 Oct 2026.
+
+| Topic | Observation |
+|---|---|
+| `GetItems` with many types | One request with the types for lines, junctions, local/global/hierarchical/directive labels, no-connect markers, bus entries, sheets, text, text boxes, shapes, images, tables, groups, and rule areas answers in one reply on the headless server. A `SchematicLine` has a type: wire, bus, or graphic |
+| `DeleteItems` | Deletes wires, labels, junctions, and placed symbols (including power symbols) by KIID; each item has its own status (`IDS_OK`, `IDS_NONEXISTENT`, …) |
+| `UpdateItems` with `field_mask` `position` and `transform` | Moves and turns a symbol. **The symbol's reference, value, and other field text stay where they were**: they are not carried along. Fields must be updated separately (`reference_field`, `value_field`, …, each carrying its own `text.position`) |
+| Field text angle | `text.attributes.angle` is the same value the file stores: relative to the symbol. It does not change when the symbol is turned, and leaving it alone gives the same drawing as KiCad's own move in the editor |
+| Wires after `CreateItems` | KiCad joins wires that meet end to end into one, so a set of wires read back may be cut differently from the set that was created; compare wires as runs along a line |
+| `kicad-cli` netlist vs API netlist | The CLI netlister omits power symbols and flags; the API netlist includes them. A flag that is connected to the rest of a net only through the name of a power symbol on its wire has to be attached by name |
+| ERC `power_pin_not_driven` | One violation per net. A net named by a **power symbol** whose pins nothing drives (no `PWR_FLAG`, no output pin) gets it; the same net named by a **label** does not. A tidy must therefore not turn a label-named net into a power-symbol net |

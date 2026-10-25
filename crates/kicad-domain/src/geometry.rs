@@ -171,6 +171,18 @@ impl Orientation {
         }
         Some(Point::new(Nm(x), Nm(y)))
     }
+
+    /// The inverse of [`apply`](Self::apply): the point relative to the symbol origin that lands
+    /// at `offset` on the sheet. Returns `None` for a rotation that is not a multiple of 90°.
+    pub fn unapply(self, offset: Point) -> Option<Point> {
+        // The images of the two axes are orthonormal columns, so the inverse is their transpose.
+        let x_axis = self.apply(Point::new(Nm(1), Nm(0)))?;
+        let y_axis = self.apply(Point::new(Nm(0), Nm(1)))?;
+        Some(Point::new(
+            Nm(offset.x.0 * x_axis.x.0 + offset.y.0 * x_axis.y.0),
+            Nm(offset.x.0 * y_axis.x.0 + offset.y.0 * y_axis.y.0),
+        ))
+    }
 }
 
 /// One of the four drawing directions, in sheet axes (y down).
@@ -308,6 +320,29 @@ impl Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unapply_undoes_apply_for_every_orientation() {
+        let local = Point::new(Nm(3_810_000), Nm(-1_270_000));
+        for rotation_deg in [0, 90, 180, 270] {
+            for (mirror_x, mirror_y) in [(false, false), (true, false), (false, true), (true, true)] {
+                let o = Orientation {
+                    rotation_deg,
+                    mirror_x,
+                    mirror_y,
+                };
+                assert_eq!(o.unapply(o.apply(local).unwrap()), Some(local), "{o:?}");
+            }
+        }
+        assert_eq!(
+            Orientation {
+                rotation_deg: 45,
+                ..Default::default()
+            }
+            .unapply(local),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

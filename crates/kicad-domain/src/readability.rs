@@ -10,6 +10,7 @@ use crate::geometry::{Point, Rect};
 use crate::ids::LibraryId;
 use crate::layout::power_symbol;
 use crate::plan::{LibrarySymbol, Operation, OperationPlan};
+use crate::schematic::SchematicDesign;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Readability {
@@ -40,6 +41,33 @@ fn on_segment(p: Point, a: Point, b: Point) -> bool {
         && p.x <= a.x.max(b.x)
         && p.y >= a.y.min(b.y)
         && p.y <= a.y.max(b.y)
+}
+
+/// Overlapping symbol bodies, and wires crossing a symbol body.
+fn geometry_findings(
+    bodies: &[(String, Rect)],
+    pins_of: &BTreeMap<&str, Vec<Point>>,
+    wires: &[(String, Point, Point)],
+    report: &mut Readability,
+) {
+    for (i, (ra, a)) in bodies.iter().enumerate() {
+        for (rb, b) in &bodies[i + 1..] {
+            if a.overlaps(*b) {
+                report.overlapping_symbols.push((ra.clone(), rb.clone()));
+            }
+        }
+    }
+    for (net, a, b) in wires {
+        for (reference, body) in bodies {
+            // A wire leaving the symbol's own pin may clip graphics that overhang the pin end
+            // (an LED's arrows); KiCad's own drawings do the same.
+            let pins = pins_of.get(reference.as_str()).map(Vec::as_slice).unwrap_or_default();
+            let leaves_pin = pins.contains(a) || pins.contains(b);
+            if !leaves_pin && body.crossed_by(*a, *b) {
+                report.wires_through_symbols.push((net.clone(), reference.clone()));
+            }
+        }
+    }
 }
 
 pub fn check(plan: &OperationPlan, library: &BTreeMap<LibraryId, LibrarySymbol>) -> Readability {
@@ -143,23 +171,44 @@ pub fn check(plan: &OperationPlan, library: &BTreeMap<LibraryId, LibrarySymbol>)
         }
     }
 
-    for (i, (ra, a)) in bodies.iter().enumerate() {
-        for (rb, b) in &bodies[i + 1..] {
-            if a.overlaps(*b) {
-                report.overlapping_symbols.push((ra.clone(), rb.clone()));
+    geometry_findings(&bodies, &pins_of, &wires, &mut report);
+    report
+}
+
+/// The same geometric checks on a drawing that exists already. Shorts are not looked for: the
+/// wires carry no net names, and KiCad's netlist is the authority on connectivity.
+pub fn check_design(design: &SchematicDesign, library: &BTreeMap<LibraryId, LibrarySymbol>) -> Readability {
+    let mut report = Readability::default();
+    let mut bodies: Vec<(String, Rect)> = Vec::new();
+    let mut pins_of: BTreeMap<&str, Vec<Point>> = BTreeMap::new();
+    for symbol in &design.symbols {
+        let Some(def) = LibraryId::parse(&symbol.library_id)
+            .ok()
+            .and_then(|id| library.get(&id))
+        else {
+            continue;
+        };
+        if let Some(body) = def.body {
+            bodies.push((
+                symbol.reference.clone(),
+                body.transformed(symbol.orientation).translate(symbol.position),
+            ));
+        }
+        let pins = pins_of.entry(symbol.reference.as_str()).or_default();
+        for pin in &def.pins {
+            if let Some(offset) = symbol.orientation.apply(pin.local) {
+                pins.push(symbol.position + offset);
             }
         }
     }
-    for (net, a, b) in &wires {
-        for (reference, body) in &bodies {
-            // A wire leaving the symbol's own pin may clip graphics that overhang the pin end
-            // (an LED's arrows); KiCad's own drawings do the same.
-            let pins = pins_of.get(reference.as_str()).map(Vec::as_slice).unwrap_or_default();
-            let leaves_pin = pins.contains(a) || pins.contains(b);
-            if !leaves_pin && body.crossed_by(*a, *b) {
-                report.wires_through_symbols.push((net.clone(), reference.clone()));
-            }
-        }
-    }
+    let wires: Vec<(String, Point, Point)> = design
+        .wires
+        .iter()
+        .map(|w| {
+            let at = |p: Point| format!("({:.2}, {:.2})", p.x.to_mm(), p.y.to_mm());
+            (format!("wire {}-{}", at(w.start), at(w.end)), w.start, w.end)
+        })
+        .collect();
+    geometry_findings(&bodies, &pins_of, &wires, &mut report);
     report
 }

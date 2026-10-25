@@ -107,6 +107,18 @@ pub fn operation_view(op: &Operation) -> Value {
     }
 }
 
+fn move_view(m: &kicad_domain::plan::SymbolMove) -> Value {
+    json!({
+        "reference": m.reference,
+        "id": m.id,
+        "from_mm": mm(m.from),
+        "to_mm": mm(m.to),
+        "rotation_deg": m.orientation.rotation_deg,
+        "mirror_x": m.orientation.mirror_x,
+        "mirror_y": m.orientation.mirror_y,
+    })
+}
+
 pub fn plan_view(plan_id: &str, plan: &OperationPlan) -> Value {
     let can_apply = !kicad_domain::validation::has_errors(&plan.findings);
     json!({
@@ -116,8 +128,11 @@ pub fn plan_view(plan_id: &str, plan: &OperationPlan) -> Value {
         "counts": plan.counts(),
         "fallback_nets": plan.fallback_nets,
         "readability": plan.readability,
+        "readability_before": plan.readability_before,
         "references": plan.references,
         "findings": plan.findings,
+        "moves": plan.moves.iter().map(move_view).collect::<Vec<_>>(),
+        "removals": plan.removals,
         "operations": plan.operations.iter().map(operation_view).collect::<Vec<_>>(),
         "expected_nets": plan.expected_nets,
     })

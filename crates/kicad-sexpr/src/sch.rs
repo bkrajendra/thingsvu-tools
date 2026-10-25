@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Reading a `.kicad_sch` file: what is placed, and which symbol definitions it carries.
 
-use kicad_domain::{Nm, Orientation, Point};
+use kicad_domain::{DesignJunction, DesignLabel, DesignSymbol, DesignWire, Nm, Orientation, Point, SchematicDesign};
 
 use crate::node::{parse, Node, ParseError};
 
@@ -112,6 +112,93 @@ impl Document {
     pub fn symbols(&self) -> Vec<PlacedSymbol> {
         self.root.children("symbol").filter_map(placed).collect()
     }
+
+    /// The top-level item with this head (`wire`, `label`, `junction`, `symbol`) and uuid.
+    pub fn item(&self, head: &str, uuid: &str) -> Option<&Node> {
+        self.root
+            .items()
+            .iter()
+            .filter(|n| n.head() == Some(head))
+            .find(|n| n.child_text("uuid").is_some_and(|u| u.eq_ignore_ascii_case(uuid)))
+    }
+
+    /// Everything on the sheet that the review and tidy tools look at.
+    pub fn design(&self) -> SchematicDesign {
+        let mut design = SchematicDesign::default();
+        for s in self.symbols() {
+            design.symbols.push(DesignSymbol {
+                id: s.uuid,
+                reference: s.reference,
+                value: s.value,
+                library_id: s.library_id,
+                footprint: s.footprint,
+                position: s.position,
+                orientation: s.orientation,
+                unit: s.unit,
+            });
+        }
+        let point = |n: &Node| {
+            Some(Point::new(
+                Nm((n.arg_f64(0)? * 1e6).round() as i64),
+                Nm((n.arg_f64(1)? * 1e6).round() as i64),
+            ))
+        };
+        for item in self.root.items() {
+            let Some(head) = item.head() else { continue };
+            let id = item.child_text("uuid").unwrap_or_default().to_owned();
+            match head {
+                "wire" => {
+                    let ends: Vec<Point> = item
+                        .child("pts")
+                        .map(|p| p.children("xy").filter_map(point).collect())
+                        .unwrap_or_default();
+                    if let [start, end] = ends[..] {
+                        design.wires.push(DesignWire { id, start, end });
+                    }
+                }
+                "label" => {
+                    if let (Some(text), Some(position)) = (item.arg_text(0), item.child("at").and_then(point)) {
+                        design.labels.push(DesignLabel {
+                            id,
+                            text: text.to_owned(),
+                            position,
+                        });
+                    }
+                }
+                "junction" => {
+                    if let Some(position) = item.child("at").and_then(point) {
+                        design.junctions.push(DesignJunction { id, position });
+                    }
+                }
+                // Things a person drew with and a tidy cannot redraw around.
+                "no_connect" | "bus" | "bus_entry" | "sheet" | "global_label" | "hierarchical_label"
+                | "directive_label" | "netclass_flag" | "rule_area" | "table" | "group" => {
+                    *design.unsupported.entry(head.to_owned()).or_default() += 1;
+                }
+                // Notes and graphics stay where they are.
+                "text" | "text_box" | "polyline" | "rectangle" | "circle" | "arc" | "bezier" | "image" => {
+                    design.annotations += 1;
+                    if head == "text" {
+                        if let (Some(text), Some(at)) = (item.arg_text(0), item.child("at").and_then(point)) {
+                            let size = item
+                                .child("effects")
+                                .and_then(|e| e.child("font"))
+                                .and_then(|f| f.child("size"))
+                                .and_then(|s| s.arg_f64(0))
+                                .unwrap_or(1.27);
+                            design.notes.push(kicad_domain::schematic::note_area(
+                                at,
+                                text,
+                                Nm((size * 1e6).round() as i64),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        design
+    }
 }
 
 fn placed(node: &Node) -> Option<PlacedSymbol> {
@@ -206,6 +293,30 @@ mod tests {
         );
         assert_eq!(s.pins.len(), 2);
         assert_eq!(s.definition, "Device:R");
+    }
+
+    #[test]
+    fn reads_the_whole_design() {
+        let text = SCH.replace(
+            "\n)",
+            r#"
+	(wire (pts (xy 10 20) (xy 10 30)) (stroke (width 0) (type default)) (uuid "a1"))
+	(junction (at 10 25) (diameter 0) (uuid "a2"))
+	(label "MID" (at 10 30 0) (uuid "a3"))
+	(global_label "SDA" (at 1 1 0) (uuid "a4"))
+	(no_connect (at 2 2) (uuid "a5"))
+	(text "note" (at 5 5 0) (uuid "a6"))
+)"#,
+        );
+        let design = Document::parse(text).unwrap().design();
+        assert_eq!(design.symbols.len(), 1);
+        assert_eq!(design.wires.len(), 1);
+        assert_eq!(design.wires[0].end, Point::new(Nm(10_000_000), Nm(30_000_000)));
+        assert_eq!(design.labels[0].text, "MID");
+        assert_eq!(design.junctions[0].position, Point::new(Nm(10_000_000), Nm(25_000_000)));
+        assert_eq!(design.annotations, 1);
+        assert_eq!(design.unsupported.get("global_label"), Some(&1));
+        assert_eq!(design.unsupported.get("no_connect"), Some(&1));
     }
 
     #[test]

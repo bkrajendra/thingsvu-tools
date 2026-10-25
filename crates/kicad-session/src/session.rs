@@ -416,7 +416,7 @@ impl Session {
         &self.document_path
     }
 
-    async fn unsaved_changes(inner: &mut Inner, document: &DocumentSpecifier) -> Option<bool> {
+    pub(crate) async fn unsaved_changes(inner: &mut Inner, document: &DocumentSpecifier) -> Option<bool> {
         let r: GetDocumentModifiedStateResponse = inner
             .client
             .call(&GetDocumentModifiedState {

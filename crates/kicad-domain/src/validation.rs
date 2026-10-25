@@ -192,6 +192,8 @@ pub fn has_errors(findings: &[Finding]) -> bool {
 }
 
 fn is_reference(r: &str) -> bool {
+    // Power-library parts (flags, power symbols) are `#FLG01`, `#PWR02`.
+    let r = r.strip_prefix('#').unwrap_or(r);
     let letters = r.chars().take_while(|c| c.is_ascii_alphabetic()).count();
     letters > 0 && letters < r.len() && r[letters..].chars().all(|c| c.is_ascii_digit()) && r.len() <= 16
 }

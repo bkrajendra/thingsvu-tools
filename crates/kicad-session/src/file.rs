@@ -4,7 +4,7 @@
 //! changes are written to a copy that `kicad-cli` must accept — with exactly the planned
 //! connectivity — before it atomically replaces the original.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -370,6 +370,11 @@ impl FileSession {
         })
     }
 
+    /// Every part, wire, label, and junction in the file, and what tidying cannot handle.
+    pub async fn design(&self) -> Result<kicad_domain::SchematicDesign, ToolError> {
+        Ok(self.read()?.design())
+    }
+
     /// A plan made against one fingerprint is stale once the file changes in any way.
     pub async fn fingerprint(&self) -> Result<String, ToolError> {
         Ok(fingerprint_of(&self.read_bytes()?))
@@ -510,8 +515,29 @@ impl FileSession {
     }
 
     pub async fn netlist(&self) -> Result<Vec<NetInfo>, ToolError> {
-        let symbols = self.read()?.symbols();
-        self.netlist_of(&self.document_path, &symbols).await
+        let doc = self.read()?;
+        let mut nets = self.netlist_of(&self.document_path, &doc.symbols()).await?;
+        // The netlister leaves out power symbols and flags; the API's netlist has them, so add
+        // them from the drawing and both kinds of session report the same thing.
+        let design = doc.design();
+        let ids: Vec<LibraryId> = design
+            .symbols
+            .iter()
+            .filter(|s| s.reference.starts_with('#'))
+            .filter_map(|s| LibraryId::parse(&s.library_id).ok())
+            .chain(
+                design
+                    .symbols
+                    .iter()
+                    .filter(|s| !s.reference.starts_with('#'))
+                    .filter_map(|s| LibraryId::parse(&s.library_id).ok()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let library = self.library_symbols(&ids).await?;
+        kicad_domain::attach_power_pins(&design, &library, &mut nets);
+        Ok(nets)
     }
 
     /// Adds `plan` to the file if it still has `expected_fingerprint`. The result is written to a
@@ -597,30 +623,7 @@ impl FileSession {
             .with_mutation_state(MutationState::NotApplied));
         }
 
-        // Nobody may have changed the file while it was being verified.
-        if self.read_bytes().map(|now| fingerprint_of(&now)).ok().as_deref() != Some(&fingerprint_of(&bytes)) {
-            let _ = std::fs::remove_file(&candidate);
-            return Err(ToolError::new(
-                ErrorCode::FileChangedOnDisk,
-                "the schematic changed while the plan was being verified; nothing was written, make a new plan",
-            )
-            .with_mutation_state(MutationState::NotApplied));
-        }
-
-        // Keep the previous version where it can be recovered, then replace the file in one step.
-        let backup = self
-            .runtime_dir
-            .join(&self.id)
-            .join("backups")
-            .join(format!("{stem}-{}.kicad_sch", fingerprint_of(&bytes)));
-        let backup_path = std::fs::create_dir_all(backup.parent().unwrap_or(Path::new(".")))
-            .and_then(|_| std::fs::write(&backup, &bytes))
-            .ok()
-            .map(|_| backup.display().to_string());
-        if let Err(e) = std::fs::rename(&candidate, &self.document_path) {
-            let _ = std::fs::remove_file(&candidate);
-            return Err(io_error("replace", &self.document_path, e).with_mutation_state(MutationState::NotApplied));
-        }
+        let backup_path = self.replace_with_candidate(&bytes, &candidate, &stem)?;
 
         let by_reference: HashMap<&str, &str> = symbols
             .iter()
@@ -655,7 +658,91 @@ impl FileSession {
             verification,
             verified: true,
             backup_path,
+            moved: plan.moves.len(),
+            removed: plan.removals.len(),
         })
+    }
+
+    /// Replaces the schematic with the verified `candidate`, keeping the previous version. Refuses,
+    /// and removes the candidate, if the file changed since `bytes` was read.
+    fn replace_with_candidate(&self, bytes: &[u8], candidate: &Path, stem: &str) -> Result<Option<String>, ToolError> {
+        // Nobody may have changed the file while it was being verified.
+        if self.read_bytes().map(|now| fingerprint_of(&now)).ok().as_deref() != Some(&fingerprint_of(bytes)) {
+            let _ = std::fs::remove_file(candidate);
+            return Err(ToolError::new(
+                ErrorCode::FileChangedOnDisk,
+                "the schematic changed while the change was being verified; nothing was written, try again",
+            )
+            .with_mutation_state(MutationState::NotApplied));
+        }
+
+        // Keep the previous version where it can be recovered, then replace the file in one step.
+        let backup = self
+            .runtime_dir
+            .join(&self.id)
+            .join("backups")
+            .join(format!("{stem}-{}.kicad_sch", fingerprint_of(bytes)));
+        let backup_path = std::fs::create_dir_all(backup.parent().unwrap_or(Path::new(".")))
+            .and_then(|_| std::fs::write(&backup, bytes))
+            .ok()
+            .map(|_| backup.display().to_string());
+        if let Err(e) = std::fs::rename(candidate, &self.document_path) {
+            let _ = std::fs::remove_file(candidate);
+            return Err(io_error("replace", &self.document_path, e).with_mutation_state(MutationState::NotApplied));
+        }
+        Ok(backup_path)
+    }
+
+    /// Changes the value or footprint of one part. The new file must load in `kicad-cli` before it
+    /// replaces the old one.
+    pub async fn set_field(
+        &self,
+        selector: &str,
+        field: crate::SymbolField,
+        text: &str,
+    ) -> Result<SymbolInfo, ToolError> {
+        let _writing = self.writing.lock().await;
+        if lock_file(&self.document_path).is_some_and(|l| l.exists()) {
+            return Err(ToolError::new(
+                ErrorCode::DocumentOpenElsewhere,
+                "the schematic is now open in a KiCad editor (lock file present); close it there first",
+            ));
+        }
+        let bytes = self.read_bytes()?;
+        let doc = Document::parse(
+            String::from_utf8(bytes.clone())
+                .map_err(|_| ToolError::new(ErrorCode::InvalidArgument, "the schematic is not valid UTF-8"))?,
+        )
+        .map_err(doc_error)?;
+        let symbols = doc.symbols();
+        let target = crate::select_symbol(&symbols, selector, |s| (s.uuid.as_str(), s.reference.as_str()))?;
+        let new_text = kicad_sexpr::set_property(&doc, &target.uuid, field.property_name(), text)
+            .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot change the field: {e}")))?;
+
+        let stem = self
+            .document_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let candidate = self.document_path.with_file_name(format!(
+            ".thingsvu-{}-{}.kicad_sch",
+            self.id,
+            fingerprint_of(new_text.as_bytes())
+        ));
+        write_synced(&candidate, new_text.as_bytes()).map_err(|e| io_error("write", &candidate, e))?;
+        let reread = Document::parse(new_text.clone()).map_err(doc_error)?;
+        let loaded = self.netlist_of(&candidate, &reread.symbols()).await;
+        if let Err(e) = loaded {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(e.with_mutation_state(MutationState::NotApplied));
+        }
+        self.replace_with_candidate(&bytes, &candidate, &stem)?;
+        let changed = self.read()?.symbols();
+        let changed = changed
+            .iter()
+            .find(|s| s.uuid == target.uuid)
+            .ok_or_else(|| ToolError::new(ErrorCode::KicadError, "the part is missing after the change"))?;
+        symbol_info(changed)
     }
 
     /// Changes are written when applied; there is nothing pending to save.

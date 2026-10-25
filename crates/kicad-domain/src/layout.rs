@@ -1045,7 +1045,7 @@ pub fn layout(
 }
 
 /// Moves an operation by `by`.
-fn translate(op: Operation, by: Point) -> Operation {
+pub(crate) fn translate(op: Operation, by: Point) -> Operation {
     match op {
         Operation::PlaceSymbol {
             component_id,

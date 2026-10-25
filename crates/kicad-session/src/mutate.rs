@@ -89,6 +89,15 @@ pub struct ApplyReport {
     /// Where the previous version of the file was kept (file sessions only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+    /// Existing symbols moved and drawing items deleted (a tidy).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub moved: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub removed: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Items created so far, for cleanup when an apply fails part way.
@@ -99,6 +108,8 @@ struct Created {
     /// Created by steps that completed; must be deleted explicitly on a later failure.
     committed: Vec<String>,
 }
+
+mod edit;
 
 impl Session {
     /// Pin geometry of library symbols, before placement. Missing entries are left out.
@@ -245,6 +256,17 @@ impl Session {
             }
             n.other_items.hash(&mut h);
         }
+        // The drawing too: a tidy plan deletes particular wires, labels, and junctions.
+        let design = self.design().await?;
+        for w in &design.wires {
+            (&w.id, w.start.x.0, w.start.y.0, w.end.x.0, w.end.y.0).hash(&mut h);
+        }
+        for l in &design.labels {
+            (&l.id, &l.text, l.position.x.0, l.position.y.0).hash(&mut h);
+        }
+        for j in &design.junctions {
+            (&j.id, j.position.x.0, j.position.y.0).hash(&mut h);
+        }
         Ok(format!("{:016x}", h.finish()))
     }
 
@@ -272,6 +294,10 @@ impl Session {
                 ErrorCode::StalePlan,
                 "the schematic changed since the plan was made; make a new plan",
             ));
+        }
+
+        if !plan.moves.is_empty() || !plan.removals.is_empty() {
+            return self.apply_edit(plan).await;
         }
 
         let use_commit = self.capabilities().is_available(Capability::Commits);
@@ -326,6 +352,8 @@ impl Session {
             verification,
             verified,
             backup_path: None,
+            moved: 0,
+            removed: 0,
         })
     }
 
@@ -453,6 +481,17 @@ async fn update_fields(
             paths.push("footprint_field".into());
         }
     }
+    send_symbol_update(client, header, symbol, paths).await
+}
+
+/// Sends `symbol` to KiCad with a field mask naming the only parts that may change, and returns
+/// what KiCad stored.
+async fn send_symbol_update(
+    client: &mut Client,
+    header: &impl Fn() -> Option<ItemHeader>,
+    symbol: SchematicSymbolInstance,
+    paths: Vec<String>,
+) -> Result<SchematicSymbolInstance, ToolError> {
     let mut h = header().unwrap_or_default();
     h.field_mask = Some(FieldMask { paths });
     let any = Any::from_msg(&symbol).map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;

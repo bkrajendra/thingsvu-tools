@@ -143,6 +143,26 @@ impl AnySession {
         }
     }
 
+    pub async fn design(&self) -> Result<kicad_domain::SchematicDesign, ToolError> {
+        match self {
+            Self::Ipc(s) => s.design().await,
+            Self::File(s) => s.design().await,
+        }
+    }
+
+    /// Changes the value or footprint of one part (an id, or a reference matching one part).
+    pub async fn set_field(
+        &self,
+        selector: &str,
+        field: crate::SymbolField,
+        text: &str,
+    ) -> Result<SymbolInfo, ToolError> {
+        match self {
+            Self::Ipc(s) => s.set_field(selector, field, text).await,
+            Self::File(s) => s.set_field(selector, field, text).await,
+        }
+    }
+
     pub async fn netlist(&self) -> Result<Vec<NetInfo>, ToolError> {
         match self {
             Self::Ipc(s) => s.netlist().await,

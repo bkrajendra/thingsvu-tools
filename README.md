@@ -128,6 +128,12 @@ Or live, with KiCad 11: open your project in the **Schematic Editor**, press the
 
 The assistant plans, shows you the parts, positions, and nets, and waits for your OK. Applying a plan in the live editor is two undo steps (**Ctrl+Z** twice).
 
+To clean up a schematic that already exists:
+
+> Review the schematic, then plan a tidy and show me what would move before you change anything.
+
+The tidy lays the circuit out again, keeping every part, value, and footprint and checking that every net is identical afterwards. It handles a single sheet of parts joined by wires, labels, and power symbols; buses, global labels, hierarchical sheets, and no-connect flags are refused with a reason, and text notes stay where they are.
+
 ## Three ways to work
 
 | Provider | KiCad | What it does | Choose it when |
@@ -148,7 +154,10 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `sch_list_symbols` / `sch_get_symbol_pins` | Read parts and their pins, positions, and types |
 | `sch_get_netlist` | Connectivity as KiCad's netlister sees it |
 | `sch_plan_changes` | Turn a circuit (parts and nets) into an exact, reviewable plan. Changes nothing |
-| `sch_apply_plan` | Apply a plan you confirmed, verify it against KiCad, and report any difference |
+| `sch_apply_plan` | Apply a plan you confirmed (new circuit or tidy), verify it against KiCad, and report any difference |
+| `sch_review` | Look at an existing schematic: overlapping parts, wires through parts, and whether it can be tidied. Read-only |
+| `sch_tidy_plan` | Plan a cleaner layout for an existing schematic: parts re-laid out, old wires and labels replaced, nets kept identical. Changes nothing until applied |
+| `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |
 | `sch_export_netlist` | Write a KiCad netlist |
@@ -211,8 +220,8 @@ How releases are made: [releasing](docs/releasing.md).
 
 ## Roadmap
 
-- **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), ERC, netlist export, verified demo circuits, KiCad 10 through the schematic file, and a one-step installer
-- **Next:** layout editing tools (move, rotate, rewire), PCB tools, hierarchical schematics, part and BOM assistance
+- **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), reviewing and tidying existing schematics, ERC, netlist export, verified demo circuits, KiCad 10 through the schematic file, and a one-step installer
+- **Next:** layout hints and finer editing (move, rotate), PCB tools, hierarchical schematics, part and BOM assistance
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 
 ## Project status

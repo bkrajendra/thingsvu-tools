@@ -3,12 +3,13 @@
 //! `lib_symbols`, and before `sheet_instances`); every other byte of the file stays as it was.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
-use kicad_domain::plan::{Operation, OperationPlan};
+use kicad_domain::plan::{Operation, OperationPlan, RemovedKind, SymbolMove};
 use kicad_domain::{Dir, LibraryId, Nm, Orientation, Point};
 
-use crate::node::{mm, Node};
-use crate::sch::Document;
+use crate::node::{mm, quote, Node};
+use crate::sch::{Document, PlacedSymbol};
 use crate::sym::describe;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -19,6 +20,8 @@ pub enum EmitError {
     BadRotation,
     #[error("the file has no place to add items: {0}")]
     NoInsertPoint(&'static str),
+    #[error("the file has no {0} with id {1}")]
+    ItemNotFound(&'static str, String),
 }
 
 fn atom(s: impl Into<String>) -> Node {
@@ -238,6 +241,118 @@ fn before_close(text: &str, list: &Node, lines: &str) -> (usize, String) {
     }
 }
 
+/// A change to the original text: replace `range` with `text` (an insertion has an empty range).
+struct Edit {
+    range: Range<usize>,
+    text: String,
+}
+
+/// The range to delete for `node`: its own line when it is alone on it.
+fn removal_range(text: &str, node: &Node) -> Range<usize> {
+    let mut start = node.span.start;
+    if let Some(nl) = text[..start].rfind('\n') {
+        if text[nl + 1..start].chars().all(|c| c == ' ' || c == '\t') {
+            start = nl + 1;
+        }
+    }
+    let mut end = node.span.end;
+    if text[end..].starts_with("\r\n") {
+        end += 2;
+    } else if text[end..].starts_with('\n') {
+        end += 1;
+    }
+    start..end
+}
+
+/// The transform a symbol is written with: mirroring both ways is a half turn.
+fn normalized(o: Orientation) -> Orientation {
+    if o.mirror_x && o.mirror_y {
+        Orientation {
+            rotation_deg: (o.rotation_deg + 180) % 360,
+            mirror_x: false,
+            mirror_y: false,
+        }
+    } else {
+        o
+    }
+}
+
+fn at_text(p: Point, angle: &str) -> String {
+    format!("(at {} {} {angle})", mm(p.x.0), mm(p.y.0))
+}
+
+fn sheet_point(at: &Node) -> Option<Point> {
+    Some(Point::new(
+        Nm((at.arg_f64(0)? * 1e6).round() as i64),
+        Nm((at.arg_f64(1)? * 1e6).round() as i64),
+    ))
+}
+
+/// The edits that move one symbol and carry its fields along: each field keeps its place relative
+/// to the symbol, turned the way the symbol turns.
+fn move_edits(text: &str, node: &Node, from: &PlacedSymbol, to: &SymbolMove) -> Result<Vec<Edit>, EmitError> {
+    let (old_o, new_o) = (normalized(from.orientation), normalized(to.orientation));
+    let mut edits = Vec::new();
+    let at = node
+        .child("at")
+        .ok_or(EmitError::NoInsertPoint("a symbol without a position"))?;
+    edits.push(Edit {
+        range: at.span.clone(),
+        text: at_text(to.to, &new_o.rotation_deg.to_string()),
+    });
+    let wanted = if new_o.mirror_x {
+        Some("x")
+    } else if new_o.mirror_y {
+        Some("y")
+    } else {
+        None
+    };
+    match (node.child("mirror"), wanted) {
+        (Some(m), Some(axis)) => edits.push(Edit {
+            range: m.span.clone(),
+            text: format!("(mirror {axis})"),
+        }),
+        (Some(m), None) => edits.push(Edit {
+            range: removal_range(text, m),
+            text: String::new(),
+        }),
+        (None, Some(axis)) => edits.push(Edit {
+            range: at.span.end..at.span.end,
+            text: format!("\n\t\t(mirror {axis})"),
+        }),
+        (None, None) => {}
+    }
+    for property in node.children("property") {
+        let Some(field_at) = property.child("at") else { continue };
+        let Some(old_world) = sheet_point(field_at) else {
+            continue;
+        };
+        let local = old_o.unapply(old_world - from.position).ok_or(EmitError::BadRotation)?;
+        let new_world = to.to + new_o.apply(local).ok_or(EmitError::BadRotation)?;
+        edits.push(Edit {
+            range: field_at.span.clone(),
+            text: at_text(new_world, field_at.arg_text(2).unwrap_or("0")),
+        });
+    }
+    Ok(edits)
+}
+
+/// `doc`'s text with the text of one property (`Value`, `Footprint`, …) of the symbol with this
+/// uuid replaced; everything else is untouched.
+pub fn set_property(doc: &Document, uuid: &str, name: &str, text: &str) -> Result<String, EmitError> {
+    let symbol = doc
+        .item("symbol", uuid)
+        .ok_or_else(|| EmitError::ItemNotFound("symbol", uuid.to_owned()))?;
+    let value = symbol
+        .children("property")
+        .find(|p| p.arg_text(0) == Some(name))
+        .and_then(|p| p.arg(1))
+        .ok_or_else(|| EmitError::ItemNotFound("property", name.to_owned()))?;
+    let mut out = doc.text().to_owned();
+    out.replace_range(value.span.clone(), &quote(text));
+    Ok(out)
+}
+
 /// `doc`'s text with the plan's items added. `defs` holds a flattened definition (named
 /// `library:name`) for every library symbol the plan places; those the file does not carry yet
 /// are added to its `lib_symbols`. `project` names the project in the new symbols' instance data.
@@ -326,12 +441,43 @@ pub fn add_plan(
     let lib_symbols = root
         .child("lib_symbols")
         .ok_or(EmitError::NoInsertPoint("lib_symbols"))?;
-    let mut edits: Vec<(usize, String)> = Vec::new();
+    let mut edits: Vec<Edit> = Vec::new();
+    let insertion = |(pos, text): (usize, String)| Edit { range: pos..pos, text };
     if !new_defs.is_empty() {
-        edits.push(before_close(text, lib_symbols, &new_defs));
+        edits.push(insertion(before_close(text, lib_symbols, &new_defs)));
+    }
+
+    // Existing items the plan deletes or moves.
+    for removal in &plan.removals {
+        let (head, what) = match removal.kind {
+            RemovedKind::Wire => ("wire", "wire"),
+            RemovedKind::Label => ("label", "label"),
+            RemovedKind::Junction => ("junction", "junction"),
+            RemovedKind::PowerSymbol => ("symbol", "power symbol"),
+        };
+        let node = doc
+            .item(head, &removal.id)
+            .ok_or_else(|| EmitError::ItemNotFound(what, removal.id.clone()))?;
+        edits.push(Edit {
+            range: removal_range(text, node),
+            text: String::new(),
+        });
+    }
+    if !plan.moves.is_empty() {
+        let placed = doc.symbols();
+        for m in &plan.moves {
+            let node = doc
+                .item("symbol", &m.id)
+                .ok_or_else(|| EmitError::ItemNotFound("symbol", m.id.clone()))?;
+            let from = placed
+                .iter()
+                .find(|s| s.uuid.eq_ignore_ascii_case(&m.id))
+                .ok_or_else(|| EmitError::ItemNotFound("symbol", m.id.clone()))?;
+            edits.extend(move_edits(text, node, from, m)?);
+        }
     }
     if !items.is_empty() {
-        edits.push(match root.child("sheet_instances") {
+        edits.push(insertion(match root.child("sheet_instances") {
             Some(sheet_instances) => {
                 let start = sheet_instances.span.start;
                 match text[..start].rfind('\n') {
@@ -340,13 +486,13 @@ pub fn add_plan(
                 }
             }
             None => before_close(text, root, &items),
-        });
+        }));
     }
-    // Insert from the back so earlier offsets stay valid.
-    edits.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
+    // Apply from the back so earlier offsets stay valid.
+    edits.sort_by_key(|e| std::cmp::Reverse((e.range.start, e.range.end)));
     let mut out = text.to_owned();
-    for (pos, insert) in edits {
-        out.insert_str(pos, &insert);
+    for edit in edits {
+        out.replace_range(edit.range, &edit.text);
     }
     Ok(out)
 }
@@ -354,7 +500,6 @@ pub fn add_plan(
 #[cfg(test)]
 mod tests {
     use kicad_domain::plan::OperationPlan;
-    use kicad_domain::Readability;
 
     use super::*;
     use crate::node::parse;
@@ -374,11 +519,7 @@ mod tests {
         OperationPlan {
             circuit: "t".into(),
             operations,
-            expected_nets: vec![],
-            references: BTreeMap::new(),
-            findings: vec![],
-            fallback_nets: vec![],
-            readability: Readability::default(),
+            ..Default::default()
         }
     }
 
@@ -514,6 +655,156 @@ mod tests {
         let symbol = Document::parse(out).unwrap().symbols().remove(0);
         assert_eq!(symbol.orientation.rotation_deg, 180);
         assert!(!symbol.orientation.mirror_x && !symbol.orientation.mirror_y);
+    }
+
+    fn built_with_a_resistor_and_a_wire() -> String {
+        let doc = Document::parse(empty_schematic(MIN_VERSION, "10.0")).unwrap();
+        let operations = vec![
+            place("R1", mm_point(50.8, 63.5), Orientation::default()),
+            Operation::AddWire {
+                net: "A".into(),
+                start: mm_point(50.8, 59.69),
+                end: mm_point(50.8, 53.34),
+            },
+        ];
+        add_plan(&doc, &plan(operations), &defs(), "p").unwrap()
+    }
+
+    fn move_plan(doc: &Document, to: Point, orientation: Orientation, remove_wires: bool) -> OperationPlan {
+        let symbol = doc.symbols().remove(0);
+        let design = doc.design();
+        OperationPlan {
+            moves: vec![SymbolMove {
+                id: symbol.uuid,
+                reference: symbol.reference,
+                from: symbol.position,
+                from_orientation: symbol.orientation,
+                to,
+                orientation,
+            }],
+            removals: if remove_wires {
+                design
+                    .wires
+                    .iter()
+                    .map(|w| kicad_domain::plan::Removal {
+                        kind: RemovedKind::Wire,
+                        id: w.id.clone(),
+                        description: String::new(),
+                    })
+                    .collect()
+            } else {
+                vec![]
+            },
+            ..plan(vec![])
+        }
+    }
+
+    fn field(root: &Node, name: &str) -> (f64, f64, f64) {
+        let at = root
+            .child("symbol")
+            .unwrap()
+            .children("property")
+            .find(|p| p.arg_text(0) == Some(name))
+            .unwrap()
+            .child("at")
+            .unwrap();
+        (at.arg_f64(0).unwrap(), at.arg_f64(1).unwrap(), at.arg_f64(2).unwrap())
+    }
+
+    #[test]
+    fn moving_a_symbol_carries_its_fields_and_leaves_the_rest_alone() {
+        let before = built_with_a_resistor_and_a_wire();
+        let doc = Document::parse(before.clone()).unwrap();
+        let turned = Orientation {
+            rotation_deg: 90,
+            ..Orientation::default()
+        };
+        let after = add_plan(
+            &doc,
+            &move_plan(&doc, mm_point(100.0, 100.0), turned, true),
+            &BTreeMap::new(),
+            "p",
+        )
+        .unwrap();
+        let moved = Document::parse(after.clone()).unwrap();
+        let symbol = moved.symbols().remove(0);
+        assert_eq!((symbol.position, symbol.orientation), (mm_point(100.0, 100.0), turned));
+        assert_eq!(symbol.pins.len(), 2, "pins and their ids stay");
+        assert_eq!(moved.design().wires.len(), 0, "the wire is gone");
+        // The reference sat 2.032 mm to the right of the symbol; turned a quarter it is above it.
+        let root = parse(&after).unwrap();
+        assert_eq!(field(&root, "Reference"), (100.0, 97.968, 90.0));
+        // Everything else is as it was: the library, the uuid, the instance data.
+        let strip = |t: &str| {
+            t.lines()
+                .filter(|l| l.contains("uuid") || l.contains("lib_symbols"))
+                .count()
+        };
+        assert_eq!(strip(&before) - 1, strip(&after), "only the wire's uuid line is gone");
+        assert!(after.contains("(lib_id \"Device:R\")"));
+    }
+
+    #[test]
+    fn mirroring_is_added_and_removed_again() {
+        let doc = Document::parse(built_with_a_resistor_and_a_wire()).unwrap();
+        let mirrored = Orientation {
+            mirror_y: true,
+            ..Orientation::default()
+        };
+        let once = add_plan(
+            &doc,
+            &move_plan(&doc, mm_point(20.0, 20.0), mirrored, false),
+            &BTreeMap::new(),
+            "p",
+        )
+        .unwrap();
+        let doc2 = Document::parse(once.clone()).unwrap();
+        assert!(once.contains("(mirror y)"));
+        assert_eq!(doc2.symbols()[0].orientation, mirrored);
+        // Mirrored left to right, the reference moves from the right of the symbol to its left.
+        assert_eq!(field(&parse(&once).unwrap(), "Reference").0, 17.968);
+
+        let back = add_plan(
+            &doc2,
+            &move_plan(&doc2, mm_point(20.0, 20.0), Orientation::default(), false),
+            &BTreeMap::new(),
+            "p",
+        )
+        .unwrap();
+        assert!(!back.contains("(mirror"));
+        assert_eq!(field(&parse(&back).unwrap(), "Reference"), (22.032, 20.0, 90.0));
+    }
+
+    #[test]
+    fn items_that_are_not_in_the_file_are_reported() {
+        let doc = Document::parse(built_with_a_resistor_and_a_wire()).unwrap();
+        let mut p = move_plan(&doc, mm_point(0.0, 0.0), Orientation::default(), false);
+        p.removals.push(kicad_domain::plan::Removal {
+            kind: RemovedKind::Junction,
+            id: "nope".into(),
+            description: String::new(),
+        });
+        assert_eq!(
+            add_plan(&doc, &p, &BTreeMap::new(), "p"),
+            Err(EmitError::ItemNotFound("junction", "nope".into()))
+        );
+    }
+
+    #[test]
+    fn a_property_can_be_changed_alone() {
+        let before = built_with_a_resistor_and_a_wire();
+        let doc = Document::parse(before.clone()).unwrap();
+        let id = doc.symbols()[0].uuid.clone();
+        let after = set_property(&doc, &id, "Value", "4k7 \"1%\"").unwrap();
+        assert_eq!(Document::parse(after.clone()).unwrap().symbols()[0].value, "4k7 \"1%\"");
+        // Only that text differs.
+        let (a, b): (Vec<_>, Vec<_>) = (before.lines().collect(), after.lines().collect());
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.iter().zip(&b).filter(|(x, y)| x != y).count(), 1);
+        assert_eq!(
+            set_property(&doc, &id, "Nope", "x"),
+            Err(EmitError::ItemNotFound("property", "Nope".into()))
+        );
     }
 
     #[test]

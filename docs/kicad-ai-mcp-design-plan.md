@@ -23,7 +23,7 @@
 
 ### Revision 3 summary (after Phases 0–7)
 
-The plan below is kept as written where it still holds. Where building it led elsewhere, the sections were updated and the full list is in [architecture.md](architecture.md#changes-from-the-original-plan): the plugin is a registrar, not a bridge; `AnySession` replaced the backend trait; there is no direct-socket provider; the file backend inserts text instead of keeping a full syntax tree; a layout engine and a release pipeline were added.
+The plan below is kept as written where it still holds. Where building it led elsewhere, the sections were updated and the full list is in [architecture.md](architecture.md#changes-from-the-original-plan): the plugin is a registrar, not a bridge; `AnySession` replaced the backend trait; there is no direct-socket provider; the file backend edits only the text a plan names instead of keeping a full syntax tree; a layout engine and a release pipeline were added.
 
 ---
 
@@ -136,7 +136,7 @@ flowchart TB
 
     subgraph FILE["File sessions: KiCad 10, or no KiCad running"]
         FS["FileSession<br/>verified copy, atomic replace"]
-        SEXPR["kicad-sexpr<br/>parser, library reader,<br/>insert-only writer"]
+        SEXPR["kicad-sexpr<br/>parser, library reader,<br/>in-place writer"]
     end
 
     CLIR["kicad-cli-runner<br/>discovery, ERC, netlist, PNG"]
@@ -291,7 +291,7 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 - Protobuf `Any` payloads are dispatched by full type URL. Unknown types are an error, never decoded as empty.
 
 ### 5.3 File backend (`kicad-sexpr`)
-- Lossless by construction: the parser keeps each node's byte span and the writer only **inserts** text (new library symbols at the end of `lib_symbols`, new items before `sheet_instances`), so every other byte of the file stays as it was. Moving or deleting existing items would need a richer edit API (Phase 7 / editing tools).
+- Lossless by construction: the parser keeps each node's byte span and the writer edits only the text a plan names (new library symbols at the end of `lib_symbols`, new items before `sheet_instances`, and — since Phase 8 — deleting items and changing a symbol's `(at …)`, `(mirror …)`, and its fields' positions), so every other byte of the file stays as it was.
 - UUIDs preserved; new objects get v4 UUIDs. File UUIDs are the same KIIDs the IPC API returns, so object identities survive a backend switch.
 - Atomic write: temp file in the same directory → flush/fsync → rename. Capture a content hash at read; refuse to write if the file changed since (`FILE_CHANGED_ON_DISK`).
 - Refuse mutation if the document is open in any editor: KiCad lock file (`~<name>.kicad_sch.lck`), `GetOpenDocuments` on any reachable instance, or a headless session holding it.
@@ -366,7 +366,7 @@ All document-targeting tools take an explicit `project` (path to `.kicad_pro`) a
 | `sch_render` | `sch.render` | SVG/PNG snapshot for visual inspection |
 | `sch_create_demo_circuit` | via plan | The two-resistor fixture as plan → apply → verify |
 
-Later: `sch_move_symbol`, `sch_set_field`, `sch_add_power_symbol`, `sch_remove_item`, `sch_diff`, `session_get_installation_info`.
+Built in Phase 8: `sch_review`, `sch_tidy_plan`, `sch_set_field`. Later: `sch_move_symbol` (with local re-routing), `sch_add_power_symbol`, `sch_remove_item`, `sch_diff`, `session_get_installation_info`.
 
 ### 7.2 Tool design rules
 1. Stable IDs (KIIDs/UUIDs) internally; references are display values.
@@ -700,12 +700,15 @@ Generated schematics must read like a person drew them, not only be electrically
 - Acceptance: golden circuits (3.3 V regulator first) pass automated readability checks (no overlapping parts or text, power as symbols, local nets drawn as wires) and a rendered review.
 
 ### Phase 6 — KiCad 10 fallback
-**Done.** `kicad-sexpr` (parser with spans, symbol library and schematic readers, insert-only writer); the `file` provider (`FileSession`, behind `AnySession`) with guarded mutation — content-hash and lock-file checks, a `kicad-cli`-verified copy, atomic replace, a kept backup; the Phase 5 layout engine unchanged on file-derived symbol geometry; ERC, netlist, and export on the 10.0 CLI. The planned direct-socket check for open documents was replaced by the lock-file check (KiCad 10's API is too limited to add value). Backend-contract tests run the circuit on both backends and compare the CLI's netlists. Known limits: root sheet only, global library table not read, no PNG render with only KiCad 10 installed.
+**Done.** `kicad-sexpr` (parser with spans, symbol library and schematic readers, a writer that edits only the text a plan names; deletes and moves were added in Phase 8); the `file` provider (`FileSession`, behind `AnySession`) with guarded mutation — content-hash and lock-file checks, a `kicad-cli`-verified copy, atomic replace, a kept backup; the Phase 5 layout engine unchanged on file-derived symbol geometry; ERC, netlist, and export on the 10.0 CLI. The planned direct-socket check for open documents was replaced by the lock-file check (KiCad 10's API is too limited to add value). Backend-contract tests run the circuit on both backends and compare the CLI's netlists. Known limits: root sheet only, global library table not read, no PNG render with only KiCad 10 installed.
 
 Exit: all Tier 2 acceptance criteria.
 
 ### Phase 7 — Hardening and packaging
 **Done**, except the re-pin. A rotating log file for the MCP server; a failure-injection suite (`kicad-fault-tests`: a fake `kicad-cli` that crashes, hangs, lies, or races, and misbehaving API servers) with a source-level guard that no log call mentions a token; the observed capability matrix ([capability-matrix.md](capability-matrix.md)); release automation that tags `v<Cargo version>` and publishes a Windows zip, a PCM package, a Linux archive, and checksums ([releasing.md](releasing.md)); a PowerShell installer that sets up the server, the plugin, and the assistant entry, with a sandbox smoke test in CI; and the architecture documentation brought up to date ([architecture.md](architecture.md)). Re-pinning to KiCad 11.0 waits for its release: re-run `scripts/probe-kicad.ps1` and the live tests against it, update docs/kicad-api-compatibility.md, and bump the supported format range in `kicad-sexpr`.
+
+### Phase 8 — Review and tidy existing schematics
+**Done.** The whole sheet (parts, wires, labels, junctions, notes) is read from a live KiCad or a file; `sch_review` reports what is untidy; `sch_tidy_plan` re-lays out an existing circuit with the Phase 5 engine as moves, removals, and additions, applied by `sch_apply_plan` with the same verification (identical nets, no new ERC errors) on the editor, headless, and file providers; `sch_set_field` changes a value or footprint. Parts keep their identity and fields. Refused: buses, global or hierarchical labels, sheets, no-connect flags. Not built: manual move, rotate, and delete tools (a move without redrawing the wires breaks the circuit) and layout hints. Details and decisions: docs/tasks.md, Phase 8.
 
 ### Later
 PCB tools on IPC (both versions), hierarchical sheets, multi-unit symbols, BOM/part tooling, design-review checks, simulation hand-off, MCP prompts/resources and a bundled skill with KiCad conventions, on-demand tool groups, enclosure integration (§16.1).

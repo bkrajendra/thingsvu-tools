@@ -6,6 +6,7 @@
 
 pub mod capability;
 pub mod circuit;
+pub mod connectivity;
 pub mod geometry;
 pub mod ids;
 pub mod layout;
@@ -13,10 +14,12 @@ pub mod plan;
 pub mod readability;
 pub mod result;
 pub mod schematic;
+pub mod tidy;
 pub mod validation;
 
 pub use capability::{Backend, Capability, CapabilitySet, Support};
 pub use circuit::{CircuitSpec, ComponentSpec, NetSpec, PinRef};
+pub use connectivity::attach_power_pins;
 pub use geometry::{Dir, Nm, Orientation, Point, Rect, GRID};
 pub use ids::{IdError, Kiid, LibraryId, LogicalId};
 pub use layout::{is_ground_name, library_ids_for};
@@ -25,5 +28,9 @@ pub use plan::{
 };
 pub use readability::Readability;
 pub use result::{ErrorCode, MutationState, Origin, Provenance, ResultState, ToolError};
-pub use schematic::{NetInfo, NetPin, PinInfo, PointMm, SymbolInfo, SymbolPins};
+pub use schematic::{
+    DesignJunction, DesignLabel, DesignSymbol, DesignWire, NetInfo, NetPin, PinInfo, PointMm, SchematicDesign,
+    SymbolInfo, SymbolPins,
+};
+pub use tidy::{design_library_ids, plan_tidy, tidy_spec};
 pub use validation::{validate_circuit, Finding, Severity};

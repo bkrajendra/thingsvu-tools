@@ -8,7 +8,7 @@ pub mod node;
 pub mod sch;
 pub mod sym;
 
-pub use emit::{add_plan, EmitError};
+pub use emit::{add_plan, set_property, EmitError};
 pub use node::{mm, parse, quote, Kind, Node, ParseError};
 pub use sch::{empty_schematic, DocError, Document, PlacedSymbol, MAX_VERSION, MIN_VERSION};
 pub use sym::{describe, property, SymError, SymbolLibrary};

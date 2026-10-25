@@ -112,8 +112,11 @@ async fn lists_tools_and_returns_envelopes() {
             "sch_list_symbols",
             "sch_plan_changes",
             "sch_render",
+            "sch_review",
             "sch_run_erc",
             "sch_save",
+            "sch_set_field",
+            "sch_tidy_plan",
             "session_close",
             "session_list_documents",
             "session_open",
@@ -547,6 +550,136 @@ async fn live_file_provider_on_kicad_10() {
 }
 
 #[tokio::test]
+async fn live_review_tidy_and_set_field_through_mcp() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-tidy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("regulator.kicad_sch");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/v11/regulator-with-notes/regulator.kicad_sch"),
+        &schematic,
+    )
+    .unwrap();
+
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": "file" }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    // The review says what is wrong and what a tidy would do, and changes nothing.
+    let before = std::fs::read(&schematic).unwrap();
+    let review = mcp.call("sch_review", json!({ "session_id": id })).await;
+    assert_eq!(review["ok"], true, "{review}");
+    assert_eq!(review["result"]["parts"], 13, "{review}");
+    assert_eq!(review["result"]["tidy"]["possible"], true, "{review}");
+    assert!(
+        review["result"]["problems"]
+            .to_string()
+            .contains("D2 and #PWR10 overlap"),
+        "{review}"
+    );
+    assert_eq!(review["result"]["tidy"]["already_tidy"], false);
+    assert_eq!(std::fs::read(&schematic).unwrap(), before, "a review changes nothing");
+
+    let plan = mcp.call("sch_tidy_plan", json!({ "session_id": id })).await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    assert!(plan["result"]["moves"].as_array().unwrap().len() >= 10);
+    assert!(plan["result"]["removals"].as_array().unwrap().len() >= 30);
+    assert!(plan["result"]["readability_before"]["overlapping_symbols"]
+        .as_array()
+        .is_some());
+    assert_eq!(std::fs::read(&schematic).unwrap(), before, "planning changes nothing");
+    let plan_id = plan["result"]["plan_id"].clone();
+
+    let refused = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": false, "idempotency_key": "tidy-key-0001" }),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], "INVALID_ARGUMENT");
+
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "tidy-key-0001" }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert!(applied["result"]["moved"].as_u64().unwrap() >= 10);
+    assert!(applied["result"]["removed"].as_u64().unwrap() >= 30);
+
+    // Reviewed again, it is tidy.
+    let after = mcp.call("sch_review", json!({ "session_id": id })).await;
+    assert_eq!(after["result"]["tidy"]["already_tidy"], true, "{after}");
+    assert_eq!(after["result"]["problems"], json!([]), "{after}");
+
+    // Change one value. It needs confirm, a real part, and sensible text.
+    let no_confirm = mcp
+        .call(
+            "sch_set_field",
+            json!({ "session_id": id, "symbol": "R3", "field": "value", "text": "2k2", "confirm": false }),
+        )
+        .await;
+    assert_eq!(no_confirm["error"]["code"], "INVALID_ARGUMENT");
+    let unknown = mcp
+        .call(
+            "sch_set_field",
+            json!({ "session_id": id, "symbol": "R99", "field": "value", "text": "2k2", "confirm": true }),
+        )
+        .await;
+    assert_eq!(unknown["error"]["code"], "SYMBOL_NOT_FOUND", "{unknown}");
+    let changed = mcp
+        .call(
+            "sch_set_field",
+            json!({ "session_id": id, "symbol": "R3", "field": "value", "text": "2k2", "confirm": true }),
+        )
+        .await;
+    assert_eq!(changed["ok"], true, "{changed}");
+    assert_eq!(changed["result"]["value"], "2k2");
+    let footprint = mcp
+        .call(
+            "sch_set_field",
+            json!({ "session_id": id, "symbol": "R3", "field": "footprint", "text": "Resistor_SMD:R_0805_2012Metric", "confirm": true }),
+        )
+        .await;
+    assert_eq!(
+        footprint["result"]["footprint"], "Resistor_SMD:R_0805_2012Metric",
+        "{footprint}"
+    );
+    assert_eq!(footprint["result"]["value"], "2k2", "the value is kept");
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    let r3 = symbols["result"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["reference"] == "R3")
+        .unwrap();
+    assert_eq!(r3["value"], "2k2");
+
+    // The result is still the same circuit, as KiCad reads it.
+    let nets = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert_eq!(nets["result"]["unconnected_pins"], 0, "{nets}");
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!(
+        "ERC after tidy: {} errors, {} warnings",
+        erc["result"]["errors"], erc["result"]["warnings"]
+    );
+}
+
+#[tokio::test]
 async fn read_only_mode_refuses_changes() {
     let mut mcp = Mcp::start_with(&["--read-only"]).await;
     for (tool, args) in [
@@ -644,4 +777,64 @@ async fn gui_editor_demo() {
     let closed = mcp.call("session_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: check the editor (two Ctrl+Z steps should remove the demo)");
+}
+
+/// Against a real KiCad 11 editor with a schematic open: review it, plan a tidy, apply it, and
+/// check ERC. Open a **copy** of a design in the nightly Schematic Editor, press "KiCad AI:
+/// connect", then run with THINGSVU_GUI_TIDY=1. Undo in the editor (Ctrl+Z twice) restores it.
+#[tokio::test]
+async fn gui_tidy_demo() {
+    if std::env::var("THINGSVU_GUI_TIDY").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_TIDY=1 with a registered KiCad editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("session_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    println!("GUI SESSION {}", opened["result"]["document"]);
+
+    let review = mcp.call("sch_review", json!({ "session_id": id })).await;
+    println!("GUI REVIEW {}", review["result"]);
+    assert_eq!(review["ok"], true, "{review}");
+    let erc_before = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!(
+        "GUI ERC BEFORE errors={} warnings={}",
+        erc_before["result"]["errors"], erc_before["result"]["warnings"]
+    );
+
+    let plan = mcp.call("sch_tidy_plan", json!({ "session_id": id })).await;
+    println!(
+        "GUI PLAN counts={} findings={}",
+        plan["result"]["counts"], plan["result"]["findings"]
+    );
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({
+                "session_id": id,
+                "plan_id": plan["result"]["plan_id"],
+                "confirm": true,
+                "idempotency_key": format!("gui-tidy-{}", std::process::id())
+            }),
+        )
+        .await;
+    println!("GUI APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(applied["result"]["undo_steps"], 2);
+
+    let after = mcp.call("sch_review", json!({ "session_id": id })).await;
+    println!("GUI REVIEW AFTER {}", after["result"]);
+    assert_eq!(after["result"]["tidy"]["already_tidy"], true, "{after}");
+    let erc_after = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!(
+        "GUI ERC AFTER errors={} warnings={}",
+        erc_after["result"]["errors"], erc_after["result"]["warnings"]
+    );
+    assert!(erc_after["result"]["errors"].as_u64() <= erc_before["result"]["errors"].as_u64());
+
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: look at the editor; Ctrl+Z twice undoes the tidy");
 }

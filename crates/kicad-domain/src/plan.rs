@@ -87,22 +87,67 @@ pub struct ExpectedNet {
     pub pins: BTreeSet<String>,
 }
 
+/// An existing symbol moved to a new place (and orientation). Its identity, fields, and
+/// footprint stay; wires are not dragged along, so a plan that moves symbols also replaces the
+/// drawing around them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SymbolMove {
+    /// The symbol's id in the document (its UUID).
+    pub id: String,
+    pub reference: String,
+    pub from: Point,
+    pub from_orientation: Orientation,
+    pub to: Point,
+    pub orientation: Orientation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovedKind {
+    Wire,
+    Label,
+    Junction,
+    /// A power symbol that only names a net (`#PWR…`); the plan draws it again where it belongs.
+    PowerSymbol,
+}
+
+/// An existing drawing item the plan deletes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Removal {
+    pub kind: RemovedKind,
+    pub id: String,
+    /// What it is, for the person reviewing the plan.
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct OperationPlan {
     pub circuit: String,
+    /// Symbols, power symbols, wires, labels, and junctions to add.
     pub operations: Vec<Operation>,
+    /// Existing symbols to move (tidying an existing schematic).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<SymbolMove>,
+    /// Existing items to delete (tidying an existing schematic).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removals: Vec<Removal>,
     pub expected_nets: Vec<ExpectedNet>,
     /// Component logical id → planned reference.
     pub references: BTreeMap<LogicalId, String>,
     pub findings: Vec<Finding>,
     /// Nets the layout could not wire and joined with labels instead.
     pub fallback_nets: Vec<String>,
-    /// Geometric checks of the drawing (shorts, overlaps, wires through parts).
+    /// Geometric checks of the drawing the plan produces (shorts, overlaps, wires through parts).
     pub readability: crate::readability::Readability,
+    /// The same checks on the drawing as it is now, when the plan tidies an existing schematic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readability_before: Option<crate::readability::Readability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct OperationCounts {
+    pub moves: usize,
+    pub removals: usize,
     pub symbols: usize,
     pub power_symbols: usize,
     pub wires: usize,
@@ -112,7 +157,11 @@ pub struct OperationCounts {
 
 impl OperationPlan {
     pub fn counts(&self) -> OperationCounts {
-        let mut c = OperationCounts::default();
+        let mut c = OperationCounts {
+            moves: self.moves.len(),
+            removals: self.removals.len(),
+            ..Default::default()
+        };
         for op in &self.operations {
             match op {
                 Operation::PlaceSymbol { .. } => c.symbols += 1,
@@ -134,7 +183,7 @@ pub struct ExistingDocument {
     pub max_y: Option<Nm>,
 }
 
-fn error(code: &'static str, message: String, objects: Vec<String>) -> Finding {
+pub(crate) fn error(code: &'static str, message: String, objects: Vec<String>) -> Finding {
     Finding {
         severity: Severity::Error,
         code,
@@ -143,30 +192,9 @@ fn error(code: &'static str, message: String, objects: Vec<String>) -> Finding {
     }
 }
 
-/// Turns `spec` into a plan. `library` must contain every component's symbol, plus the power
-/// symbols available for net names (see [`layout::library_ids_for`]). A plan whose findings
-/// include an error must not be applied.
-pub fn plan_circuit(
-    spec: &CircuitSpec,
-    library: &BTreeMap<LibraryId, LibrarySymbol>,
-    existing: &ExistingDocument,
-) -> OperationPlan {
-    let mut findings = validate_circuit(spec);
-    let mut plan = OperationPlan {
-        circuit: spec.name.to_string(),
-        operations: vec![],
-        expected_nets: vec![],
-        references: BTreeMap::new(),
-        findings: vec![],
-        fallback_nets: vec![],
-        readability: Default::default(),
-    };
-    if has_errors(&findings) {
-        plan.findings = findings;
-        return plan;
-    }
-
-    // Library checks.
+/// Errors about components and pins that the symbol libraries do not support.
+pub(crate) fn library_findings(spec: &CircuitSpec, library: &BTreeMap<LibraryId, LibrarySymbol>) -> Vec<Finding> {
+    let mut findings = Vec::new();
     for c in &spec.components {
         match library.get(&c.library_id) {
             None => findings.push(error(
@@ -213,6 +241,57 @@ pub fn plan_circuit(
             }
         }
     }
+    findings
+}
+
+/// Findings for a drawing's readability report: shorts are errors, the rest warnings.
+pub(crate) fn readability_findings(readability: &crate::readability::Readability) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for (a, b) in &readability.shorts {
+        findings.push(error(
+            "LAYOUT_SHORT",
+            format!("the drawing would join nets '{a}' and '{b}'"),
+            vec![a.clone(), b.clone()],
+        ));
+    }
+    for (a, b) in &readability.overlapping_symbols {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "SYMBOLS_OVERLAP",
+            message: format!("{a} and {b} overlap"),
+            objects: vec![a.clone(), b.clone()],
+        });
+    }
+    for (net, reference) in &readability.wires_through_symbols {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "WIRE_THROUGH_SYMBOL",
+            message: format!("a wire of '{net}' passes through {reference}"),
+            objects: vec![net.clone(), reference.clone()],
+        });
+    }
+    findings
+}
+
+/// Turns `spec` into a plan. `library` must contain every component's symbol, plus the power
+/// symbols available for net names (see [`layout::library_ids_for`]). A plan whose findings
+/// include an error must not be applied.
+pub fn plan_circuit(
+    spec: &CircuitSpec,
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    existing: &ExistingDocument,
+) -> OperationPlan {
+    let mut findings = validate_circuit(spec);
+    let mut plan = OperationPlan {
+        circuit: spec.name.to_string(),
+        ..Default::default()
+    };
+    if has_errors(&findings) {
+        plan.findings = findings;
+        return plan;
+    }
+
+    findings.extend(library_findings(spec, library));
     if has_errors(&findings) {
         plan.findings = findings;
         return plan;
@@ -267,29 +346,7 @@ pub fn plan_circuit(
     findings.extend(out.findings);
 
     plan.readability = crate::readability::check(&plan, library);
-    for (a, b) in &plan.readability.shorts {
-        findings.push(error(
-            "LAYOUT_SHORT",
-            format!("the drawing would join nets '{a}' and '{b}'"),
-            vec![a.clone(), b.clone()],
-        ));
-    }
-    for (a, b) in &plan.readability.overlapping_symbols {
-        findings.push(Finding {
-            severity: Severity::Warning,
-            code: "SYMBOLS_OVERLAP",
-            message: format!("{a} and {b} overlap"),
-            objects: vec![a.clone(), b.clone()],
-        });
-    }
-    for (net, reference) in &plan.readability.wires_through_symbols {
-        findings.push(Finding {
-            severity: Severity::Warning,
-            code: "WIRE_THROUGH_SYMBOL",
-            message: format!("a wire of '{net}' passes through {reference}"),
-            objects: vec![net.clone(), reference.clone()],
-        });
-    }
+    findings.extend(readability_findings(&plan.readability));
     if plan.operations.len() > MAX_OPERATIONS {
         findings.push(error(
             "PLAN_TOO_LARGE",

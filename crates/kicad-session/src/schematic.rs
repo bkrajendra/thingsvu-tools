@@ -153,7 +153,7 @@ pub(crate) fn natural_key(number: &str) -> (u64, String) {
 }
 
 impl Session {
-    fn require(&self, capability: Capability) -> Result<(), ToolError> {
+    pub(crate) fn require(&self, capability: Capability) -> Result<(), ToolError> {
         if self.capabilities().is_available(capability) {
             return Ok(());
         }
@@ -168,7 +168,7 @@ impl Session {
         ))
     }
 
-    async fn symbol_instances(&self) -> Result<Vec<SchematicSymbolInstance>, ToolError> {
+    pub(crate) async fn symbol_instances(&self) -> Result<Vec<SchematicSymbolInstance>, ToolError> {
         self.require(Capability::SchReadSymbols)?;
         let mut inner = self.inner.lock().await;
         let r: GetItemsResponse = inner

@@ -25,3 +25,14 @@ What each kind of session can do, and which backend serves it. This is what `ses
 - **Which provider for which job:** the headless provider generates and checks designs without a GUI; the GUI provider co-edits the open editor with normal undo; the file provider needs no KiCad running and works with KiCad 10.
 - **One provider per document.** A document open in an editor is never edited through the headless or file provider (lock-file check), and the GUI provider is the only one that edits it.
 - **Version-specific `kicad-cli` differences** (PNG export, `sch diff`, `api-server`) are in docs/kicad-api-compatibility.md.
+
+## Review, tidy, and field changes
+
+These need no capability of their own: `sch_review` and `sch_tidy_plan` read the sheet (`sch.read_symbols`, `sch.netlist`), and applying a tidy or `sch_set_field` needs `sch.place_symbol` and `sch.edit_items`.
+
+| | Headless | GUI | File |
+|---|---|---|---|
+| Whole sheet read (wires, labels, junctions, notes) | ipc | ipc | project_file |
+| Netlist used for a tidy | ipc (includes power symbols and flags) | ipc | kicad_cli, plus power symbols and flags attached from the drawing |
+| Applying a tidy | Two commits; reloads the saved file if it fails, so unsaved changes must be saved first | Two commits (two undo steps); a failure after the first says how many undo steps to take | Verified copy, then atomic replace |
+| `sch_set_field` | One commit | One commit (one undo step) | Verified copy, then atomic replace |

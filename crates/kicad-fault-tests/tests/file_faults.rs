@@ -4,12 +4,12 @@
 //! exactly as it was or exactly as planned — never half-written — and no verification copy stays
 //! behind.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kicad_cli_runner::{InstallSource, KicadInstall, KicadVersion};
-use kicad_domain::{ErrorCode, ExpectedNet, MutationState, OperationPlan, Readability};
+use kicad_domain::{ErrorCode, ExpectedNet, MutationState, OperationPlan};
 use kicad_session::{FileSession, OpenTarget, SessionConfig};
 use kicad_sexpr::{empty_schematic, MIN_VERSION};
 
@@ -64,15 +64,11 @@ async fn open_with(f: &Fixture, cli_timeout: Duration) -> FileSession {
 fn plan_expecting_a_net() -> OperationPlan {
     OperationPlan {
         circuit: "fault".into(),
-        operations: vec![],
         expected_nets: vec![ExpectedNet {
             name: "N".into(),
             pins: BTreeSet::from(["R1.1".to_owned()]),
         }],
-        references: BTreeMap::new(),
-        findings: vec![],
-        fallback_nets: vec![],
-        readability: Readability::default(),
+        ..Default::default()
     }
 }
 
@@ -305,4 +301,23 @@ async fn only_old_leftover_copies_are_cleaned_up() {
     assert!(!old.exists(), "a copy an hour old is removed");
     assert!(fresh.exists(), "a copy that may be in use is kept");
     assert!(unrelated.exists(), "files that are not ours are never touched");
+}
+
+#[tokio::test]
+async fn a_tidy_plan_for_items_that_are_gone_changes_nothing() {
+    let f = fixture("vanished", "ok");
+    let session = open(&f).await;
+    let before = std::fs::read(&f.schematic).unwrap();
+    let fingerprint = session.fingerprint().await.unwrap();
+    let mut plan = empty_plan();
+    plan.removals.push(kicad_domain::plan::Removal {
+        kind: kicad_domain::plan::RemovedKind::Wire,
+        id: "00000000-0000-4000-8000-000000000001".into(),
+        description: "a wire someone else already deleted".into(),
+    });
+
+    let error = session.apply_plan(&plan, &fingerprint).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::KicadError, "{error}");
+    assert!(error.message.contains("no wire with id"), "{error}");
+    assert_untouched(&f, &before);
 }

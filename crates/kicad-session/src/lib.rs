@@ -7,6 +7,7 @@
 
 mod any;
 mod capability_map;
+mod design;
 mod errors;
 mod file;
 mod headless;
@@ -24,3 +25,56 @@ pub use file::FileSession;
 pub use mutate::{ApplyReport, NetCheck, PlacedComponent};
 pub use schematic::OpenDocument;
 pub use session::{OpenTarget, Provider, Session, SessionConfig, SessionStatus};
+
+/// A part's field that `sch_set_field` can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolField {
+    Value,
+    Footprint,
+}
+
+impl SymbolField {
+    /// The property's name in KiCad.
+    pub fn property_name(self) -> &'static str {
+        match self {
+            Self::Value => "Value",
+            Self::Footprint => "Footprint",
+        }
+    }
+}
+
+/// The one symbol that `selector` (an id, or a reference matching exactly one) names.
+pub(crate) fn select_symbol<'a, T>(
+    symbols: &'a [T],
+    selector: &str,
+    keys: impl Fn(&'a T) -> (&'a str, &'a str),
+) -> Result<&'a T, kicad_domain::ToolError> {
+    use kicad_domain::{ErrorCode, ToolError};
+    let by_id = kicad_domain::Kiid::new(selector).is_ok();
+    let matches: Vec<&T> = symbols
+        .iter()
+        .filter(|s| {
+            let (id, reference) = keys(s);
+            if by_id {
+                id.eq_ignore_ascii_case(selector)
+            } else {
+                reference == selector
+            }
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(ToolError::new(
+            ErrorCode::SymbolNotFound,
+            format!("no symbol matches '{selector}'"),
+        )),
+        many => Err(ToolError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "'{selector}' matches {} symbols; use one of their ids: {}",
+                many.len(),
+                many.iter().map(|s| keys(s).0).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}

@@ -1,0 +1,910 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Tidying an existing schematic (Phase 8).
+//!
+//! The circuit is read back from the design (its parts, and the nets KiCad reports), laid out
+//! again by the same engine that lays out new circuits, and the difference becomes a plan: move
+//! each existing part to its new place, delete the old wires, labels, junctions, and net-naming
+//! power symbols, and draw the new ones. Parts keep their identity, values, footprints, and fields.
+//! Wires are never dragged, so a part is never moved without the drawing around it being replaced.
+//!
+//! Applying the plan must leave every net exactly as it was; the apply step checks that against
+//! KiCad's own netlist, as for a new circuit.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::circuit::{CircuitSpec, ComponentSpec, NetSpec, PinRef, SCHEMA_VERSION};
+use crate::geometry::{Nm, Point, GRID};
+use crate::ids::{LibraryId, LogicalId};
+use crate::layout;
+use crate::plan::LibrarySymbol;
+use crate::plan::{
+    error, library_findings, readability_findings, ExpectedNet, Operation, OperationPlan, Removal, RemovedKind,
+    SymbolMove, MAX_OPERATIONS,
+};
+use crate::schematic::{NetInfo, SchematicDesign};
+use crate::validation::{has_errors, validate_circuit, Finding, Severity};
+
+/// The library symbols the design's own parts use.
+pub fn design_library_ids(design: &SchematicDesign) -> Vec<LibraryId> {
+    let mut ids: Vec<LibraryId> = design
+        .symbols
+        .iter()
+        .filter_map(|s| LibraryId::parse(&s.library_id).ok())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// `R10` sorts after `R2`: references by prefix, then number.
+fn natural(reference: &str) -> (String, u64, String) {
+    let prefix: String = reference.chars().take_while(|c| !c.is_ascii_digit()).collect();
+    let number = reference[prefix.len()..].parse::<u64>().unwrap_or(u64::MAX);
+    (prefix, number, reference.to_owned())
+}
+
+/// A logical id for a reference; flags (`#FLG01`) cannot start with `#`.
+fn logical_id(reference: &str) -> Option<LogicalId> {
+    match reference.strip_prefix('#') {
+        Some(rest) => LogicalId::new(format!("flag_{rest}")).ok(),
+        None => LogicalId::new(reference).ok(),
+    }
+}
+
+/// The circuit the design implements: its parts (not the power symbols that only name nets) and
+/// the nets KiCad reports. Parts are listed in reference order so the layout does not depend on
+/// the order KiCad returned them in.
+pub fn tidy_spec(design: &SchematicDesign, nets: &[NetInfo]) -> Result<CircuitSpec, Vec<Finding>> {
+    let mut findings = Vec::new();
+    if !design.unsupported.is_empty() {
+        let items = design
+            .unsupported
+            .iter()
+            .map(|(kind, n)| format!("{n} {kind}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(error(
+            "TIDY_UNSUPPORTED_ITEMS",
+            format!(
+                "the sheet has items that tidying cannot redraw safely ({items}); nothing was planned. \
+                 Tidying handles a single sheet of parts joined by wires, local labels, and power symbols"
+            ),
+            design.unsupported.keys().cloned().collect(),
+        ));
+    }
+
+    let mut parts: Vec<_> = design
+        .symbols
+        .iter()
+        .filter(|s| !s.reference.starts_with("#PWR"))
+        .collect();
+    parts.sort_by_key(|s| natural(&s.reference));
+    let mut components = Vec::new();
+    let mut ids: BTreeMap<&str, LogicalId> = BTreeMap::new();
+    for s in parts {
+        let Some(id) = logical_id(&s.reference) else {
+            findings.push(error(
+                "TIDY_BAD_REFERENCE",
+                format!(
+                    "'{}' is not a usable reference; annotate the schematic first",
+                    s.reference
+                ),
+                vec![s.reference.clone()],
+            ));
+            continue;
+        };
+        let Ok(library_id) = LibraryId::parse(&s.library_id) else {
+            findings.push(error(
+                "TIDY_BAD_LIBRARY_ID",
+                format!("{} has the library id '{}'", s.reference, s.library_id),
+                vec![s.reference.clone()],
+            ));
+            continue;
+        };
+        if ids.insert(&s.reference, id.clone()).is_some() {
+            findings.push(error(
+                "TIDY_DUPLICATE_REFERENCE",
+                format!("two parts are called {}", s.reference),
+                vec![s.reference.clone()],
+            ));
+            continue;
+        }
+        components.push(ComponentSpec {
+            id,
+            library_id,
+            reference_preference: Some(s.reference.clone()),
+            value: s.value.clone(),
+            footprint: Some(s.footprint.clone()).filter(|f| !f.is_empty()),
+            fields: BTreeMap::new(),
+        });
+    }
+
+    let mut net_specs = Vec::new();
+    for net in nets {
+        if net.name.starts_with("unconnected-") {
+            continue;
+        }
+        let pins: Vec<PinRef> = net
+            .pins
+            .iter()
+            .filter_map(|p| {
+                ids.get(p.reference.as_str()).map(|id| PinRef {
+                    component_id: id.clone(),
+                    pin_number: p.pin.clone(),
+                })
+            })
+            .collect();
+        if !pins.is_empty() {
+            net_specs.push(NetSpec {
+                name: net.name.trim_start_matches('/').to_owned(),
+                pins,
+            });
+        }
+    }
+    net_specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if has_errors(&findings) {
+        return Err(findings);
+    }
+    Ok(CircuitSpec {
+        schema_version: SCHEMA_VERSION,
+        name: LogicalId::new("tidy").expect("valid id"),
+        description: "the circuit as it is in the schematic".into(),
+        components,
+        nets: net_specs,
+        notes: vec![],
+    })
+}
+
+/// Segments compare the same in either direction.
+fn wire_key(a: Point, b: Point) -> ((i64, i64), (i64, i64)) {
+    let (a, b) = ((a.x.0, a.y.0), (b.x.0, b.y.0));
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+type WireKey = ((i64, i64), (i64, i64));
+
+/// Wires by the straight line they lie on. KiCad joins wires that meet end to end into one, so
+/// two drawings that look the same must compare the same however their wires are cut.
+struct WireIndex {
+    horizontal: BTreeMap<i64, Vec<(i64, i64)>>,
+    vertical: BTreeMap<i64, Vec<(i64, i64)>>,
+}
+
+impl WireIndex {
+    fn new(segments: impl Iterator<Item = (Point, Point)>) -> Self {
+        let mut index = WireIndex {
+            horizontal: BTreeMap::new(),
+            vertical: BTreeMap::new(),
+        };
+        for (a, b) in segments {
+            if a.y == b.y {
+                index
+                    .horizontal
+                    .entry(a.y.0)
+                    .or_default()
+                    .push((a.x.0.min(b.x.0), a.x.0.max(b.x.0)));
+            } else if a.x == b.x {
+                index
+                    .vertical
+                    .entry(a.x.0)
+                    .or_default()
+                    .push((a.y.0.min(b.y.0), a.y.0.max(b.y.0)));
+            }
+        }
+        for runs in index.horizontal.values_mut().chain(index.vertical.values_mut()) {
+            runs.sort_unstable();
+            let mut merged: Vec<(i64, i64)> = Vec::new();
+            for &(from, to) in runs.iter() {
+                match merged.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => merged.push((from, to)),
+                }
+            }
+            *runs = merged;
+        }
+        index
+    }
+
+    /// The whole run of wire on one line that contains this segment (the segment itself when it
+    /// is slanted).
+    fn key(&self, a: Point, b: Point) -> WireKey {
+        let run = |runs: Option<&Vec<(i64, i64)>>, lo: i64, hi: i64| {
+            runs.and_then(|r| r.iter().find(|&&(from, to)| from <= lo && hi <= to).copied())
+        };
+        if a.y == b.y {
+            if let Some((from, to)) = run(self.horizontal.get(&a.y.0), a.x.0.min(b.x.0), a.x.0.max(b.x.0)) {
+                return ((from, a.y.0), (to, a.y.0));
+            }
+        } else if a.x == b.x {
+            if let Some((from, to)) = run(self.vertical.get(&a.x.0), a.y.0.min(b.y.0), a.y.0.max(b.y.0)) {
+                return ((a.x.0, from), (a.x.0, to));
+            }
+        }
+        wire_key(a, b)
+    }
+
+    fn keys(&self) -> BTreeSet<WireKey> {
+        let horizontal = self
+            .horizontal
+            .iter()
+            .flat_map(|(&y, runs)| runs.iter().map(move |&(from, to)| ((from, y), (to, y))));
+        let vertical = self
+            .vertical
+            .iter()
+            .flat_map(|(&x, runs)| runs.iter().map(move |&(from, to)| ((x, from), (x, to))));
+        horizontal.chain(vertical).collect()
+    }
+}
+
+/// Plans the new layout of an existing design. `library` needs the design's own symbols and the
+/// power symbols the layout may use (see [`design_library_ids`] and [`layout::library_ids_for`]).
+pub fn plan_tidy(
+    design: &SchematicDesign,
+    nets: &[NetInfo],
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+) -> OperationPlan {
+    let mut plan = OperationPlan {
+        circuit: "tidy".into(),
+        ..Default::default()
+    };
+    let spec = match tidy_spec(design, nets) {
+        Ok(spec) => spec,
+        Err(findings) => {
+            plan.findings = findings;
+            return plan;
+        }
+    };
+    let mut findings = validate_circuit(&spec);
+    if !has_errors(&findings) {
+        findings.extend(library_findings(&spec, library));
+    }
+    if has_errors(&findings) {
+        plan.findings = findings;
+        return plan;
+    }
+
+    plan.references = spec
+        .components
+        .iter()
+        .filter_map(|c| Some((c.id.clone(), c.reference_preference.clone()?)))
+        .collect();
+    plan.expected_nets = spec
+        .nets
+        .iter()
+        .map(|n| ExpectedNet {
+            name: n.name.clone(),
+            pins: n
+                .pins
+                .iter()
+                .map(|p| format!("{}.{}", plan.references[&p.component_id], p.pin_number))
+                .collect(),
+        })
+        .collect();
+
+    // A net the design names with a label stays named with a label: a power symbol there would be
+    // a power input nothing drives, and ERC would start to complain. Only nets that already have a
+    // power symbol get one again.
+    let named_by_symbol: BTreeSet<&str> = design
+        .symbols
+        .iter()
+        .filter(|s| s.reference.starts_with("#PWR"))
+        .map(|s| s.value.as_str())
+        .collect();
+    let mut library = library.clone();
+    library.retain(|id, symbol| {
+        let net_naming = id.library() == "power"
+            && symbol.is_power
+            && symbol.pins.len() == 1
+            && symbol.pins[0].electrical_type == "power_in";
+        !net_naming || named_by_symbol.contains(id.entry())
+    });
+    let library = &library;
+
+    // The layout starts from the top left of the sheet, as for a new circuit.
+    let mut taken: BTreeSet<String> = plan.references.values().cloned().collect();
+    let mut out = layout::layout(&spec, library, &plan.references, &mut taken, None);
+    findings.extend(out.findings.clone());
+    plan.fallback_nets = out.fallback_nets.clone();
+
+    // KiCad names a net nobody named `Net-(R1-Pad2)`; a label saying so adds nothing to a net that
+    // is drawn with wires.
+    out.operations.retain(|op| match op {
+        Operation::AddLabel { net, .. } => !net.starts_with("Net-(") || plan.fallback_nets.contains(net),
+        _ => true,
+    });
+
+    // Text notes stay where they are, so the layout moves out of their way (below them).
+    if let Some(drawn) = layout::operations_bounds(&out.operations, library) {
+        let mut dy = 0;
+        for _ in 0..design.notes.len() + 1 {
+            let area = drawn.translate(Point::new(Nm(0), Nm(dy)));
+            let Some(lowest) = design
+                .notes
+                .iter()
+                .filter(|n| n.overlaps(area))
+                .map(|n| n.max.y.0)
+                .max()
+            else {
+                break;
+            };
+            // Clear of the note by a little, on the grid.
+            let wanted = lowest + 2_540_000 - drawn.min.y.0;
+            dy = (wanted + GRID.0 - 1).div_euclid(GRID.0) * GRID.0;
+        }
+        if dy != 0 {
+            let by = Point::new(Nm(0), Nm(dy));
+            out.operations = out.operations.into_iter().map(|op| layout::translate(op, by)).collect();
+            findings.push(Finding {
+                severity: Severity::Warning,
+                code: "TIDY_PLACED_BELOW_NOTES",
+                message: format!(
+                    "text notes sit where the layout would go, so the circuit is placed {:.0} mm lower, below them; move the notes if you want it higher",
+                    Nm(dy).to_mm()
+                ),
+                objects: vec![],
+            });
+        }
+    }
+
+    // The checks run on the drawing as the layout made it, parts included.
+    let drawn = OperationPlan {
+        operations: out.operations.clone(),
+        expected_nets: plan.expected_nets.clone(),
+        references: plan.references.clone(),
+        ..Default::default()
+    };
+    plan.readability = crate::readability::check(&drawn, library);
+    findings.extend(readability_findings(&plan.readability));
+    plan.readability_before = Some(crate::readability::check_design(design, library));
+
+    // Existing parts: move the ones that are not already in place.
+    let by_reference: BTreeMap<&str, _> = design.symbols.iter().map(|s| (s.reference.as_str(), s)).collect();
+    let mut additions = Vec::new();
+    for op in out.operations {
+        match &op {
+            Operation::PlaceSymbol {
+                reference,
+                position,
+                orientation,
+                ..
+            } => {
+                let Some(existing) = by_reference.get(reference.as_str()) else {
+                    continue;
+                };
+                if existing.position != *position || !existing.orientation.same_effect(*orientation) {
+                    plan.moves.push(SymbolMove {
+                        id: existing.id.clone(),
+                        reference: reference.clone(),
+                        from: existing.position,
+                        from_orientation: existing.orientation,
+                        to: *position,
+                        orientation: *orientation,
+                    });
+                }
+            }
+            _ => additions.push(op),
+        }
+    }
+
+    // Existing drawing items go, except those the new drawing would draw identically.
+    // Wires compare as runs along a line, so that wires KiCad has joined or cut differently still
+    // match; a run is kept when the new drawing has exactly the same run.
+    let existing_wires = WireIndex::new(design.wires.iter().map(|w| (w.start, w.end)));
+    let new_wires = WireIndex::new(additions.iter().filter_map(|op| match op {
+        Operation::AddWire { start, end, .. } => Some((*start, *end)),
+        _ => None,
+    }));
+    let same_runs: BTreeSet<WireKey> = existing_wires.keys().intersection(&new_wires.keys()).copied().collect();
+    let mut junctions: BTreeMap<_, Vec<usize>> = BTreeMap::new();
+    for (i, j) in design.junctions.iter().enumerate() {
+        junctions.entry((j.position.x.0, j.position.y.0)).or_default().push(i);
+    }
+    let mut labels: BTreeMap<_, Vec<usize>> = BTreeMap::new();
+    for (i, l) in design.labels.iter().enumerate() {
+        labels
+            .entry((l.text.clone(), l.position.x.0, l.position.y.0))
+            .or_default()
+            .push(i);
+    }
+    let power: Vec<usize> = design
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.reference.starts_with("#PWR"))
+        .map(|(i, _)| i)
+        .collect();
+    let (mut keep_wire, mut keep_junction, mut keep_label, mut keep_power) =
+        (BTreeSet::new(), BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    additions.retain(|op| {
+        let matched = match op {
+            Operation::AddWire { start, end, .. } => same_runs.contains(&new_wires.key(*start, *end)).then_some(true),
+            Operation::AddJunction { position } => junctions
+                .get_mut(&(position.x.0, position.y.0))
+                .and_then(Vec::pop)
+                .map(|i| keep_junction.insert(i)),
+            Operation::AddLabel { net, position, .. } => labels
+                .get_mut(&(net.clone(), position.x.0, position.y.0))
+                .and_then(Vec::pop)
+                .map(|i| keep_label.insert(i)),
+            Operation::PlacePowerSymbol {
+                net,
+                position,
+                orientation,
+                ..
+            } => power
+                .iter()
+                .find(|&&i| {
+                    let s = &design.symbols[i];
+                    !keep_power.contains(&i)
+                        && s.value == *net
+                        && s.position == *position
+                        && s.orientation.same_effect(*orientation)
+                })
+                .map(|&i| keep_power.insert(i)),
+            _ => None,
+        };
+        matched.is_none()
+    });
+    let at = |p: Point| format!("({:.2}, {:.2})", p.x.to_mm(), p.y.to_mm());
+    for (i, w) in design.wires.iter().enumerate() {
+        if same_runs.contains(&existing_wires.key(w.start, w.end)) {
+            keep_wire.insert(i);
+        }
+    }
+    for (i, w) in design.wires.iter().enumerate().filter(|(i, _)| !keep_wire.contains(i)) {
+        let _ = i;
+        plan.removals.push(Removal {
+            kind: RemovedKind::Wire,
+            id: w.id.clone(),
+            description: format!("wire {} to {}", at(w.start), at(w.end)),
+        });
+    }
+    for (i, l) in design
+        .labels
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !keep_label.contains(i))
+    {
+        let _ = i;
+        plan.removals.push(Removal {
+            kind: RemovedKind::Label,
+            id: l.id.clone(),
+            description: format!("label {} at {}", l.text, at(l.position)),
+        });
+    }
+    for (i, j) in design
+        .junctions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !keep_junction.contains(i))
+    {
+        let _ = i;
+        plan.removals.push(Removal {
+            kind: RemovedKind::Junction,
+            id: j.id.clone(),
+            description: format!("junction at {}", at(j.position)),
+        });
+    }
+    for &i in power.iter().filter(|i| !keep_power.contains(i)) {
+        let s = &design.symbols[i];
+        plan.removals.push(Removal {
+            kind: RemovedKind::PowerSymbol,
+            id: s.id.clone(),
+            description: format!("power symbol {} ({}) at {}", s.reference, s.value, at(s.position)),
+        });
+    }
+
+    // New power symbols must not reuse a reference that a kept one still has.
+    let mut used: BTreeSet<String> = plan.references.values().cloned().collect();
+    used.extend(keep_power.iter().map(|&i| design.symbols[i].reference.clone()));
+    for op in &mut additions {
+        if let Operation::PlacePowerSymbol { reference, .. } = op {
+            let prefix: String = reference.chars().take_while(|c| !c.is_ascii_digit()).collect();
+            *reference = (1..)
+                .map(|n| format!("{prefix}{n:02}"))
+                .find(|r| !used.contains(r))
+                .expect("unbounded range");
+            used.insert(reference.clone());
+        }
+    }
+    plan.operations = additions;
+
+    if design.annotations > 0 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "TIDY_ANNOTATIONS_STAY",
+            message: format!(
+                "{} text note(s) or graphics stay where they are and may overlap the new layout",
+                design.annotations
+            ),
+            objects: vec![],
+        });
+    }
+    if plan.moves.is_empty() && plan.removals.is_empty() && plan.operations.is_empty() {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "NOTHING_TO_CHANGE",
+            message: "the schematic already matches the layout the tidy tool would draw".into(),
+            objects: vec![],
+        });
+    }
+    let total = plan.operations.len() + plan.moves.len() + plan.removals.len();
+    if total > MAX_OPERATIONS {
+        findings.push(error(
+            "PLAN_TOO_LARGE",
+            format!("the plan has {total} operations; the limit is {MAX_OPERATIONS}"),
+            vec![],
+        ));
+    }
+    plan.findings = findings;
+    plan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit::CircuitSpec;
+    use crate::geometry::{Nm, Orientation};
+    use crate::plan::{plan_circuit, ExistingDocument};
+    use crate::schematic::{DesignJunction, DesignLabel, DesignSymbol, DesignWire, NetPin};
+
+    const REGULATOR: &str = include_str!("../../../docs/examples/regulator-3v3.json");
+
+    fn library() -> BTreeMap<LibraryId, LibrarySymbol> {
+        crate::plan::tests::library()
+    }
+
+    /// The design a plan would produce, as it would be read back (ids made up).
+    fn design_of(plan: &OperationPlan) -> SchematicDesign {
+        let mut design = SchematicDesign::default();
+        for (n, op) in plan.operations.iter().enumerate() {
+            let id = format!("00000000-0000-4000-8000-{n:012}");
+            match op {
+                Operation::PlaceSymbol {
+                    library_id,
+                    reference,
+                    value,
+                    position,
+                    orientation,
+                    ..
+                } => design.symbols.push(DesignSymbol {
+                    id,
+                    reference: reference.clone(),
+                    value: value.clone(),
+                    library_id: library_id.to_string(),
+                    footprint: String::new(),
+                    position: *position,
+                    orientation: *orientation,
+                    unit: 1,
+                }),
+                Operation::PlacePowerSymbol {
+                    net,
+                    library_id,
+                    reference,
+                    position,
+                    orientation,
+                } => design.symbols.push(DesignSymbol {
+                    id,
+                    reference: reference.clone(),
+                    value: net.clone(),
+                    library_id: library_id.to_string(),
+                    footprint: String::new(),
+                    position: *position,
+                    orientation: *orientation,
+                    unit: 1,
+                }),
+                Operation::AddWire { start, end, .. } => design.wires.push(DesignWire {
+                    id,
+                    start: *start,
+                    end: *end,
+                }),
+                Operation::AddLabel { net, position, .. } => design.labels.push(DesignLabel {
+                    id,
+                    text: net.clone(),
+                    position: *position,
+                }),
+                Operation::AddJunction { position } => design.junctions.push(DesignJunction {
+                    id,
+                    position: *position,
+                }),
+            }
+        }
+        design
+    }
+
+    /// The nets KiCad would report for the plan's circuit.
+    fn nets_of(plan: &OperationPlan) -> Vec<NetInfo> {
+        plan.expected_nets
+            .iter()
+            .map(|n| NetInfo {
+                name: format!("/{}", n.name),
+                pins: n
+                    .pins
+                    .iter()
+                    .map(|p| {
+                        let (reference, pin) = p.split_once('.').unwrap();
+                        NetPin {
+                            reference: reference.into(),
+                            pin: pin.into(),
+                            symbol_id: crate::ids::Kiid::new("00000000-0000-4000-8000-000000000000").unwrap(),
+                        }
+                    })
+                    .collect(),
+                other_items: 0,
+            })
+            .collect()
+    }
+
+    /// What applying the plan does to the design, for the next round.
+    fn apply(design: &SchematicDesign, plan: &OperationPlan) -> SchematicDesign {
+        let mut next = design.clone();
+        let gone: BTreeSet<&str> = plan.removals.iter().map(|r| r.id.as_str()).collect();
+        next.symbols.retain(|s| !gone.contains(s.id.as_str()));
+        next.wires.retain(|w| !gone.contains(w.id.as_str()));
+        next.labels.retain(|l| !gone.contains(l.id.as_str()));
+        next.junctions.retain(|j| !gone.contains(j.id.as_str()));
+        for m in &plan.moves {
+            let s = next.symbols.iter_mut().find(|s| s.id == m.id).unwrap();
+            s.position = m.to;
+            s.orientation = m.orientation;
+        }
+        let added = design_of(&OperationPlan {
+            operations: plan.operations.clone(),
+            ..Default::default()
+        });
+        let offset = format!("new{}", next.symbols.len() + next.wires.len());
+        for mut s in added.symbols {
+            s.id = format!("{offset}{}", s.id);
+            next.symbols.push(s);
+        }
+        for mut w in added.wires {
+            w.id = format!("{offset}{}", w.id);
+            next.wires.push(w);
+        }
+        for mut l in added.labels {
+            l.id = format!("{offset}{}", l.id);
+            next.labels.push(l);
+        }
+        for mut j in added.junctions {
+            j.id = format!("{offset}{}", j.id);
+            next.junctions.push(j);
+        }
+        next
+    }
+
+    fn built_regulator() -> (OperationPlan, SchematicDesign) {
+        let spec = CircuitSpec::from_json(REGULATOR).unwrap();
+        let plan = plan_circuit(&spec, &library(), &ExistingDocument::default());
+        assert!(!has_errors(&plan.findings), "{:#?}", plan.findings);
+        let design = design_of(&plan);
+        (plan, design)
+    }
+
+    fn errors(plan: &OperationPlan) -> Vec<&Finding> {
+        plan.findings.iter().filter(|f| f.severity == Severity::Error).collect()
+    }
+
+    #[test]
+    fn power_pins_are_attached_to_the_nets_they_touch() {
+        let (built, design) = built_regulator();
+        // What `kicad-cli` reports: no power symbols or flags.
+        let mut nets = nets_of(&built);
+        for net in &mut nets {
+            net.pins.retain(|p| !p.reference.starts_with('#'));
+        }
+        crate::connectivity::attach_power_pins(&design, &library(), &mut nets);
+        let pins_of = |net: &NetInfo| -> BTreeSet<String> {
+            net.pins.iter().map(|p| format!("{}.{}", p.reference, p.pin)).collect()
+        };
+        let expected = nets_of(&built);
+        for want in &expected {
+            let got = nets.iter().find(|n| n.name == want.name).unwrap();
+            // Every pin the plan expected is there (the flags among them)...
+            assert!(
+                pins_of(want).is_subset(&pins_of(got)),
+                "{}: {:?} vs {:?}",
+                want.name,
+                pins_of(want),
+                pins_of(got)
+            );
+            // ...and each power symbol sits on the net its value names.
+            for extra in pins_of(got).difference(&pins_of(want)) {
+                let reference = extra.split_once('.').unwrap().0;
+                let symbol = design.symbols.iter().find(|s| s.reference == reference).unwrap();
+                assert_eq!(format!("/{}", symbol.value), got.name, "{extra}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_layout_keeps_out_of_the_way_of_text_notes() {
+        let (built, mut design) = built_regulator();
+        // A note across the middle of where the circuit is drawn.
+        design.annotations = 1;
+        design.notes.push(crate::schematic::note_area(
+            Point::new(Nm(50_800_000), Nm(76_200_000)),
+            &"x".repeat(80),
+            Nm(1_270_000),
+        ));
+        let nets = nets_of(&built);
+        let plan = plan_tidy(&design, &nets, &library());
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert!(plan.findings.iter().any(|f| f.code == "TIDY_PLACED_BELOW_NOTES"));
+        // Nothing is drawn on the note.
+        let drawn = layout::operations_bounds(
+            &design_of(&OperationPlan {
+                operations: plan.operations.clone(),
+                ..Default::default()
+            })
+            .symbols
+            .iter()
+            .map(|s| Operation::PlacePowerSymbol {
+                net: s.value.clone(),
+                library_id: LibraryId::parse(&s.library_id).unwrap(),
+                reference: s.reference.clone(),
+                position: s.position,
+                orientation: s.orientation,
+            })
+            .collect::<Vec<_>>(),
+            &library(),
+        );
+        let note = design.notes[0];
+        assert!(
+            drawn.is_none_or(|d| !d.overlaps(note)) || plan.moves.iter().all(|m| m.to.y.0 > note.max.y.0 - 20_000_000)
+        );
+        // Tidying again changes nothing: the same notes give the same place.
+        let again = plan_tidy(&apply(&design, &plan), &nets, &library());
+        assert!(
+            again.moves.is_empty() && again.removals.is_empty() && again.operations.is_empty(),
+            "{again:#?}"
+        );
+    }
+
+    #[test]
+    fn a_tidied_design_needs_no_further_change() {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let first = plan_tidy(&design, &nets, &library());
+        assert_eq!(errors(&first), Vec::<&Finding>::new(), "{:#?}", first.findings);
+        let tidy = apply(&design, &first);
+        let second = plan_tidy(&tidy, &nets, &library());
+        assert_eq!(errors(&second), Vec::<&Finding>::new(), "{:#?}", second.findings);
+        assert!(second.moves.is_empty(), "moves: {:#?}", second.moves);
+        assert!(second.removals.is_empty(), "removals: {:#?}", second.removals);
+        assert!(second.operations.is_empty(), "operations: {:#?}", second.operations);
+        assert!(second.findings.iter().any(|f| f.code == "NOTHING_TO_CHANGE"));
+    }
+
+    #[test]
+    fn a_scrambled_design_is_laid_out_again_with_the_same_nets() {
+        let (built, mut design) = built_regulator();
+        // Pile the parts up, turn some, and lose the labels: a mess with the same circuit.
+        for (i, s) in design
+            .symbols
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, s)| !s.reference.starts_with('#'))
+        {
+            // Parts piled up on one spot.
+            s.position = Point::new(Nm(76_200_000 + 1_270_000 * (i as i64 % 3)), Nm(127_000_000));
+            if i % 2 == 0 {
+                s.orientation = Orientation {
+                    rotation_deg: 90,
+                    ..s.orientation
+                };
+            }
+        }
+        design.labels.clear();
+        let plan = plan_tidy(&design, &nets_of(&built), &library());
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert!(!plan.moves.is_empty());
+        assert!(plan.readability.is_clean(), "{:#?}", plan.readability);
+        // The circuit asked for is the circuit that was there.
+        let mut expected: Vec<_> = plan
+            .expected_nets
+            .iter()
+            .map(|n| (n.name.clone(), n.pins.clone()))
+            .collect();
+        // (The test library gives flags a `#PWR` reference; those are not circuit parts.)
+        let mut original: Vec<_> = built
+            .expected_nets
+            .iter()
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.pins
+                        .iter()
+                        .filter(|p| !p.starts_with('#'))
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect();
+        expected.sort();
+        original.sort();
+        assert_eq!(expected, original);
+        // Every part is kept (moved, never removed), and old power symbols are replaced.
+        assert!(plan
+            .removals
+            .iter()
+            .all(|r| r.kind != RemovedKind::PowerSymbol || r.description.contains("#PWR")));
+        let moved: BTreeSet<_> = plan.moves.iter().map(|m| m.reference.as_str()).collect();
+        assert!(moved.contains("U1") && moved.contains("J1"));
+        // The review notices what was wrong before.
+        let before = plan
+            .readability_before
+            .as_ref()
+            .expect("a tidy plan reports the old state");
+        assert!(
+            !before.is_clean(),
+            "the scrambled design should have problems: {before:#?}"
+        );
+    }
+
+    #[test]
+    fn designs_with_items_that_cannot_be_redrawn_are_refused() {
+        let (built, mut design) = built_regulator();
+        design.unsupported.insert("no_connect".into(), 2);
+        design.unsupported.insert("sheet".into(), 1);
+        let plan = plan_tidy(&design, &nets_of(&built), &library());
+        assert!(plan.moves.is_empty() && plan.operations.is_empty() && plan.removals.is_empty());
+        let finding = plan
+            .findings
+            .iter()
+            .find(|f| f.code == "TIDY_UNSUPPORTED_ITEMS")
+            .unwrap();
+        assert!(
+            finding.message.contains("2 no_connect") && finding.message.contains("1 sheet"),
+            "{finding:?}"
+        );
+    }
+
+    #[test]
+    fn unannotated_parts_are_refused() {
+        let (built, mut design) = built_regulator();
+        design
+            .symbols
+            .iter_mut()
+            .find(|s| s.reference == "C1")
+            .unwrap()
+            .reference = "C?".into();
+        let plan = plan_tidy(&design, &nets_of(&built), &library());
+        assert!(plan.findings.iter().any(|f| f.code == "TIDY_BAD_REFERENCE"));
+    }
+
+    #[test]
+    fn new_power_symbols_do_not_reuse_references_that_stay() {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let first = plan_tidy(&design, &nets, &library());
+        let mut tidy = apply(&design, &first);
+        // One ground symbol is no longer where the layout wants it; the others stay.
+        let moved = tidy
+            .symbols
+            .iter_mut()
+            .find(|s| s.value == "GND" && s.reference.starts_with("#PWR"))
+            .unwrap();
+        moved.position = Point::new(Nm(moved.position.x.0 + 5_080_000), moved.position.y);
+        let plan = plan_tidy(&tidy, &nets, &library());
+        let kept: BTreeSet<_> = tidy
+            .symbols
+            .iter()
+            .filter(|s| s.reference.starts_with("#PWR") && !plan.removals.iter().any(|r| r.id == s.id))
+            .map(|s| s.reference.clone())
+            .collect();
+        for op in &plan.operations {
+            if let Operation::PlacePowerSymbol { reference, .. } = op {
+                assert!(
+                    !kept.contains(reference),
+                    "{reference} is already used by a symbol that stays"
+                );
+            }
+        }
+        assert_eq!(plan.operations.len(), 1, "{:#?}", plan.operations);
+    }
+}

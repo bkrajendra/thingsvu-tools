@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kicad_cli_runner::KicadInstall;
-use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, Origin, Provenance, ResultState, ToolError};
+use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, OperationPlan, Origin, Provenance, ResultState, ToolError};
 use kicad_session::registry::{self, Registration};
 use kicad_session::{AnySession, FileSession, OpenTarget, Provider, Session, SessionConfig};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -133,6 +133,26 @@ pub struct ApplyArgs {
     /// A new value per intended apply (8–128 characters). Repeating a key returns the earlier
     /// result instead of applying twice.
     pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldArg {
+    Value,
+    Footprint,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetFieldArgs {
+    pub session_id: String,
+    /// Symbol id (UUID from sch_list_symbols), or a reference such as R1 that matches exactly one symbol.
+    pub symbol: String,
+    pub field: FieldArg,
+    /// The new text, up to 256 characters, no control characters.
+    pub text: String,
+    /// Must be true: the user asked for this change.
+    pub confirm: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -336,6 +356,11 @@ impl KicadAiServer {
         let library = session.library_symbols(&ids).await?;
         let existing = session.existing_document().await?;
         let plan = plan_circuit(&spec, &library, &existing);
+        self.store_plan(session, plan).await
+    }
+
+    /// Stores a plan against the document's current fingerprint and returns its client view.
+    async fn store_plan(&self, session: &Arc<AnySession>, plan: OperationPlan) -> Result<serde_json::Value, ToolError> {
         let fingerprint = session.fingerprint().await?;
         let mut plans = self.state.plans.lock().await;
         let stored = StoredPlan {
@@ -347,6 +372,26 @@ impl KicadAiServer {
         let view_plan = stored.plan.clone();
         let id = plans.insert(stored);
         Ok(plan_view(&id, &view_plan))
+    }
+
+    /// Reads the sheet and plans how to lay it out again. Nothing is changed.
+    async fn tidy_plan_for(
+        &self,
+        session: &Arc<AnySession>,
+    ) -> Result<(kicad_domain::SchematicDesign, OperationPlan), ToolError> {
+        let design = session.design().await?;
+        let nets = session.netlist().await?;
+        let mut ids = kicad_domain::design_library_ids(&design);
+        let mut library = session.library_symbols(&ids).await?;
+        // Power symbols for the net names are only needed when the circuit can be read at all.
+        if let Ok(spec) = kicad_domain::tidy_spec(&design, &nets) {
+            ids.extend(kicad_domain::library_ids_for(&spec));
+            ids.sort();
+            ids.dedup();
+            library = session.library_symbols(&ids).await?;
+        }
+        let plan = kicad_domain::plan_tidy(&design, &nets, &library);
+        Ok((design, plan))
     }
 
     /// Applies a stored plan once per idempotency key.
@@ -720,11 +765,111 @@ afterwards, and findings (errors block applying)."
     }
 
     #[tool(
+        name = "sch_review",
+        description = "Look at the whole drawing of an existing schematic and say what is untidy: symbols \
+that overlap, wires that run through a part, power nets named by text instead of a power symbol. Also \
+reports whether sch_tidy_plan can redraw it (it handles one sheet of parts joined by wires, local labels, \
+and power symbols; buses, global labels, hierarchical sheets, and no-connect flags are refused) and how \
+much it would change. Read-only. Use sch_render to see it."
+    )]
+    pub async fn sch_review(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let (design, plan) = match self.tidy_plan_for(&session).await {
+            Ok(v) => v,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let power = design
+            .symbols
+            .iter()
+            .filter(|s| s.reference.starts_with("#PWR"))
+            .count();
+        let problems: Vec<String> = match &plan.readability_before {
+            Some(r) => r
+                .overlapping_symbols
+                .iter()
+                .map(|(a, b)| format!("{a} and {b} overlap"))
+                .chain(
+                    r.wires_through_symbols
+                        .iter()
+                        .map(|(wire, part)| format!("{wire} passes through {part}")),
+                )
+                .chain(
+                    r.labelled_power_nets
+                        .iter()
+                        .map(|n| format!("{n} is named by a label; a power symbol would be clearer")),
+                )
+                .collect(),
+            None => vec![],
+        };
+        let blockers: Vec<_> = plan
+            .findings
+            .iter()
+            .filter(|f| f.severity == kicad_domain::Severity::Error)
+            .collect();
+        let counts = plan.counts();
+        envelope::ok(
+            &cid,
+            serde_json::json!({
+                "parts": design.symbols.len() - power,
+                "power_symbols": power,
+                "wires": design.wires.len(),
+                "labels": design.labels.len(),
+                "junctions": design.junctions.len(),
+                "notes_and_graphics": design.annotations,
+                "unsupported_items": design.unsupported,
+                "problems": problems,
+                "readability": plan.readability_before,
+                "tidy": {
+                    "possible": blockers.is_empty(),
+                    "blockers": blockers,
+                    "would_move": counts.moves,
+                    "would_remove": counts.removals,
+                    "would_add": plan.operations.len(),
+                    "already_tidy": plan.findings.iter().any(|f| f.code == "NOTHING_TO_CHANGE"),
+                },
+            }),
+            live(&session),
+            vec![],
+        )
+    }
+
+    #[tool(
+        name = "sch_tidy_plan",
+        description = "Plan a cleaner layout for an existing schematic: the parts are laid out again with \
+signal flow left to right, power and ground as symbols, and wires instead of labels. Every part keeps its \
+identity, value, footprint, and fields; the old wires, labels, junctions, and net-naming power symbols are \
+replaced. Returns a plan_id for sch_apply_plan, with the moves, removals, and additions, the drawing's \
+readability before and after, and the nets that must be identical afterwards. Nothing is changed until the \
+plan is applied with confirm: true; show it to the user first."
+    )]
+    pub async fn sch_tidy_plan(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = match self.tidy_plan_for(&session).await {
+            Ok((_, plan)) => plan,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match self.store_plan(&session, plan).await {
+            Ok(view) => envelope::ok(&cid, view, live(&session), vec![]),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "sch_apply_plan",
-        description = "Apply a plan from sch_plan_changes after the user has reviewed it (confirm: true). \
-Refused if the schematic changed since planning. Places symbols, sets values, adds wires and labels, then \
-reads connectivity back from KiCad and compares it with the plan's expected nets. On failure every change \
-is undone. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a plan from sch_plan_changes or sch_tidy_plan after the user has reviewed it \
+(confirm: true). Refused if the schematic changed since planning. Places or moves symbols, sets values, \
+adds and removes wires, labels, and junctions, then reads connectivity back from KiCad and compares it \
+with the plan's expected nets. On failure the changes are undone where KiCad allows it; in a live editor a \
+partly applied plan is reported with how many undo steps to take. Repeating the same idempotency_key \
+returns the earlier result."
     )]
     pub async fn sch_apply_plan(&self, Parameters(args): Parameters<ApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -765,6 +910,50 @@ is undone. Repeating the same idempotency_key returns the earlier result."
                 ),
                 Err(e) => envelope::error(&cid, &e),
             },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_set_field",
+        description = "Change the value (e.g. 10k to 4k7) or the footprint of one part, and nothing else: \
+the part keeps its place and connections. Needs confirm: true. In a live editor it is one undo step; in a \
+file session the new file must load in kicad-cli before it replaces the old one. Returns the part as it is \
+now. For anything bigger (moving parts, redrawing), use a plan."
+    )]
+    pub async fn sch_set_field(&self, Parameters(args): Parameters<SetFieldArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        if !args.confirm {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "confirm must be true; the user asked for this change",
+                ),
+            );
+        }
+        if args.text.chars().count() > 256 || args.text.chars().any(char::is_control) {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "text must be at most 256 characters with no control characters",
+                ),
+            );
+        }
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let field = match args.field {
+            FieldArg::Value => kicad_session::SymbolField::Value,
+            FieldArg::Footprint => kicad_session::SymbolField::Footprint,
+        };
+        match session.set_field(&args.symbol, field, &args.text).await {
+            Ok(info) => envelope::ok(&cid, info, live(&session), vec![]),
             Err(e) => envelope::error(&cid, &e),
         }
     }

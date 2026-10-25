@@ -18,3 +18,5 @@ Expected connectivity for `two-resistor-series-chain` (from `kicad-cli sch expor
 ERC (`kicad-cli sch erc --severity-all`): 2 warnings, `isolated_pin_label` on INPUT and OUTPUT. This is expected, because those nets have one pin each.
 
 History: earlier versions of this fixture were wrong. The first headless one duplicated the library symbol (`R_1`) because whole symbols were sent back in one batch. A GUI-saved one kept Value `R` although `UpdateItems` replied `10k`. Replaced on 24 Oct 2026; see `docs/tasks.md` (tasks 1.4 and 2.6).
+
+| `regulator-with-notes/` | The 3.3 V regulator from `docs/examples/regulator-3v3.json`, built with these tools in the 10.99 GUI and then edited by an AI assistant (a title and a note added, labels and flags moved). A realistic starting point for the tidy tests: 13 parts, 11 power symbols, wires, junctions, two text notes. Do not edit by hand |
