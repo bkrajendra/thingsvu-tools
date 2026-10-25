@@ -698,7 +698,10 @@ pub fn plan_placement(
     options: &PlaceOptions,
 ) -> Result<(BoardEditPlan, PlacementReport), ToolError> {
     let outline = board.outline.ok_or_else(|| {
-        bad("the board has no outline; give it one first (pcb_outline_plan), so the parts have somewhere to go")
+        bad(format!(
+            "the board has no outline: nothing is drawn on Edge.Cuts ({} drawing(s) on the board; selecting all and              deleting in KiCad removes the outline too). Give it one first with pcb_outline_plan and a size              (width_mm, height_mm), so the parts have somewhere to go",
+            board.drawings
+        ))
     })?;
     let grid = grid_nm(options.grid_mm)?;
     let step = if grid.0 >= 500_000 { grid } else { Nm(500_000) };

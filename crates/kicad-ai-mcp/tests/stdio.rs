@@ -2306,6 +2306,39 @@ async fn gui_pcb_place_demo() {
     let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
     assert_eq!(opened["ok"], true, "{opened}");
     let id = opened["result"]["session_id"].clone();
+    // A board whose outline was deleted (select all, delete) gets one sized from the parts: about
+    // three times their courtyard area, 4:3, centred on them.
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    if info["result"]["outline"].is_null() {
+        let list = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
+        let area: f64 = list["result"]["footprints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| Some(f["courtyard"]["width"].as_f64()? * f["courtyard"]["height"].as_f64()?))
+            .sum();
+        let width = ((area * 3.0 * 4.0 / 3.0).sqrt().max(20.0) / 5.0).ceil() * 5.0;
+        let height = ((width * 3.0 / 4.0) / 5.0).ceil() * 5.0;
+        let outline = mcp
+            .call(
+                "pcb_outline_plan",
+                json!({ "session_id": id, "width_mm": width, "height_mm": height, "corner_radius_mm": 1 }),
+            )
+            .await;
+        println!(
+            "GUI NO OUTLINE: adding {width} x {height} mm: {}",
+            outline["result"]["operations"]
+        );
+        assert_eq!(outline["ok"], true, "{outline}");
+        let applied = apply_board(
+            &mut mcp,
+            &id,
+            &outline,
+            &format!("gui-pcb-outline-{}", std::process::id()),
+        )
+        .await;
+        assert_eq!(applied["result"]["verified"], true, "{applied}");
+    }
     let plan = mcp.call("pcb_place_plan", json!({ "session_id": id })).await;
     println!("GUI PLACE PLAN {}", plan["result"]["measured"]);
     println!("GUI PLACE WARNINGS {}", plan["result"]["warnings"]);
@@ -2317,5 +2350,5 @@ async fn gui_pcb_place_demo() {
     println!("GUI REVIEW AFTER PLACING {}", review["result"]["issues"]);
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
-    println!("GUI DONE: the footprints are placed; Ctrl+Z undoes it");
+    println!("GUI DONE: the footprints are placed; Ctrl+Z undoes it (and once more the outline, if one was added)");
 }

@@ -406,7 +406,7 @@ Known limits (12.0 to 12.4): board editing needs a live KiCad 11 session (headle
 
 **Attention — please try on the live editor:** open a **copy** of a project in the **PCB Editor**, press **KiCad AI: connect** there, and run `THINGSVU_GUI_PCB_EDIT=1 cargo test -p kicad-ai-mcp --test stdio gui_pcb_edit_demo -- --nocapture` (Git Bash; in PowerShell: `$env:THINGSVU_GUI_PCB_EDIT='1'; cargo test ...`). It replaces the outline with one fitted around the parts (3 mm margin, 1 mm corners) and turns the first unlocked footprint by 90°; Ctrl+Z twice undoes both. Or ask the assistant: *"Put a 50 x 40 mm outline with rounded corners and four M3 holes around the parts, then turn U1 by 90 degrees."*
 
-For placement, on a copy of a board that has an outline: `THINGSVU_GUI_PCB_PLACE=1 cargo test -p kicad-ai-mcp --test stdio gui_pcb_place_demo -- --nocapture`. It places every unlocked footprint, prints the measured result and the review, and Ctrl+Z undoes it. Or ask: *"Place the parts on the board, keep J1 on the left edge and the LED near the connector."*
+For placement, on a copy of a board that has an outline: `THINGSVU_GUI_PCB_PLACE=1 cargo test -p kicad-ai-mcp --test stdio gui_pcb_place_demo -- --nocapture`. It places every unlocked footprint, prints the measured result and the review, and Ctrl+Z undoes it. A board with no outline (for example after selecting all and deleting, which removes the outline too) first gets one sized from the parts, as a separate undo step. Or ask: *"Place the parts on the board, keep J1 on the left edge and the LED near the connector."*
 
 ### Phase 13 — Manufacturing outputs and the mechanical exchange (v0.8.0)
 
