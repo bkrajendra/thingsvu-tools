@@ -8,6 +8,7 @@ pub mod fp;
 pub mod node;
 pub mod pcb;
 pub mod sch;
+pub mod ses;
 pub mod sym;
 
 pub use emit::{add_plan, set_property, EmitError};

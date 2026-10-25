@@ -305,12 +305,34 @@ pub struct PcbZoneArgs {
     pub zones: Vec<ZoneArg>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbAutorouteArgs {
+    pub session_id: String,
+    /// Most routing passes (default 20, 1 to 200).
+    #[serde(default)]
+    pub passes: Option<u32>,
+    /// Stop the router after this many seconds (default 120, 10 to 900).
+    #[serde(default)]
+    pub time_limit_s: Option<u64>,
+}
+
+/// A routed session waiting to be imported.
+pub struct PendingSession {
+    pub ses: PathBuf,
+    pub dir: PathBuf,
+    /// Nets the session routes.
+    pub nets: Vec<String>,
+}
+
 /// What a pending board plan does.
 pub enum PendingWork {
     /// An update of the board from the schematic.
     Update { netlist: PathBuf, schematic: PathBuf },
     /// An outline or moves (Phase 12).
     Edit(Box<BoardEditPlan>),
+    /// A routed Specctra session (12.7).
+    Autoroute(PendingSession),
 }
 
 /// A board plan waiting to be applied.
@@ -1294,8 +1316,141 @@ impl KicadAiServer {
     }
 
     #[tool(
+        name = "pcb_autoroute_plan",
+        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when the server is started with --freerouting-jar or THINGSVU_FREEROUTING_JAR; never downloaded). \\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nNothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move."
+    )]
+    pub async fn pcb_autoroute_plan(&self, Parameters(args): Parameters<PcbAutorouteArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let router = self.state.options.freerouting.clone().ok_or_else(|| {
+                ToolError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "no autorouter is configured: start the server with --freerouting-jar <path> (or set \
+                     THINGSVU_FREEROUTING_JAR); route with pcb_route_plan meanwhile",
+                )
+            })?;
+            let passes = args.passes.unwrap_or(20);
+            let limit = args.time_limit_s.unwrap_or(120);
+            if !(1..=200).contains(&passes) || !(10..=900).contains(&limit) {
+                return Err(bad_arg("passes is 1 to 200 and time_limit_s 10 to 900"));
+            }
+            let data = board.read().await?;
+            let rules = board.routing_rules(&data.nets).await?;
+            let dir = self.scratch_dir(board.id(), "autoroute", &cid)?;
+            let (dsn, ses) = (dir.join("board.dsn"), dir.join("board.ses"));
+            // From a snapshot of the live board: KiCad's own DSN export job reads the board file on
+            // disk, so unsaved changes (a placement) would be routed as they were, and the session's
+            // placement would move every part back on import (the Phase 12.7 probe).
+            let snapshot = dir.join("snapshot");
+            std::fs::create_dir_all(&snapshot).map_err(|e| {
+                ToolError::new(
+                    ErrorCode::KicadError,
+                    format!("cannot create {}: {e}", snapshot.display()),
+                )
+            })?;
+            let copy = board.save_copy(&snapshot).await?;
+            let cli = board.render_cli().or(board.cli()).cloned().ok_or_else(|| {
+                ToolError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "no kicad-cli that can export Specctra DSN (KiCad 11)",
+                )
+            })?;
+            kicad_cli_runner::pcb::export_specctra(&cli, &copy, &dsn, Duration::from_secs(120))
+                .await
+                .map_err(|e| {
+                    ToolError::new(
+                        ErrorCode::KicadError,
+                        format!("cannot export the board for the router: {e}"),
+                    )
+                })?;
+            let run = router
+                .route(&dsn, &ses, passes, Duration::from_secs(limit))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
+            let text = std::fs::read_to_string(&ses)
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}")))?;
+            let summary = kicad_sexpr::ses::summarize(&text)
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}")))?;
+            Ok::<_, ToolError>((data, rules, dir, ses, run, summary))
+        }
+        .await;
+        let (data, rules, dir, ses, run, summary) = match result {
+            Ok(r) => r,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let mut warnings = Vec::new();
+        if run.unrouted.unwrap_or(0) > 0 {
+            warnings.push(format!(
+                "Freerouting left {} connection(s) unrouted; more passes, a larger board, or a better placement may help",
+                run.unrouted.unwrap_or(0)
+            ));
+        }
+        if run.violations.unwrap_or(0) > 0 {
+            warnings.push(format!(
+                "Freerouting reports {} violation(s)",
+                run.violations.unwrap_or(0)
+            ));
+        }
+        let min = mm(rules.min_track_width.0);
+        let narrow: Vec<String> = summary
+            .nets
+            .iter()
+            .filter(|n| n.segments > 0 && n.min_width_mm + 1e-9 < min)
+            .map(|n| format!("{} ({:.2} mm)", n.net, n.min_width_mm))
+            .collect();
+        if !narrow.is_empty() {
+            warnings.push(format!(
+                "tracks narrower than the board minimum of {min:.2} mm: {}; DRC after applying will show them",
+                narrow.join(", ")
+            ));
+        }
+        let replaced_tracks = data.tracks.iter().filter(|t| !t.locked).count();
+        let replaced_vias = data.vias.len();
+        if replaced_tracks + replaced_vias > 0 {
+            warnings.push(format!(
+                "the import replaces {replaced_tracks} unlocked track(s) and {replaced_vias} via(s); lock tracks in KiCad to keep them"
+            ));
+        }
+        let plan_id = self.next_pcb_plan_id();
+        let body = serde_json::json!({
+            "plan_id": plan_id,
+            "kind": "autoroute",
+            "can_apply": true,
+            "router": run,
+            "session": summary,
+            "replaces": { "tracks": replaced_tracks, "vias": replaced_vias, "locked_tracks_kept": data.tracks.len() - replaced_tracks },
+            "warnings": warnings,
+            "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
+        });
+        self.state.pending_updates.lock().await.insert(
+            plan_id,
+            PendingUpdate {
+                session_id: board.id().to_owned(),
+                fingerprint: fingerprint(&data),
+                applied_with: None,
+                work: PendingWork::Autoroute(PendingSession {
+                    ses,
+                    dir,
+                    nets: summary
+                        .nets
+                        .iter()
+                        .filter(|n| n.segments > 0)
+                        .map(|n| n.net.clone())
+                        .collect(),
+                }),
+            },
+        );
+        envelope::ok(&cid, body, board_provenance(&board), warnings)
+    }
+
+    #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan, pcb_zone_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1352,12 +1507,14 @@ impl KicadAiServer {
             }
             let work = match &plan.work {
                 PendingWork::Update { netlist, schematic } => Err((netlist.clone(), schematic.clone())),
-                PendingWork::Edit(edit) => Ok(edit.clone()),
+                PendingWork::Edit(edit) => Ok(Ok(edit.clone())),
+                PendingWork::Autoroute(s) => Ok(Err((s.ses.clone(), s.dir.clone(), s.nets.clone()))),
             };
             (plan.fingerprint.clone(), work)
         };
         let (netlist, schematic) = match work {
-            Ok(edit) => return self.apply_board_edit(&cid, &board, &args, &fp, &edit).await,
+            Ok(Ok(edit)) => return self.apply_board_edit(&cid, &board, &args, &fp, &edit).await,
+            Ok(Err(session)) => return self.apply_autoroute(&cid, &board, &args, &fp, session).await,
             Err(update) => update,
         };
         let result = async {
@@ -1924,4 +2081,101 @@ fn drc_worse(before: &kicad_cli_runner::pcb::DrcReport, after: &kicad_cli_runner
             )
         })
         .collect()
+}
+
+impl KicadAiServer {
+    /// Imports a routed session, reads the board back, and checks it with DRC before and after.
+    async fn apply_autoroute(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        args: &PcbApplyArgs,
+        fp: &str,
+        session: (PathBuf, PathBuf, Vec<String>),
+    ) -> CallToolResult {
+        let (ses, dir, nets) = session;
+        let result = async {
+            let before = board.read().await?;
+            if fingerprint(&before) != fp {
+                return Err(ToolError::new(
+                    ErrorCode::StalePlan,
+                    "the board changed since the plan was made; make a new plan",
+                ));
+            }
+            let drc_before = self.run_drc(cid, board, false).await.ok();
+            let imported = board.import_session(&ses).await?;
+            let drc_after = self.run_drc(cid, board, false).await.ok();
+            let after = board.read().await?;
+            Ok::<_, ToolError>((before, imported, after, drc_before, drc_after))
+        }
+        .await;
+        let (before, imported, after, drc_before, drc_after) = match result {
+            Ok(r) => r,
+            Err(e) => return envelope::error(cid, &e),
+        };
+        if let Some(p) = self.state.pending_updates.lock().await.get_mut(&args.plan_id) {
+            p.applied_with = Some(args.idempotency_key.clone());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut problems = Vec::new();
+        if imported.skipped > 0 {
+            problems.push(format!("KiCad skipped {} item(s) of the session", imported.skipped));
+        }
+        for f in &after.footprints {
+            if let Some(b) = before.footprints.iter().find(|b| b.id == f.id) {
+                if b.position != f.position || b.layer != f.layer {
+                    problems.push(format!("{} moved during the import", f.reference));
+                }
+            }
+        }
+        for net in &nets {
+            if !after.tracks.iter().any(|t| &t.net == net) {
+                problems.push(format!("net {net} has no track after the import"));
+            }
+        }
+        let drc = match (&drc_before, &drc_after) {
+            (Some(b), Some(a)) => {
+                problems.extend(drc_worse(b, a));
+                Some(serde_json::json!({
+                    "unrouted_before": b.unconnected_items.len(),
+                    "unrouted_after": a.unconnected_items.len(),
+                    "errors_before": b.count("error"),
+                    "errors_after": a.count("error"),
+                    "after": drc_json(a),
+                }))
+            }
+            _ => {
+                problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
+                None
+            }
+        };
+        let verified = problems.is_empty();
+        let body = serde_json::json!({
+            "applied": true,
+            "verified": verified,
+            "kind": "autoroute",
+            "tracks": after.tracks.len(),
+            "vias": after.vias.len(),
+            "skipped": imported.skipped,
+            "report": imported.report,
+            "drc": drc,
+            "problems": problems,
+            "undo": match board.provider() {
+                Provider::Gui => "KiCad's own import step in the PCB editor (Ctrl+Z)",
+                _ => "not saved yet; pcb_save writes it, closing with discard_unsaved drops it",
+            },
+            "next": "Check with pcb_review or pcb_render, then save with pcb_save.",
+        });
+        if verified {
+            envelope::ok(cid, body, board_provenance(board), vec![])
+        } else {
+            envelope::ok_with_state(
+                cid,
+                kicad_domain::ResultState::Partial,
+                body,
+                board_provenance(board),
+                vec!["applied, but the board read back is not as clean as before; see problems".to_owned()],
+            )
+        }
+    }
 }

@@ -110,6 +110,7 @@ async fn lists_tools_and_returns_envelopes() {
             "fp_get",
             "fp_search",
             "pcb_apply_plan",
+            "pcb_autoroute_plan",
             "pcb_close",
             "pcb_get_footprint",
             "pcb_info",
@@ -2711,4 +2712,146 @@ async fn gui_pcb_zone_demo() {
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: GND is poured; Ctrl+Z undoes the fill, a second Ctrl+Z the zone");
+}
+
+/// The placed regulator board routed by Freerouting: planned (export, route, summary; nothing
+/// changes), imported, read back, and checked with DRC. Needs KICAD_LIVE=1 and
+/// THINGSVU_FREEROUTING_JAR (and THINGSVU_JAVA unless java is on the PATH).
+#[tokio::test]
+async fn live_board_is_autorouted() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") || std::env::var("THINGSVU_FREEROUTING_JAR").is_err() {
+        eprintln!("skipped: set KICAD_LIVE=1 and THINGSVU_FREEROUTING_JAR");
+        return;
+    }
+    let pcb = board_fixture("autoroute", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-autoroute-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+    // One track by hand, which the import will replace.
+    let route = mcp
+        .call(
+            "pcb_route_plan",
+            json!({ "session_id": id, "routes": [{ "points": [{ "pad": "J1.1" }, { "pad": "F1.1" }] }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &route, &key("route")).await["result"]["verified"],
+        true
+    );
+    let before = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
+
+    let bad = mcp
+        .call("pcb_autoroute_plan", json!({ "session_id": id, "passes": 0 }))
+        .await;
+    assert_eq!(bad["ok"], false, "{bad}");
+    let plan = mcp
+        .call(
+            "pcb_autoroute_plan",
+            json!({ "session_id": id, "passes": 20, "time_limit_s": 180 }),
+        )
+        .await;
+    println!(
+        "AUTOROUTE PLAN router {} session {} replaces {} warnings {}",
+        plan["result"]["router"],
+        plan["result"]["session"]["segments"],
+        plan["result"]["replaces"],
+        plan["result"]["warnings"]
+    );
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["router"]["unrouted"], 0, "{plan}");
+    assert!(plan["result"]["session"]["segments"].as_u64().unwrap() > 10, "{plan}");
+    assert_eq!(plan["result"]["replaces"]["tracks"], 1, "the hand-made track: {plan}");
+    // Planning changed nothing.
+    let tracks = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    assert_eq!(tracks["result"]["track_count"], 1, "{tracks}");
+
+    let applied = apply_board(&mut mcp, &id, &plan, &key("import")).await;
+    println!(
+        "AUTOROUTE APPLY verified {} drc {} problems {}",
+        applied["result"]["verified"],
+        json!({ "unrouted": [applied["result"]["drc"]["unrouted_before"], applied["result"]["drc"]["unrouted_after"]], "errors": [applied["result"]["drc"]["errors_before"], applied["result"]["drc"]["errors_after"]], "by_type": applied["result"]["drc"]["after"]["by_type"] }),
+        applied["result"]["problems"]
+    );
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["drc"]["unrouted_after"], 0, "{applied}");
+    let after = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
+    assert_eq!(
+        before["result"]["footprints"], after["result"]["footprints"],
+        "no footprint moved"
+    );
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let again = apply_board(&mut mcp, &id, &plan, &key("again")).await;
+    assert_eq!(again["ok"], false, "a plan is applied once: {again}");
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let text = std::fs::read_to_string(&pcb).unwrap();
+    assert!(text.matches("(segment").count() > 10, "the routes are saved");
+}
+
+/// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows
+/// the router's result. Open a **copy** of a placed board in the PCB Editor, press "KiCad AI:
+/// connect" there, then run with THINGSVU_GUI_PCB_AUTOROUTE=1 and THINGSVU_FREEROUTING_JAR.
+#[tokio::test]
+async fn gui_pcb_autoroute_demo() {
+    if std::env::var("THINGSVU_GUI_PCB_AUTOROUTE").as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: set THINGSVU_GUI_PCB_AUTOROUTE=1 and THINGSVU_FREEROUTING_JAR with a registered KiCad PCB editor"
+        );
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let plan = mcp.call("pcb_autoroute_plan", json!({ "session_id": id })).await;
+    println!(
+        "GUI AUTOROUTE PLAN router {} session {} replaces {} warnings {}",
+        plan["result"]["router"]["unrouted"],
+        plan["result"]["session"]["segments"],
+        plan["result"]["replaces"],
+        plan["result"]["warnings"]
+    );
+    assert_eq!(plan["ok"], true, "{plan}");
+    let applied = apply_board(
+        &mut mcp,
+        &id,
+        &plan,
+        &format!("gui-pcb-autoroute-{}", std::process::id()),
+    )
+    .await;
+    println!(
+        "GUI AUTOROUTE APPLY verified {} unrouted {} -> {}, errors {} -> {}, problems {}",
+        applied["result"]["verified"],
+        applied["result"]["drc"]["unrouted_before"],
+        applied["result"]["drc"]["unrouted_after"],
+        applied["result"]["drc"]["errors_before"],
+        applied["result"]["drc"]["errors_after"],
+        applied["result"]["problems"]
+    );
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: the board is routed; Ctrl+Z undoes KiCad's import");
 }

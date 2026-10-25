@@ -112,6 +112,14 @@ Add to `.vscode/mcp.json` in your workspace:
 
 Add `"--read-only"` to the arguments to let the assistant look but never change anything.
 
+**Optional autorouter.** If you have [Freerouting](https://github.com/freerouting/freerouting) (2.x) and Java installed, point the server at them to let the assistant route a whole board:
+
+```json
+"args": ["--freerouting-jar", "D:/tools/freerouter/freerouting-2.5.0.jar", "--java", "D:/jdk/bin/java.exe"]
+```
+
+(or set `THINGSVU_FREEROUTING_JAR` and `THINGSVU_JAVA`). Without it, autorouting is simply unavailable; the installer never downloads it. Freerouting runs as a separate process for each plan, with its GUI, API server, and usage reporting turned off, so nothing leaves your machine.
+
 ### 4. Try it
 
 Ask your assistant:
@@ -166,7 +174,13 @@ Between two pads the assistant finds a simple path (straight, 45°, or an L) on 
 
 > Pour ground on both layers, with thermal reliefs, and tell me which connections are still missing.
 
-The pour covers the board (or an area you give) at your net class's clearance; the plan lists the pads it should connect, applying refills it and runs DRC before and after. An optional external autorouter comes later in Phase 12.
+The pour covers the board (or an area you give) at your net class's clearance; the plan lists the pads it should connect, applying refills it and runs DRC before and after.
+
+With Freerouting configured (see the setup above), the whole board can be routed at once:
+
+> Autoroute the board and tell me if anything is left.
+
+The plan runs Freerouting on a snapshot of the board and shows its result (unrouted connections, tracks per net, the unlocked tracks it would replace) before anything changes; applying imports it into KiCad and checks that no part moved and DRC is no worse. Lock the tracks you want to keep.
 
 To get a schematic ready to order parts:
 
@@ -229,6 +243,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_move_plan` | Move, turn, flip, and lock named footprints (places on a grid, exact offsets); shows overlaps before and after; applied with `pcb_apply_plan`, every pad read back |
 | `pcb_route_plan` | Tracks and vias for named nets, pad to pad or through given points, at the net class width; checked against other nets' copper and the edge; DRC before and after applying |
 | `pcb_zone_plan` | Copper pours (ground first) over the board or an area, with clearance, minimum width, and thermal reliefs; refilled after applying, DRC before and after |
+| `pcb_autoroute_plan` | Route the whole board with Freerouting (optional, when configured): the router's result first, then KiCad's import, checked with DRC before and after |
 | `pcb_place_plan` | Place the footprints inside the outline (main IC central, connectors on edges, decoupling beside its pins, no overlaps), with hints keep, place, near, edge, groups, side, only; measured before and after; applied with `pcb_apply_plan` |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |

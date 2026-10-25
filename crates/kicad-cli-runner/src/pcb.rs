@@ -93,6 +93,31 @@ pub async fn run_drc(
 
 /// Renders the board in 3D to a PNG at `output`. Needs a KiCad 11-series CLI. `side` is one of
 /// `top`, `bottom`, `left`, `right`, `front`, `back`.
+/// Writes `board` as a Specctra DSN file for an autorouter (KiCad 10.99 and later).
+pub async fn export_specctra(
+    install: &KicadInstall,
+    board: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    let args: Vec<OsString> = vec![
+        "pcb".into(),
+        "export".into(),
+        "specctra".into(),
+        "--output".into(),
+        output.into(),
+        board.into(),
+    ];
+    check(run(&install.cli, &args, timeout).await?, board)?;
+    if !output.is_file() {
+        return Err(CliError::BadReport {
+            path: output.to_owned(),
+            detail: "no DSN file was written".into(),
+        });
+    }
+    Ok(())
+}
+
 pub async fn render_png(
     install: &KicadInstall,
     board: &Path,

@@ -8,6 +8,7 @@
 
 pub mod erc;
 pub mod export;
+pub mod freerouting;
 pub mod install;
 pub mod netlist;
 pub mod pcb;

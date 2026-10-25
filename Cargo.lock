@@ -486,6 +486,7 @@ name = "kicad-sexpr"
 version = "0.6.0"
 dependencies = [
  "kicad-domain",
+ "serde",
  "thiserror",
  "uuid",
 ]

@@ -1067,3 +1067,39 @@ impl BoardSession {
         Ok(out)
     }
 }
+
+/// What importing a routed session did.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionImport {
+    /// Session items KiCad could not place (unknown reference, layer, or padstack).
+    pub skipped: u32,
+    pub report: String,
+}
+
+impl BoardSession {
+    /// Imports a routed Specctra session: KiCad deletes the unlocked tracks and vias and adds the
+    /// session's. KiCad makes it one change of its own.
+    pub async fn import_session(&self, path: &std::path::Path) -> Result<SessionImport, ToolError> {
+        use kicad_ipc::proto::kiapi::board::commands::{ImportSpecctraSession, ImportSpecctraSessionResponse};
+        let ipc = self.ipc.as_ref().ok_or_else(|| {
+            ToolError::new(
+                ErrorCode::FeatureUnavailable,
+                "autorouting needs a live KiCad 11 session (headless or gui)",
+            )
+        })?;
+        let mut ipc = ipc.lock().await;
+        let document = ipc.document.clone();
+        let r: ImportSpecctraSessionResponse = ipc
+            .client
+            .call(&ImportSpecctraSession {
+                board: Some(document),
+                session_path: path.display().to_string(),
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        Ok(SessionImport {
+            skipped: r.skipped_count,
+            report: r.report,
+        })
+    }
+}

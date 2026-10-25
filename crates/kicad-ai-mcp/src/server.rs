@@ -40,6 +40,8 @@ pub struct Options {
     pub session: SessionConfig,
     /// Reject every tool that changes a schematic or writes files into a project.
     pub read_only: bool,
+    /// The optional external autorouter; none unless configured.
+    pub freerouting: Option<kicad_cli_runner::freerouting::Freerouting>,
 }
 
 struct State {

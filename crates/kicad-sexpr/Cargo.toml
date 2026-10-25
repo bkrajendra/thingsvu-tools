@@ -9,5 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 kicad-domain = { path = "../kicad-domain" }
+serde.workspace = true
 thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }

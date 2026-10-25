@@ -8,13 +8,18 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = r"usage: kicad-ai-mcp [--kicad-cli <path>]... [--read-only] [--log-dir <path>] [--no-log-file]
+const USAGE: &str = r"usage: kicad-ai-mcp [--kicad-cli <path>]... [--read-only] [--freerouting-jar <path>] [--java <path>]
+                    [--log-dir <path>] [--no-log-file]
 
 MCP server for KiCad over stdio. Logs go to stderr and to a daily rotating file (the last 7 days
 are kept); set RUST_LOG to change the level.
 
   --kicad-cli <path>   kicad-cli to prefer over automatic discovery (repeatable)
   --read-only          refuse every tool that changes a schematic or writes into a project
+  --freerouting-jar <path>
+                       Freerouting jar for pcb_autoroute_plan (or $THINGSVU_FREEROUTING_JAR);
+                       autorouting is off without it
+  --java <path>        Java for Freerouting (or $THINGSVU_JAVA, $JAVA_HOME, java on the PATH)
   --log-dir <path>     folder for log files (default: %LOCALAPPDATA%\thingsvu\kicad-ai\logs,
                        or $THINGSVU_LOG_DIR)
   --no-log-file        log to stderr only
@@ -28,6 +33,7 @@ const LOG_DAYS: usize = 7;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = Options::default();
     let mut log_dir = Some(kicad_session::registry::log_dir());
+    let (mut router_jar, mut java) = (None, None);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -35,6 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .configured_cli
                 .push(PathBuf::from(args.next().ok_or("--kicad-cli needs a path")?)),
             "--read-only" => options.read_only = true,
+            "--freerouting-jar" => {
+                router_jar = Some(PathBuf::from(args.next().ok_or("--freerouting-jar needs a path")?))
+            }
+            "--java" => java = Some(PathBuf::from(args.next().ok_or("--java needs a path")?)),
             "--log-dir" => log_dir = Some(PathBuf::from(args.next().ok_or("--log-dir needs a path")?)),
             "--no-log-file" => log_dir = None,
             "--help" | "-h" => {
@@ -48,6 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument '{other}'\n\n{USAGE}").into()),
         }
     }
+
+    options.freerouting = kicad_cli_runner::freerouting::Freerouting::configured(router_jar, java);
 
     // stdout is reserved for MCP messages. A log folder that cannot be used is not fatal: the
     // server still runs and logs to stderr.
@@ -89,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         read_only = options.read_only,
+        freerouting = ?options.freerouting.as_ref().map(|f| f.jar.display().to_string()),
         log_dir = ?log_dir,
         "kicad-ai-mcp starting on stdio"
     );
