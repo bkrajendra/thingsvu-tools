@@ -19,6 +19,17 @@ if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'thingsvu\kicad-ai' 
 if (-not $DocumentsDir) { $DocumentsDir = [Environment]::GetFolderPath('MyDocuments') }
 if (-not $ClaudeDesktopConfig) { $ClaudeDesktopConfig = Join-Path $env:APPDATA 'Claude\claude_desktop_config.json' }
 
+# Runs a program and returns its exit code. Windows PowerShell 5.1 turns anything a program writes
+# to stderr into an error when $ErrorActionPreference is 'Stop', even for a harmless message such as
+# "No MCP server named ... in user scope"; only the exit code says whether it worked.
+function Invoke-Native {
+    param([string]$File, [string[]]$Arguments)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $File @Arguments 2>&1 | Out-Null; return $LASTEXITCODE }
+    finally { $ErrorActionPreference = $previous }
+}
+
 function Ask($question) {
     if ($Yes) { return $true }
     try { $a = Read-Host "$question [Y/n]"; return ($a -eq '' -or $a -match '^[yY]') }
@@ -43,7 +54,7 @@ if (Test-Path $DataDir) {
 # AI assistants.
 if ($Clients -contains 'ClaudeCode' -and (Get-Command claude -ErrorAction SilentlyContinue)) {
     if (Ask 'Remove the KiCad tools from Claude Code?') {
-        & claude mcp remove kicad-ai --scope user *> $null
+        $null = Invoke-Native 'claude' @('mcp', 'remove', 'kicad-ai', '--scope', 'user')
         Write-Host 'Claude Code: removed "kicad-ai" (if it was there).'
     }
 }

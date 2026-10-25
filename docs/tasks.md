@@ -277,3 +277,7 @@ Findings during the work (kept for the record):
 **Attention — please try on the live editor:** I could not drive your KiCad GUI. Open a **copy** of a design in the nightly Schematic Editor, press **KiCad AI: connect**, and run `THINGSVU_GUI_TIDY=1 cargo test -p kicad-ai-mcp --test stdio gui_tidy_demo -- --nocapture` (or ask the assistant to review and tidy it). It prints the review, the plan counts, the result, and ERC before and after; Ctrl+Z twice undoes it. The same code path was verified live on the headless server with the same API.
 
 - **Decision:** the version is now **0.2.0**, so this push publishes release `v0.2.0` (a pre-release) with the new tools.
+
+Installer fixes (25 Oct 2026, **v0.2.1**), found by the project owner installing for real:
+- **`claude mcp remove` stopped the install.** It writes "No MCP server named …" to stderr when nothing is registered yet, and Windows PowerShell 5.1 turns stderr into an error under `$ErrorActionPreference = 'Stop'`. Programs are now run through a helper that looks only at the exit code. `test-installer.ps1` has a stand-in `claude` that behaves like the real one, so CI catches this.
+- **"No release found"** came from running the one-line install in the minutes between a push and its release being published. The message now says so and where to download from; the release list is also read defensively.

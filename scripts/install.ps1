@@ -35,6 +35,17 @@ if (-not $InstallDir) { $InstallDir = Join-Path $env:LOCALAPPDATA 'thingsvu\kica
 if (-not $DocumentsDir) { $DocumentsDir = [Environment]::GetFolderPath('MyDocuments') }
 if (-not $ClaudeDesktopConfig) { $ClaudeDesktopConfig = Join-Path $env:APPDATA 'Claude\claude_desktop_config.json' }
 
+# Runs a program and returns its exit code. Windows PowerShell 5.1 turns anything a program writes
+# to stderr into an error when $ErrorActionPreference is 'Stop', even for a harmless message such as
+# "No MCP server named ... in user scope"; only the exit code says whether it worked.
+function Invoke-Native {
+    param([string]$File, [string[]]$Arguments)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $File @Arguments 2>&1 | Out-Null; return $LASTEXITCODE }
+    finally { $ErrorActionPreference = $previous }
+}
+
 function Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 function Ask($question) {
     if ($Yes) { return $true }
@@ -58,13 +69,15 @@ else {
     $api = "https://api.github.com/repos/$Repository/releases"
     if ($Version -eq 'latest') {
         # /releases/latest skips pre-releases, which every 0.x release is.
-        $release = Invoke-RestMethod "${api}?per_page=10" -Headers $headers | Where-Object { -not $_.draft } | Select-Object -First 1
+        $release = @(Invoke-RestMethod "${api}?per_page=10" -Headers $headers) | Where-Object { -not $_.draft } | Select-Object -First 1
     }
     else {
         $tag = if ($Version.StartsWith('v')) { $Version } else { "v$Version" }
         $release = Invoke-RestMethod "$api/tags/$tag" -Headers $headers
     }
-    if (-not $release) { throw "No release found in $Repository." }
+    if (-not $release) {
+        throw "No published release found in $Repository yet. A release appears a few minutes after a new version is pushed; try again shortly, or download the zip from https://github.com/$Repository/releases."
+    }
     $zipAsset = $release.assets | Where-Object { $_.name -like '*-windows-x64.zip' } | Select-Object -First 1
     $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1
     if (-not $zipAsset -or -not $sumsAsset) { throw "Release $($release.tag_name) has no Windows package." }
@@ -142,9 +155,10 @@ if (-not $SkipClients) {
             Write-Host 'Claude Code: not found on PATH (skipping).'
         }
         elseif (Ask 'Add the KiCad tools to Claude Code?') {
-            & claude mcp remove kicad-ai --scope user *> $null
-            & claude mcp add --scope user kicad-ai -- $mcp
-            if ($LASTEXITCODE -eq 0) { $configured += 'Claude Code'; Write-Host 'Claude Code: added "kicad-ai".' }
+            # Replace an earlier entry; it is fine if there was none.
+            $null = Invoke-Native 'claude' @('mcp', 'remove', 'kicad-ai', '--scope', 'user')
+            $code = Invoke-Native 'claude' @('mcp', 'add', '--scope', 'user', 'kicad-ai', '--', $mcp)
+            if ($code -eq 0) { $configured += 'Claude Code'; Write-Host 'Claude Code: added "kicad-ai".' }
             else { Write-Warning 'Claude Code: "claude mcp add" failed; add it by hand (see the README).' }
         }
     }

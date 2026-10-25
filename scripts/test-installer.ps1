@@ -63,6 +63,36 @@ try {
     Check ((Get-Content $desktop -Raw) -eq 'not json {') 'it is not overwritten'
     [IO.File]::WriteAllText($desktop, ($cfg | ConvertTo-Json -Depth 20))
 
+    Write-Host 'Claude Code (a stand-in that behaves like the real one)'
+    # The real `claude mcp remove` writes to stderr and fails when there is nothing to remove; that
+    # must not stop the installer (Windows PowerShell 5.1 turns stderr into an error).
+    $fake = Join-Path $sandbox 'fakeclaude'
+    New-Item -ItemType Directory $fake | Out-Null
+    $log = Join-Path $fake 'calls.txt'
+    $cmd = @(
+        '@echo off',
+        'echo %* >> "%~dp0calls.txt"',
+        'if "%2"=="remove" (',
+        '  echo No MCP server named "kicad-ai" in user scope 1>&2',
+        '  exit /b 1',
+        ')',
+        'exit /b 0'
+    )
+    Set-Content (Join-Path $fake 'claude.cmd') $cmd -Encoding ascii
+    $savedPath = $env:PATH
+    $env:PATH = "$fake;$env:PATH"
+    try {
+        $text = Run-Script (Join-Path $package 'install.ps1') @('-Yes', '-InstallDir', "$data\bin", '-DocumentsDir', $documents, '-Clients', 'ClaudeCode')
+        Check ($text -match 'Claude Code: added') 'the installer carries on after "remove" fails and adds the entry'
+        $calls = Get-Content $log -Raw
+        Check ($calls -match 'mcp add --scope user kicad-ai -- ') 'with the right command'
+        Check ($calls -match [regex]::Escape("$data\bin\kicad-ai-mcp.exe")) 'pointing at the installed server'
+        Remove-Item $log
+        Run-Script (Join-Path $package 'uninstall.ps1') @('-Yes', '-DataDir', "$sandbox\nothing", '-DocumentsDir', $documents, '-Clients', 'ClaudeCode') | Out-Null
+        Check ((Get-Content $log -Raw) -match 'mcp remove kicad-ai --scope user') 'the uninstaller removes it, and an empty "remove" is not an error'
+    }
+    finally { $env:PATH = $savedPath }
+
     Write-Host 'Uninstall'
     Run-Script (Join-Path $package 'uninstall.ps1') @('-Yes', '-DataDir', $data, '-DocumentsDir', $documents, '-Clients', 'ClaudeDesktop', '-ClaudeDesktopConfig', $desktop) | Out-Null
     Check (-not (Test-Path $data)) 'the server and its data are removed'
