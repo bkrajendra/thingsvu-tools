@@ -128,21 +128,21 @@ pub struct LayoutOutput {
 }
 
 /// Collects drawing primitives and counts connections per point for junctions.
-#[derive(Default)]
-struct Drawing {
-    wires: Vec<(String, Point, Point)>,
-    labels: Vec<(String, Point, Dir)>,
-    power: Vec<(String, Point, Dir)>,
+#[derive(Default, Clone)]
+pub(crate) struct Drawing {
+    pub(crate) wires: Vec<(String, Point, Point)>,
+    pub(crate) labels: Vec<(String, Point, Dir)>,
+    pub(crate) power: Vec<(String, Point, Dir)>,
     /// Connection ends per point: wire ends, pins, power-symbol pins.
-    ends: BTreeMap<(i64, i64), u32>,
+    pub(crate) ends: BTreeMap<(i64, i64), u32>,
 }
 
 impl Drawing {
-    fn end(&mut self, p: Point) {
+    pub(crate) fn end(&mut self, p: Point) {
         *self.ends.entry((p.x.0, p.y.0)).or_default() += 1;
     }
 
-    fn wire(&mut self, net: &str, a: Point, b: Point) {
+    pub(crate) fn wire(&mut self, net: &str, a: Point, b: Point) {
         if a != b {
             self.wires.push((net.to_owned(), a, b));
             self.end(a);
@@ -151,7 +151,7 @@ impl Drawing {
     }
 
     /// A path through consecutive points.
-    fn path(&mut self, net: &str, points: &[Point]) {
+    pub(crate) fn path(&mut self, net: &str, points: &[Point]) {
         for w in points.windows(2) {
             self.wire(net, w[0], w[1]);
         }
@@ -159,7 +159,7 @@ impl Drawing {
 
     /// Would a wire of `net` from `a` to `b` connect to anything of another net? Touching a pin
     /// or wire end, or running along another wire, connects in KiCad; a plain crossing does not.
-    fn touches_other_net(&self, net: &str, a: Point, b: Point, pins: &[(String, Point)]) -> bool {
+    pub(crate) fn touches_other_net(&self, net: &str, a: Point, b: Point, pins: &[(String, Point)]) -> bool {
         pins.iter().any(|(n, p)| n != net && on_segment(*p, a, b))
             || self.wires.iter().any(|(n, c, d)| {
                 n != net
@@ -168,7 +168,7 @@ impl Drawing {
             || self.power.iter().any(|(n, p, _)| n != net && on_segment(*p, a, b))
     }
 
-    fn path_is_free(&self, net: &str, points: &[Point], pins: &[(String, Point)]) -> bool {
+    pub(crate) fn path_is_free(&self, net: &str, points: &[Point], pins: &[(String, Point)]) -> bool {
         points
             .windows(2)
             .all(|w| !self.touches_other_net(net, w[0], w[1], pins))
@@ -177,14 +177,14 @@ impl Drawing {
 }
 
 /// Is `p` on the axis-aligned segment a–b (ends included)?
-fn on_segment(p: Point, a: Point, b: Point) -> bool {
+pub(crate) fn on_segment(p: Point, a: Point, b: Point) -> bool {
     let (lo_x, hi_x) = (a.x.min(b.x), a.x.max(b.x));
     let (lo_y, hi_y) = (a.y.min(b.y), a.y.max(b.y));
     (a.x == b.x || a.y == b.y) && p.x >= lo_x && p.x <= hi_x && p.y >= lo_y && p.y <= hi_y
 }
 
 /// Rotation that makes a symbol pointing `default` point `want` instead.
-fn rotation_towards(default: Dir, want: Dir) -> Orientation {
+pub(crate) fn rotation_towards(default: Dir, want: Dir) -> Orientation {
     [0u16, 90, 180, 270]
         .into_iter()
         .map(|deg| Orientation {
@@ -800,6 +800,31 @@ fn layout_chain(
             orientation: part.orientation,
         });
     }
+    operations.extend(drawing_operations(&drawing, library, taken));
+
+    for name in &fallback_nets {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "NET_DRAWN_WITH_LABELS",
+            message: format!("net '{name}' could not be wired cleanly and is joined by labels"),
+            objects: vec![name.clone()],
+        });
+    }
+    LayoutOutput {
+        operations,
+        findings,
+        fallback_nets,
+    }
+}
+
+/// The power symbols, wires, labels, and junctions of a drawing, as operations. Power symbols take
+/// the next free reference of their prefix from `taken`.
+pub(crate) fn drawing_operations(
+    drawing: &Drawing,
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    taken: &mut BTreeSet<String>,
+) -> Vec<Operation> {
+    let mut operations = Vec::new();
     for (net, at, facing) in &drawing.power {
         let Some(symbol) = power_symbol(library, net) else {
             continue;
@@ -841,20 +866,7 @@ fn layout_chain(
             });
         }
     }
-
-    for name in &fallback_nets {
-        findings.push(Finding {
-            severity: Severity::Warning,
-            code: "NET_DRAWN_WITH_LABELS",
-            message: format!("net '{name}' could not be wired cleanly and is joined by labels"),
-            objects: vec![name.clone()],
-        });
-    }
-    LayoutOutput {
-        operations,
-        findings,
-        fallback_nets,
-    }
+    operations
 }
 
 /// A part with at least this many pins on non-ground nets is laid out as a hub (an IC with
@@ -1148,7 +1160,12 @@ fn on_segment_inside(r: Rect, a: Point, b: Point) -> bool {
 }
 
 /// The body of the power symbol for `net` with its pin at `at`, facing `facing`.
-fn power_body(library: &BTreeMap<LibraryId, LibrarySymbol>, net: &str, at: Point, facing: Dir) -> Option<Rect> {
+pub(crate) fn power_body(
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    net: &str,
+    at: Point,
+    facing: Dir,
+) -> Option<Rect> {
     let symbol = power_symbol(library, net)?;
     let pin = symbol.pins.first()?;
     let o = rotation_towards(pin.outward.opposite(), facing);

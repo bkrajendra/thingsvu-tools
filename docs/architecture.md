@@ -82,7 +82,7 @@ flowchart LR
 
 | Crate | Responsibility | Must not |
 |---|---|---|
-| `kicad-domain` | Circuit spec, validation, geometry, plans and their operations, the layout engine and its readability checks, the tidy planner for existing designs, capability and result types | Depend on a transport, KiCad, or the file system |
+| `kicad-domain` | Circuit spec, validation, geometry, plans and their operations, the layout engine and its readability checks, the tidy planner, the arrange planner, and the router for existing designs, capability and result types | Depend on a transport, KiCad, or the file system |
 | `kicad-ipc` | KiCad's protobuf API (vendored protos), the NNG `ipc` transport written in Rust, request deadlines, status mapping | Leak protobuf types upward |
 | `kicad-cli-runner` | Finds KiCad installs; runs `kicad-cli` with fixed argument arrays (ERC, netlist, PNG); parses reports | Use a shell, or treat exit code 0 as proof of correctness |
 | `kicad-sexpr` | Parses KiCad files keeping source positions; reads symbol libraries and schematics; writes a plan into a schematic by editing only the text the plan names (inserting new items, deleting old ones, changing a symbol's numbers) | Re-print a file; change its format version |
@@ -192,6 +192,20 @@ flowchart LR
     LAYOUT --> DIFF["Plan<br/>moves, removals, additions<br/>identical items cancel out"]
     DIFF --> REVIEW["User reviews it<br/>before and after readability"]
     REVIEW --> APPLY["sch_apply_plan<br/>nets must be identical,<br/>ERC no worse"]
+```
+
+### Placing parts by hand, then reconnecting
+
+Moving parts and drawing the connections are separate steps, so an assistant can place everything where it belongs and wire once. `sch_arrange_plan` changes only the named parts (wires stay and break); the server remembers the nets KiCad reported just before the first such change; `sch_reconnect_plan` then removes the old wiring and draws it again around the parts where they are, with a router that never crosses a part or touches another net (and falls back to labels). The same router draws the wires when `sch_tidy_plan` is given layout hints.
+
+```mermaid
+flowchart LR
+    DESCRIBE["sch_describe_layout<br/>positions, bodies, pins, nets"] --> ARRANGE["sch_arrange_plan<br/>move, turn, mirror, delete<br/>(wires stay and break)"]
+    ARRANGE -->|"apply: nets remembered<br/>from just before"| BROKEN["Parts in place,<br/>connections broken"]
+    BROKEN --> RECONNECT["sch_reconnect_plan<br/>router: stubs, power symbols,<br/>wires around parts, labels as fallback"]
+    RECONNECT --> VERIFY["sch_apply_plan<br/>nets must match the remembered circuit"]
+    HINTS["sch_tidy_plan hints<br/>keep, place, near"] --> ROUTER["Layout engine places the rest,<br/>router draws the wires"]
+    ROUTER --> VERIFY
 ```
 
 How the three providers apply it:

@@ -109,6 +109,8 @@ pub enum RemovedKind {
     Junction,
     /// A power symbol that only names a net (`#PWR…`); the plan draws it again where it belongs.
     PowerSymbol,
+    /// A part the user asked to delete.
+    Symbol,
 }
 
 /// An existing drawing item the plan deletes.

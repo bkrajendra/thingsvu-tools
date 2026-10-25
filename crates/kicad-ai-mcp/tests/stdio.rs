@@ -105,12 +105,15 @@ async fn lists_tools_and_returns_envelopes() {
         names,
         [
             "sch_apply_plan",
+            "sch_arrange_plan",
             "sch_create_demo_circuit",
+            "sch_describe_layout",
             "sch_export_netlist",
             "sch_get_netlist",
             "sch_get_symbol_pins",
             "sch_list_symbols",
             "sch_plan_changes",
+            "sch_reconnect_plan",
             "sch_render",
             "sch_review",
             "sch_run_erc",
@@ -679,6 +682,175 @@ async fn live_review_tidy_and_set_field_through_mcp() {
     );
 }
 
+/// Place parts by hand, let the wires break, then wire everything again: the circuit must come
+/// out the same, and no part moves in the second step.
+#[tokio::test]
+async fn live_arrange_then_reconnect_through_mcp() {
+    arrange_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_arrange_then_reconnect_through_the_api() {
+    arrange_flow("headless").await;
+}
+
+async fn arrange_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-arrange-{provider}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("regulator.kicad_sch");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/v11/regulator-with-notes/regulator.kicad_sch"),
+        &schematic,
+    )
+    .unwrap();
+
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": provider }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    assert_eq!(layout["ok"], true, "{layout}");
+    let parts = layout["result"]["parts"].as_array().unwrap();
+    assert!(parts.len() >= 10, "{layout}");
+    assert!(parts[0]["pins"][0]["x"].is_number(), "{layout}");
+    let nets_before = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    let count_before = nets_before["result"]["nets"].as_array().unwrap().len();
+
+    // Move a few parts far away, turn one, and delete nothing yet.
+    let key = |n: &str| format!("{n}-{}", std::process::id());
+    let arrange = mcp
+        .call(
+            "sch_arrange_plan",
+            json!({ "session_id": id, "edits": [
+                { "reference": "C1", "x_mm": 200.0, "y_mm": 40.0 },
+                { "reference": "C2", "dx_mm": 30.0, "dy_mm": 20.0, "rotate_deg": 90 },
+                { "reference": "R3", "x_mm": 200.0, "y_mm": 90.0, "mirror": "y" },
+            ] }),
+        )
+        .await;
+    assert_eq!(arrange["ok"], true, "{arrange}");
+    assert_eq!(arrange["result"]["counts"]["moves"], 3, "{arrange}");
+    assert!(arrange["result"]["findings"]
+        .to_string()
+        .contains("ARRANGE_WIRES_LEFT_BEHIND"));
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": arrange["result"]["plan_id"], "confirm": true, "idempotency_key": key("arrange-1") }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["moved"], 3, "{applied}");
+
+    // The circuit is broken now: KiCad no longer sees the nets it had.
+    let broken = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    let moved_pins_net = |v: &serde_json::Value| {
+        v["result"]["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["pins"].to_string().contains("\"C1\""))
+            .count()
+    };
+    println!("nets with C1 before reconnect: {}", moved_pins_net(&broken));
+
+    let reconnect = mcp.call("sch_reconnect_plan", json!({ "session_id": id })).await;
+    assert_eq!(reconnect["ok"], true, "{reconnect}");
+    assert_eq!(reconnect["result"]["can_apply"], true, "{reconnect}");
+    assert_eq!(reconnect["result"]["counts"]["moves"], 0, "{reconnect}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": reconnect["result"]["plan_id"], "confirm": true, "idempotency_key": key("reconnect-1") }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+
+    let nets_after = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert_eq!(nets_after["result"]["unconnected_pins"], 0, "{nets_after}");
+    assert_eq!(nets_after["result"]["nets"].as_array().unwrap().len(), count_before);
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!(
+        "ERC after arrange + reconnect: {} errors, {} warnings",
+        erc["result"]["errors"], erc["result"]["warnings"]
+    );
+
+    // A tidy starts from a saved document (so that a failure can be reverted).
+    let saved = mcp.call("sch_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+
+    // Hints: keep C1 where it was put, and the rest is laid out around it.
+    let tidy = mcp
+        .call(
+            "sch_tidy_plan",
+            json!({ "session_id": id, "keep": ["C1"], "near": [{ "reference": "C2", "to": "C1", "side": "right", "gap_mm": 10.0 }] }),
+        )
+        .await;
+    assert_eq!(tidy["ok"], true, "{tidy}");
+    assert_eq!(tidy["result"]["can_apply"], true, "{tidy}");
+    assert!(
+        !tidy["result"]["moves"].to_string().contains("\"C1\""),
+        "a kept part does not move: {tidy}"
+    );
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": tidy["result"]["plan_id"], "confirm": true, "idempotency_key": key("hints-1") }),
+        )
+        .await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+
+    // Delete a part, then wire the rest again: the other parts keep their nets.
+    let saved = mcp.call("sch_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let delete = mcp
+        .call("sch_arrange_plan", json!({ "session_id": id, "delete": ["C2"] }))
+        .await;
+    assert_eq!(delete["result"]["counts"]["removals"], 1, "{delete}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": delete["result"]["plan_id"], "confirm": true, "idempotency_key": key("delete-1") }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let reconnect = mcp.call("sch_reconnect_plan", json!({ "session_id": id })).await;
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": reconnect["result"]["plan_id"], "confirm": true, "idempotency_key": key("delete-2") }),
+        )
+        .await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert!(
+        !symbols["result"]["symbols"].to_string().contains("\"C2\""),
+        "C2 is gone"
+    );
+
+    // A bad request is refused, and an unknown part named.
+    let bad = mcp
+        .call(
+            "sch_arrange_plan",
+            json!({ "session_id": id, "edits": [{ "reference": "R99", "dx_mm": 1.0 }] }),
+        )
+        .await;
+    assert_eq!(bad["result"]["can_apply"], false, "{bad}");
+}
+
 #[tokio::test]
 async fn read_only_mode_refuses_changes() {
     let mut mcp = Mcp::start_with(&["--read-only"]).await;
@@ -839,4 +1011,71 @@ async fn gui_tidy_demo() {
     let closed = mcp.call("session_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: look at the editor; Ctrl+Z twice undoes the tidy");
+}
+
+/// Against a real KiCad 11 editor: move two parts, let their wires break, wire everything again.
+/// Open a **copy** of a design, press "KiCad AI: connect", then run with THINGSVU_GUI_ARRANGE=1.
+/// Ctrl+Z in the editor undoes each step.
+#[tokio::test]
+async fn gui_arrange_demo() {
+    if std::env::var("THINGSVU_GUI_ARRANGE").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_ARRANGE=1 with a registered KiCad editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("session_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let layout = mcp.call("sch_describe_layout", json!({ "session_id": id })).await;
+    let parts = layout["result"]["parts"].as_array().unwrap();
+    let movable: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| p["reference"].as_str())
+        .filter(|r| !r.starts_with('#'))
+        .take(2)
+        .collect();
+    println!("GUI ARRANGE moving {movable:?}");
+    let erc_before = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    let edits: Vec<_> = movable
+        .iter()
+        .map(|r| json!({ "reference": r, "dx_mm": 25.4, "dy_mm": 12.7 }))
+        .collect();
+    let plan = mcp
+        .call("sch_arrange_plan", json!({ "session_id": id, "edits": edits }))
+        .await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("gui-arrange-{}", std::process::id()) }),
+        )
+        .await;
+    println!("GUI ARRANGE APPLY {applied}");
+    assert_eq!(applied["ok"], true, "{applied}");
+
+    let reconnect = mcp.call("sch_reconnect_plan", json!({ "session_id": id })).await;
+    println!(
+        "GUI RECONNECT PLAN counts={} findings={}",
+        reconnect["result"]["counts"], reconnect["result"]["findings"]
+    );
+    assert_eq!(reconnect["result"]["can_apply"], true, "{reconnect}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": reconnect["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("gui-reconnect-{}", std::process::id()) }),
+        )
+        .await;
+    println!("GUI RECONNECT APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let erc_after = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!(
+        "GUI ERC before={} after={}",
+        erc_before["result"]["errors"], erc_after["result"]["errors"]
+    );
+    assert!(erc_after["result"]["errors"].as_u64() <= erc_before["result"]["errors"].as_u64());
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: look at the editor; Ctrl+Z undoes the steps");
 }

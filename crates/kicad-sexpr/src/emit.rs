@@ -454,6 +454,7 @@ pub fn add_plan(
             RemovedKind::Label => ("label", "label"),
             RemovedKind::Junction => ("junction", "junction"),
             RemovedKind::PowerSymbol => ("symbol", "power symbol"),
+            RemovedKind::Symbol => ("symbol", "part"),
         };
         let node = doc
             .item(head, &removal.id)

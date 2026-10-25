@@ -12,8 +12,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::arrange::{mirrored, Mirror};
 use crate::circuit::{CircuitSpec, ComponentSpec, NetSpec, PinRef, SCHEMA_VERSION};
-use crate::geometry::{Nm, Point, GRID};
+use crate::geometry::{Dir, Nm, Point, Rect, GRID};
 use crate::ids::{LibraryId, LogicalId};
 use crate::layout;
 use crate::plan::LibrarySymbol;
@@ -21,6 +22,7 @@ use crate::plan::{
     error, library_findings, readability_findings, ExpectedNet, Operation, OperationPlan, Removal, RemovedKind,
     SymbolMove, MAX_OPERATIONS,
 };
+use crate::reconnect::{self, Placement};
 use crate::schematic::{NetInfo, SchematicDesign};
 use crate::validation::{has_errors, validate_circuit, Finding, Severity};
 
@@ -241,12 +243,85 @@ impl WireIndex {
     }
 }
 
+/// Where the person wants parts to stay when the rest is laid out again.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutHints {
+    /// Parts that stay exactly where they are.
+    pub keep: Vec<String>,
+    /// Parts that go to a given place.
+    pub place: Vec<PlaceHint>,
+    /// Parts that go next to another part.
+    pub near: Vec<NearHint>,
+}
+
+impl LayoutHints {
+    pub fn is_empty(&self) -> bool {
+        self.keep.is_empty() && self.place.is_empty() && self.near.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaceHint {
+    pub reference: String,
+    pub position: Point,
+    /// Counter-clockwise from where the part is now.
+    pub rotate_deg: Option<u16>,
+    pub mirror: Option<Mirror>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NearHint {
+    pub reference: String,
+    pub to: String,
+    /// Which side of `to` the part goes on.
+    pub side: Dir,
+    /// Clear space between the two bodies.
+    pub gap: Nm,
+}
+
+/// How the drawing is made again.
+enum Redraw<'a> {
+    /// The layout engine decides where parts go (except as the hints say).
+    Layout(&'a LayoutHints),
+    /// Parts stay; only their connections are drawn again.
+    Reconnect,
+}
+
 /// Plans the new layout of an existing design. `library` needs the design's own symbols and the
 /// power symbols the layout may use (see [`design_library_ids`] and [`layout::library_ids_for`]).
 pub fn plan_tidy(
     design: &SchematicDesign,
     nets: &[NetInfo],
     library: &BTreeMap<LibraryId, LibrarySymbol>,
+) -> OperationPlan {
+    plan_tidy_with_hints(design, nets, library, &LayoutHints::default())
+}
+
+/// [`plan_tidy`], with parts the person wants in particular places.
+pub fn plan_tidy_with_hints(
+    design: &SchematicDesign,
+    nets: &[NetInfo],
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    hints: &LayoutHints,
+) -> OperationPlan {
+    plan_redraw(design, nets, library, Redraw::Layout(hints))
+}
+
+/// Draws every connection again with the parts where they are. `nets` is the circuit that is
+/// meant, which after moving parts is not what KiCad reads from the drawing.
+pub fn plan_reconnect(
+    design: &SchematicDesign,
+    nets: &[NetInfo],
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+) -> OperationPlan {
+    plan_redraw(design, nets, library, Redraw::Reconnect)
+}
+
+fn plan_redraw(
+    design: &SchematicDesign,
+    nets: &[NetInfo],
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    mode: Redraw,
 ) -> OperationPlan {
     let mut plan = OperationPlan {
         circuit: "tidy".into(),
@@ -307,7 +382,45 @@ pub fn plan_tidy(
 
     // The layout starts from the top left of the sheet, as for a new circuit.
     let mut taken: BTreeSet<String> = plan.references.values().cloned().collect();
-    let mut out = layout::layout(&spec, library, &plan.references, &mut taken, None);
+    let current: BTreeMap<&str, Placement> = design
+        .symbols
+        .iter()
+        .map(|s| {
+            (
+                s.reference.as_str(),
+                Placement {
+                    position: s.position,
+                    orientation: s.orientation,
+                },
+            )
+        })
+        .collect();
+    let mut hint_errors = Vec::new();
+    let mut out = match &mode {
+        Redraw::Layout(hints) if hints.is_empty() => layout::layout(&spec, library, &plan.references, &mut taken, None),
+        Redraw::Layout(hints) => {
+            let base = layout::layout(&spec, library, &plan.references, &mut taken.clone(), None);
+            let placements = hinted_placements(&spec, library, &current, &base.operations, hints, &mut hint_errors);
+            let mut routed = reconnect::route(&spec, library, &plan.references, &placements, &mut taken);
+            routed
+                .findings
+                .extend(base.findings.into_iter().filter(|f| f.code != "NET_DRAWN_WITH_LABELS"));
+            routed
+        }
+        Redraw::Reconnect => {
+            let placements: BTreeMap<LogicalId, Placement> = spec
+                .components
+                .iter()
+                .filter_map(|c| Some((c.id.clone(), *current.get(c.reference_preference.as_deref()?)?)))
+                .collect();
+            reconnect::route(&spec, library, &plan.references, &placements, &mut taken)
+        }
+    };
+    if !hint_errors.is_empty() {
+        findings.extend(hint_errors);
+        plan.findings = findings;
+        return plan;
+    }
     findings.extend(out.findings.clone());
     plan.fallback_nets = out.fallback_nets.clone();
 
@@ -318,8 +431,10 @@ pub fn plan_tidy(
         _ => true,
     });
 
-    // Text notes stay where they are, so the layout moves out of their way (below them).
-    if let Some(drawn) = layout::operations_bounds(&out.operations, library) {
+    // Text notes stay where they are, so the layout moves out of their way (below them). Parts the
+    // person placed, or left in place, are not moved.
+    let free_layout = matches!(&mode, Redraw::Layout(h) if h.is_empty());
+    if let Some(drawn) = layout::operations_bounds(&out.operations, library).filter(|_| free_layout) {
         let mut dy = 0;
         for _ in 0..design.notes.len() + 1 {
             let area = drawn.translate(Point::new(Nm(0), Nm(dy)));
@@ -514,7 +629,7 @@ pub fn plan_tidy(
     }
     plan.operations = additions;
 
-    if design.annotations > 0 {
+    if design.annotations > 0 && free_layout {
         findings.push(Finding {
             severity: Severity::Warning,
             code: "TIDY_ANNOTATIONS_STAY",
@@ -543,6 +658,161 @@ pub fn plan_tidy(
     }
     plan.findings = findings;
     plan
+}
+
+fn body_at(library: &BTreeMap<LibraryId, LibrarySymbol>, id: &LibraryId, at: Placement) -> Option<Rect> {
+    Some(
+        library
+            .get(id)?
+            .body?
+            .transformed(at.orientation)
+            .translate(at.position),
+    )
+}
+
+/// The places of all parts: the layout's, except where the hints say otherwise, and with the
+/// layout's parts moved off the ones the person placed.
+fn hinted_placements(
+    spec: &CircuitSpec,
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    current: &BTreeMap<&str, Placement>,
+    laid_out: &[Operation],
+    hints: &LayoutHints,
+    errors: &mut Vec<Finding>,
+) -> BTreeMap<LogicalId, Placement> {
+    let mut placements: BTreeMap<LogicalId, Placement> = laid_out
+        .iter()
+        .filter_map(|op| match op {
+            Operation::PlaceSymbol {
+                component_id,
+                position,
+                orientation,
+                ..
+            } => Some((
+                component_id.clone(),
+                Placement {
+                    position: *position,
+                    orientation: *orientation,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    let find = |reference: &str| {
+        spec.components
+            .iter()
+            .find(|c| c.reference_preference.as_deref() == Some(reference))
+    };
+    let unknown = |reference: &str, errors: &mut Vec<Finding>| {
+        errors.push(error(
+            "TIDY_HINT_UNKNOWN_PART",
+            format!("the layout hints name {reference}, which is not a part of this sheet"),
+            vec![reference.to_owned()],
+        ));
+    };
+    let mut fixed: BTreeSet<LogicalId> = BTreeSet::new();
+    for reference in &hints.keep {
+        match (find(reference), current.get(reference.as_str())) {
+            (Some(c), Some(&at)) => {
+                placements.insert(c.id.clone(), at);
+                fixed.insert(c.id.clone());
+            }
+            _ => unknown(reference, errors),
+        }
+    }
+    for hint in &hints.place {
+        match (find(&hint.reference), current.get(hint.reference.as_str())) {
+            (Some(c), Some(&now)) => {
+                let mut orientation = now.orientation;
+                if let Some(deg) = hint.rotate_deg {
+                    orientation = crate::arrange::rotated(orientation, deg);
+                }
+                if let Some(mirror) = hint.mirror {
+                    orientation = mirrored(orientation, mirror);
+                }
+                placements.insert(
+                    c.id.clone(),
+                    Placement {
+                        position: hint.position.snap(GRID),
+                        orientation,
+                    },
+                );
+                fixed.insert(c.id.clone());
+            }
+            _ => unknown(&hint.reference, errors),
+        }
+    }
+    for hint in &hints.near {
+        let (Some(c), Some(target)) = (find(&hint.reference), find(&hint.to)) else {
+            let missing = if find(&hint.reference).is_none() {
+                &hint.reference
+            } else {
+                &hint.to
+            };
+            unknown(missing, errors);
+            continue;
+        };
+        let (Some(&own), Some(&other)) = (placements.get(&c.id), placements.get(&target.id)) else {
+            continue;
+        };
+        let at_origin = Placement {
+            position: Point::default(),
+            ..own
+        };
+        let (Some(own_body), Some(target_body)) = (
+            body_at(library, &c.library_id, at_origin),
+            body_at(library, &target.library_id, other),
+        ) else {
+            continue;
+        };
+        let centre = |r: Rect| Point::new(Nm((r.min.x.0 + r.max.x.0) / 2), Nm((r.min.y.0 + r.max.y.0) / 2));
+        let (own_mid, target_mid) = (centre(own_body), centre(target_body));
+        let position = match hint.side {
+            Dir::Right => Point::new(target_body.max.x + hint.gap - own_body.min.x, target_mid.y - own_mid.y),
+            Dir::Left => Point::new(target_body.min.x - hint.gap - own_body.max.x, target_mid.y - own_mid.y),
+            Dir::Down => Point::new(target_mid.x - own_mid.x, target_body.max.y + hint.gap - own_body.min.y),
+            Dir::Up => Point::new(target_mid.x - own_mid.x, target_body.min.y - hint.gap - own_body.max.y),
+        };
+        placements.insert(
+            c.id.clone(),
+            Placement {
+                position: position.snap(GRID),
+                orientation: own.orientation,
+            },
+        );
+        fixed.insert(c.id.clone());
+    }
+
+    // Parts the layout placed must not sit on the ones that were placed by hand.
+    let step = Nm(5 * GRID.0);
+    for c in &spec.components {
+        if fixed.contains(&c.id) {
+            continue;
+        }
+        for _ in 0..200 {
+            let Some(&at) = placements.get(&c.id) else { break };
+            let Some(body) = body_at(library, &c.library_id, at).map(|b| b.inflate(Nm(2 * GRID.0))) else {
+                break;
+            };
+            let blocked = spec.components.iter().filter(|o| o.id != c.id).any(|o| {
+                placements
+                    .get(&o.id)
+                    .and_then(|&p| body_at(library, &o.library_id, p))
+                    .is_some_and(|r| r.overlaps(body))
+            });
+            if !blocked {
+                break;
+            }
+            placements.insert(
+                c.id.clone(),
+                Placement {
+                    position: at.position + Point::new(Nm(0), step),
+                    ..at
+                },
+            );
+        }
+    }
+    placements
 }
 
 #[cfg(test)]
@@ -906,5 +1176,261 @@ mod tests {
             }
         }
         assert_eq!(plan.operations.len(), 1, "{:#?}", plan.operations);
+    }
+
+    /// Which pins end up joined, read from the geometry of a design the way KiCad would.
+    fn joined(design: &SchematicDesign) -> BTreeMap<String, usize> {
+        use std::collections::HashMap;
+        #[derive(Hash, PartialEq, Eq, Clone)]
+        enum Key {
+            At(i64, i64),
+            Name(String),
+        }
+        fn find(parent: &mut HashMap<Key, Key>, k: &Key) -> Key {
+            let p = parent.entry(k.clone()).or_insert_with(|| k.clone()).clone();
+            if &p == k {
+                return p;
+            }
+            let root = find(parent, &p);
+            parent.insert(k.clone(), root.clone());
+            root
+        }
+        fn union(parent: &mut HashMap<Key, Key>, a: Key, b: Key) {
+            let (ra, rb) = (find(parent, &a), find(parent, &b));
+            parent.insert(ra, rb);
+        }
+        let mut parent: HashMap<Key, Key> = HashMap::new();
+        let at = |p: Point| Key::At(p.x.0, p.y.0);
+        let lib = library();
+        let mut pins: Vec<(String, Point)> = Vec::new();
+        let mut points: Vec<Point> = Vec::new();
+        for s in &design.symbols {
+            let def = &lib[&LibraryId::parse(&s.library_id).unwrap()];
+            for pin in &def.pins {
+                let p = s.position + s.orientation.apply(pin.local).unwrap();
+                points.push(p);
+                if s.reference.starts_with("#PWR") {
+                    union(&mut parent, at(p), Key::Name(s.value.clone()));
+                } else {
+                    pins.push((format!("{}.{}", s.reference, pin.number), p));
+                }
+            }
+        }
+        for l in &design.labels {
+            union(&mut parent, at(l.position), Key::Name(l.text.clone()));
+            points.push(l.position);
+        }
+        for w in &design.wires {
+            points.push(w.start);
+            points.push(w.end);
+        }
+        for w in &design.wires {
+            union(&mut parent, at(w.start), at(w.end));
+            for p in &points {
+                if crate::layout::on_segment(*p, w.start, w.end) {
+                    union(&mut parent, at(*p), at(w.start));
+                }
+            }
+        }
+        let mut ids: HashMap<Key, usize> = HashMap::new();
+        let mut out = BTreeMap::new();
+        for (name, p) in pins {
+            let root = find(&mut parent, &at(p));
+            let next = ids.len();
+            out.insert(name, *ids.entry(root).or_insert(next));
+        }
+        out
+    }
+
+    fn assert_nets_hold(design: &SchematicDesign, built: &OperationPlan) {
+        let groups = joined(design);
+        let mut seen = BTreeMap::new();
+        for net in &built.expected_nets {
+            let pins: Vec<&String> = net.pins.iter().filter(|p| !p.starts_with('#')).collect();
+            let Some(first) = pins.first() else { continue };
+            let group = groups[*first];
+            for p in &pins {
+                assert_eq!(
+                    groups[*p], group,
+                    "{} is not joined to {} on net {}",
+                    p, first, net.name
+                );
+            }
+            if let Some(other) = seen.insert(group, net.name.clone()) {
+                panic!("nets {other} and {} are joined", net.name);
+            }
+        }
+    }
+
+    #[test]
+    fn parts_moved_by_hand_are_wired_again_without_changing_a_net() {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        // Spread the parts out: each part to a place of its own, the way a person might.
+        let edits: Vec<crate::arrange::PartEdit> = design
+            .symbols
+            .iter()
+            .filter(|s| !s.reference.starts_with('#'))
+            .enumerate()
+            .map(|(i, s)| crate::arrange::PartEdit {
+                reference: s.reference.clone(),
+                at: Some(Point::new(
+                    Nm(60_960_000 + (i as i64 % 4) * 38_100_000),
+                    Nm(63_500_000 + (i as i64 / 4) * 38_100_000),
+                )),
+                ..Default::default()
+            })
+            .collect();
+        let arranged = crate::arrange::plan_arrange(&design, &library(), &edits, &[]);
+        assert_eq!(errors(&arranged), Vec::<&Finding>::new(), "{:#?}", arranged.findings);
+        assert!(!arranged.moves.is_empty());
+        assert!(arranged.findings.iter().any(|f| f.code == "ARRANGE_WIRES_LEFT_BEHIND"));
+        let moved = apply(&design, &arranged);
+
+        let plan = plan_reconnect(&moved, &nets, &library());
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert!(
+            plan.moves.is_empty(),
+            "reconnecting must not move parts: {:#?}",
+            plan.moves
+        );
+        assert!(plan.readability.shorts.is_empty(), "{:?}", plan.readability.shorts);
+        assert!(
+            plan.readability.wires_through_symbols.is_empty(),
+            "{:?}",
+            plan.readability
+        );
+        assert!(plan.fallback_nets.is_empty(), "{:?}", plan.fallback_nets);
+        for net in built.expected_nets.iter().filter(|n| !n.name.starts_with("Net-(")) {
+            let named = plan.operations.iter().any(|op| match op {
+                Operation::AddLabel { net: n, .. } => *n == net.name,
+                Operation::PlacePowerSymbol { net: n, .. } => *n == net.name,
+                _ => false,
+            });
+            assert!(named, "net {} is not named in the drawing", net.name);
+        }
+        let wired = apply(&moved, &plan);
+        assert_nets_hold(&wired, &built);
+    }
+
+    #[test]
+    fn reconnecting_a_tidy_drawing_changes_nothing_that_matters() {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let tidy = apply(&design, &plan_tidy(&design, &nets, &library()));
+        let plan = plan_reconnect(&tidy, &nets, &library());
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert!(plan.moves.is_empty());
+        assert_nets_hold(&apply(&tidy, &plan), &built);
+    }
+
+    #[test]
+    fn a_kept_part_stays_and_the_others_make_room() {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let first = apply(&design, &plan_tidy(&design, &nets, &library()));
+        let keep = first
+            .symbols
+            .iter()
+            .find(|s| s.reference.starts_with('C'))
+            .unwrap()
+            .reference
+            .clone();
+        // Put it somewhere the layout would not, then ask for it to stay there.
+        let mut dragged = first.clone();
+        let part = dragged.symbols.iter_mut().find(|s| s.reference == keep).unwrap();
+        part.position = Point::new(Nm(part.position.x.0 + 63_500_000), Nm(part.position.y.0 + 50_800_000));
+        let there = part.position;
+        let hints = LayoutHints {
+            keep: vec![keep.clone()],
+            ..Default::default()
+        };
+        let plan = plan_tidy_with_hints(&dragged, &nets, &library(), &hints);
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        assert!(!plan.moves.iter().any(|m| m.reference == keep), "{keep} must not move");
+        let done = apply(&dragged, &plan);
+        assert_eq!(
+            done.symbols.iter().find(|s| s.reference == keep).unwrap().position,
+            there
+        );
+        assert_nets_hold(&done, &built);
+    }
+
+    #[test]
+    fn a_part_can_be_placed_next_to_another() {
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let first = apply(&design, &plan_tidy(&design, &nets, &library()));
+        let mut parts = first.symbols.iter().filter(|s| !s.reference.starts_with('#'));
+        let a = parts.next().unwrap().reference.clone();
+        let b = parts.next_back().unwrap().reference.clone();
+        let hints = LayoutHints {
+            near: vec![NearHint {
+                reference: b.clone(),
+                to: a.clone(),
+                side: Dir::Right,
+                gap: Nm(10_160_000),
+            }],
+            ..Default::default()
+        };
+        let plan = plan_tidy_with_hints(&first, &nets, &library(), &hints);
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        let done = apply(&first, &plan);
+        let body = |r: &str| {
+            let s = done.symbols.iter().find(|s| s.reference == r).unwrap();
+            let def = &library()[&LibraryId::parse(&s.library_id).unwrap()];
+            def.body.unwrap().transformed(s.orientation).translate(s.position)
+        };
+        let gap = body(&b).min.x.0 - body(&a).max.x.0;
+        assert!((gap - 10_160_000).abs() <= GRID.0, "gap was {gap}");
+        assert_nets_hold(&done, &built);
+    }
+
+    #[test]
+    fn hints_naming_a_missing_part_are_refused() {
+        let (built, design) = built_regulator();
+        let hints = LayoutHints {
+            keep: vec!["R99".into()],
+            ..Default::default()
+        };
+        let plan = plan_tidy_with_hints(&design, &nets_of(&built), &library(), &hints);
+        assert!(errors(&plan).iter().any(|f| f.code == "TIDY_HINT_UNKNOWN_PART"));
+    }
+
+    #[test]
+    fn arranging_refuses_what_it_cannot_do() {
+        let (_, design) = built_regulator();
+        let reference = design
+            .symbols
+            .iter()
+            .find(|s| !s.reference.starts_with('#'))
+            .unwrap()
+            .reference
+            .clone();
+        let both = crate::arrange::plan_arrange(
+            &design,
+            &library(),
+            &[crate::arrange::PartEdit {
+                reference: reference.clone(),
+                at: Some(Point::default()),
+                by: Some(Point::default()),
+                ..Default::default()
+            }],
+            &[],
+        );
+        assert!(errors(&both).iter().any(|f| f.code == "ARRANGE_AT_AND_BY"));
+        let missing = crate::arrange::plan_arrange(&design, &library(), &[], &["#PWR01".into(), "Z9".into()]);
+        assert_eq!(errors(&missing).len(), 2);
+        let twisted = crate::arrange::plan_arrange(
+            &design,
+            &library(),
+            &[crate::arrange::PartEdit {
+                reference,
+                rotate_deg: Some(45),
+                ..Default::default()
+            }],
+            &[],
+        );
+        assert!(errors(&twisted).iter().any(|f| f.code == "ARRANGE_BAD_ROTATION"));
     }
 }

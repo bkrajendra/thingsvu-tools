@@ -44,6 +44,10 @@ struct State {
     installs: OnceCell<Vec<KicadInstall>>,
     sessions: Mutex<BTreeMap<String, Arc<AnySession>>>,
     plans: Mutex<PlanStore>,
+    /// The nets a session's circuit is meant to have, kept from just before its first arrange
+    /// (moving or deleting parts leaves wires behind, so KiCad no longer reports them). Used by
+    /// sch_reconnect_plan and dropped once that plan is applied.
+    intended: Mutex<BTreeMap<String, Vec<kicad_domain::NetInfo>>>,
 }
 
 #[derive(Clone)]
@@ -102,6 +106,120 @@ pub struct CloseArgs {
 #[serde(deny_unknown_fields)]
 pub struct SessionArgs {
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorArg {
+    None,
+    /// Flipped top to bottom.
+    X,
+    /// Flipped left to right.
+    Y,
+}
+
+impl From<MirrorArg> for kicad_domain::Mirror {
+    fn from(m: MirrorArg) -> Self {
+        match m {
+            MirrorArg::None => kicad_domain::Mirror::None,
+            MirrorArg::X => kicad_domain::Mirror::X,
+            MirrorArg::Y => kicad_domain::Mirror::Y,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PartEditArgs {
+    /// The part's reference, e.g. R1 (from sch_describe_layout).
+    pub reference: String,
+    /// Move to this place on the sheet, in mm (give both x_mm and y_mm; y grows downward).
+    #[serde(default)]
+    pub x_mm: Option<f64>,
+    #[serde(default)]
+    pub y_mm: Option<f64>,
+    /// Or move by this much from where it is now.
+    #[serde(default)]
+    pub dx_mm: Option<f64>,
+    #[serde(default)]
+    pub dy_mm: Option<f64>,
+    /// Turn counter-clockwise (as seen on screen) by 90, 180, or 270 degrees from where it is now.
+    #[serde(default)]
+    pub rotate_deg: Option<u16>,
+    /// Set the mirroring.
+    #[serde(default)]
+    pub mirror: Option<MirrorArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArrangeArgs {
+    pub session_id: String,
+    /// Parts to move, turn, or mirror.
+    #[serde(default)]
+    pub edits: Vec<PartEditArgs>,
+    /// References of parts to delete. Their wires stay until sch_reconnect_plan.
+    #[serde(default)]
+    pub delete: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceHintArgs {
+    pub reference: String,
+    pub x_mm: f64,
+    pub y_mm: f64,
+    /// Turn counter-clockwise by 90, 180, or 270 degrees from where the part is now.
+    #[serde(default)]
+    pub rotate_deg: Option<u16>,
+    #[serde(default)]
+    pub mirror: Option<MirrorArg>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SideArg {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NearHintArgs {
+    pub reference: String,
+    /// The part it goes next to.
+    pub to: String,
+    pub side: SideArg,
+    /// Clear space between the two, in mm (default 10).
+    #[serde(default)]
+    pub gap_mm: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TidyArgs {
+    pub session_id: String,
+    /// Parts that stay exactly where they are (e.g. the connector the user wants on the left).
+    #[serde(default)]
+    pub keep: Vec<String>,
+    /// Parts that go to a given place.
+    #[serde(default)]
+    pub place: Vec<PlaceHintArgs>,
+    /// Parts that go next to another part (e.g. the two input capacitors together).
+    #[serde(default)]
+    pub near: Vec<NearHintArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconnectArgs {
+    pub session_id: String,
+    /// Wire what KiCad reads from the drawing now instead of the circuit as it was before the first
+    /// move (use it if the circuit itself was edited in between).
+    #[serde(default)]
+    pub use_current_nets: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -252,6 +370,7 @@ impl KicadAiServer {
                 installs: OnceCell::new(),
                 sessions: Mutex::new(BTreeMap::new()),
                 plans: Mutex::new(PlanStore::default()),
+                intended: Mutex::new(BTreeMap::new()),
             }),
             tool_router: Self::tool_router(),
         }
@@ -374,24 +493,108 @@ impl KicadAiServer {
         Ok(plan_view(&id, &view_plan))
     }
 
-    /// Reads the sheet and plans how to lay it out again. Nothing is changed.
-    async fn tidy_plan_for(
+    /// The library symbols a redraw of `design` needs: its own parts, and the power symbols for
+    /// the net names once the circuit can be read at all.
+    async fn redraw_library(
         &self,
         session: &Arc<AnySession>,
-    ) -> Result<(kicad_domain::SchematicDesign, OperationPlan), ToolError> {
-        let design = session.design().await?;
-        let nets = session.netlist().await?;
-        let mut ids = kicad_domain::design_library_ids(&design);
+        design: &kicad_domain::SchematicDesign,
+        nets: &[kicad_domain::NetInfo],
+    ) -> Result<BTreeMap<kicad_domain::LibraryId, kicad_domain::plan::LibrarySymbol>, ToolError> {
+        let mut ids = kicad_domain::design_library_ids(design);
         let mut library = session.library_symbols(&ids).await?;
-        // Power symbols for the net names are only needed when the circuit can be read at all.
-        if let Ok(spec) = kicad_domain::tidy_spec(&design, &nets) {
+        if let Ok(spec) = kicad_domain::tidy_spec(design, nets) {
             ids.extend(kicad_domain::library_ids_for(&spec));
             ids.sort();
             ids.dedup();
             library = session.library_symbols(&ids).await?;
         }
-        let plan = kicad_domain::plan_tidy(&design, &nets, &library);
+        Ok(library)
+    }
+
+    /// Reads the sheet and plans how to lay it out again. Nothing is changed.
+    async fn tidy_plan_for(
+        &self,
+        session: &Arc<AnySession>,
+        hints: &kicad_domain::LayoutHints,
+    ) -> Result<(kicad_domain::SchematicDesign, OperationPlan), ToolError> {
+        let design = session.design().await?;
+        let nets = session.netlist().await?;
+        let library = self.redraw_library(session, &design, &nets).await?;
+        let plan = kicad_domain::plan_tidy_with_hints(&design, &nets, &library, hints);
         Ok((design, plan))
+    }
+
+    async fn describe_layout(&self, session: &Arc<AnySession>) -> Result<serde_json::Value, ToolError> {
+        let design = session.design().await?;
+        let nets = session.netlist().await?;
+        let library = session
+            .library_symbols(&kicad_domain::design_library_ids(&design))
+            .await?;
+        let net_of: BTreeMap<String, String> = nets
+            .iter()
+            .flat_map(|n| {
+                n.pins.iter().map(move |p| {
+                    (
+                        format!("{}.{}", p.reference, p.pin),
+                        n.name.trim_start_matches('/').to_owned(),
+                    )
+                })
+            })
+            .collect();
+        let mm = |p: kicad_domain::Point| serde_json::json!({ "x": round2(p.x.to_mm()), "y": round2(p.y.to_mm()) });
+        let facing = |d: kicad_domain::Dir| match d {
+            kicad_domain::Dir::Left => "left",
+            kicad_domain::Dir::Right => "right",
+            kicad_domain::Dir::Up => "up",
+            kicad_domain::Dir::Down => "down",
+        };
+        let mut parts = Vec::new();
+        for s in design.symbols.iter().filter(|s| !s.reference.starts_with("#PWR")) {
+            let def = kicad_domain::LibraryId::parse(&s.library_id)
+                .ok()
+                .and_then(|id| library.get(&id));
+            let pins: Vec<_> = def
+                .map(|d| {
+                    d.pins
+                        .iter()
+                        .filter(|p| p.unit == 0 || p.unit == s.unit)
+                        .filter_map(|p| {
+                            let at = s.position + s.orientation.apply(p.local)?;
+                            let mut pin = serde_json::json!({
+                                "number": p.number, "name": p.name,
+                                "x": round2(at.x.to_mm()), "y": round2(at.y.to_mm()),
+                                "faces": facing(p.outward.transformed(s.orientation)),
+                            });
+                            if let Some(net) = net_of.get(&format!("{}.{}", s.reference, p.number)) {
+                                pin["net"] = net.clone().into();
+                            }
+                            Some(pin)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let body = def
+                .and_then(|d| d.body)
+                .map(|b| b.transformed(s.orientation).translate(s.position));
+            parts.push(serde_json::json!({
+                "reference": s.reference, "value": s.value, "library_id": s.library_id,
+                "at": mm(s.position),
+                "rotation_deg": s.orientation.rotation_deg,
+                "mirror": match (s.orientation.mirror_x, s.orientation.mirror_y) {
+                    (false, false) => "none", (true, false) => "x", (false, true) => "y", (true, true) => "both" },
+                "body": body.map(|b| serde_json::json!({ "min": mm(b.min), "max": mm(b.max) })),
+                "pins": pins,
+            }));
+        }
+        Ok(serde_json::json!({
+            "units": "mm; x grows right, y grows down; the grid is 1.27 mm",
+            "parts": parts,
+            "power_symbols": design.symbols.iter().filter(|s| s.reference.starts_with("#PWR")).count(),
+            "wires": design.wires.len(),
+            "labels": design.labels.len(),
+            "notes": design.notes.iter().map(|r| serde_json::json!({ "min": mm(r.min), "max": mm(r.max) })).collect::<Vec<_>>(),
+        }))
     }
 
     /// Applies a stored plan once per idempotency key.
@@ -447,7 +650,22 @@ impl KicadAiServer {
             (stored.plan.clone(), stored.fingerprint.clone())
         };
 
+        // Moving or deleting parts leaves their wires behind, so KiCad stops reporting the circuit
+        // the person meant. Keep what it reported just before the first such change.
+        if plan.circuit == "arrange" {
+            if let Ok(nets) = session.netlist().await {
+                self.state
+                    .intended
+                    .lock()
+                    .await
+                    .entry(session.id().to_owned())
+                    .or_insert(nets);
+            }
+        }
         let result = session.apply_plan(&plan, &fingerprint).await;
+        if plan.circuit == "reconnect" && result.as_ref().is_ok_and(|r| r.verified) {
+            self.state.intended.lock().await.remove(session.id());
+        }
         let envelope = match &result {
             Ok(report) => {
                 let (state, warnings) = if report.verified {
@@ -778,7 +996,7 @@ much it would change. Read-only. Use sch_render to see it."
             Ok(s) => s,
             Err(e) => return envelope::error(&cid, &e),
         };
-        let (design, plan) = match self.tidy_plan_for(&session).await {
+        let (design, plan) = match self.tidy_plan_for(&session, &Default::default()).await {
             Ok(v) => v,
             Err(e) => return envelope::error(&cid, &e),
         };
@@ -843,22 +1061,127 @@ much it would change. Read-only. Use sch_render to see it."
         description = "Plan a cleaner layout for an existing schematic: the parts are laid out again with \
 signal flow left to right, power and ground as symbols, and wires instead of labels. Every part keeps its \
 identity, value, footprint, and fields; the old wires, labels, junctions, and net-naming power symbols are \
-replaced. Returns a plan_id for sch_apply_plan, with the moves, removals, and additions, the drawing's \
-readability before and after, and the nets that must be identical afterwards. Nothing is changed until the \
-plan is applied with confirm: true; show it to the user first."
+replaced. Optional hints steer it: keep (parts that stay where they are), place (parts to put at x_mm, \
+y_mm, optionally turned), near (a part next to another, on a side, with a gap). With hints the parts are \
+placed as asked and wired by the router, which may join a net with labels where a wire would cross a part. \
+Returns a plan_id for sch_apply_plan, with the moves, removals, and additions, the drawing's readability \
+before and after, and the nets that must be identical afterwards. Nothing is changed until the plan is \
+applied with confirm: true; show it to the user first."
     )]
-    pub async fn sch_tidy_plan(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+    pub async fn sch_tidy_plan(&self, Parameters(args): Parameters<TidyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
         let session = match self.session(&args.session_id).await {
             Ok(s) => s,
             Err(e) => return envelope::error(&cid, &e),
         };
-        let plan = match self.tidy_plan_for(&session).await {
+        let hints = match tidy_hints(&args) {
+            Ok(h) => h,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = match self.tidy_plan_for(&session, &hints).await {
             Ok((_, plan)) => plan,
             Err(e) => return envelope::error(&cid, &e),
         };
         match self.store_plan(&session, plan).await {
             Ok(view) => envelope::ok(&cid, view, live(&session), vec![]),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_describe_layout",
+        description = "Where everything is, for planning moves: each part's reference, value, library id, \
+position (mm, y grows downward), rotation, mirroring, body rectangle, and every pin with its position, \
+the direction it faces, and its net; plus the text notes' areas and counts of wires and power symbols. \
+Read-only. Use it before sch_arrange_plan or the hints of sch_tidy_plan."
+    )]
+    pub async fn sch_describe_layout(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match self.describe_layout(&session).await {
+            Ok(v) => envelope::ok(&cid, v, live(&session), vec![]),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_arrange_plan",
+        description = "Plan bare edits of existing parts: move (to x_mm/y_mm or by dx_mm/dy_mm), turn \
+(rotate_deg, counter-clockwise from now), mirror, or delete. Only the named parts change; wires, labels, \
+and junctions stay where they are, so connections to moved parts BREAK (the plan says how many wires are \
+left behind). Place every part where it belongs first, then call sch_reconnect_plan to draw the \
+connections again: the circuit as it was before the first move is remembered for that. Suited to small \
+circuits and the start of a design; for a whole sheet use sch_tidy_plan. Returns a plan_id for \
+sch_apply_plan (confirm: true after the user has seen it)."
+    )]
+    pub async fn sch_arrange_plan(&self, Parameters(args): Parameters<ArrangeArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let edits = match arrange_edits(&args) {
+            Ok(e) => e,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let design = session.design().await?;
+            let library = session
+                .library_symbols(&kicad_domain::design_library_ids(&design))
+                .await?;
+            Ok::<_, ToolError>(kicad_domain::plan_arrange(&design, &library, &edits, &args.delete))
+        }
+        .await;
+        match plan {
+            Ok(plan) => match self.store_plan(&session, plan).await {
+                Ok(view) => envelope::ok(&cid, view, live(&session), vec![]),
+                Err(e) => envelope::error(&cid, &e),
+            },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_reconnect_plan",
+        description = "Plan the wiring again with every part where it is now: all old wires, labels, \
+junctions, and net-naming power symbols are replaced by new ones that join exactly the pins of the circuit \
+as it was before the first sch_arrange_plan (or as KiCad reads it now, with use_current_nets). Wires go \
+around parts and other nets; a net that cannot be wired without crossing is joined by labels instead and \
+reported. No part moves. After sch_apply_plan the nets are verified against KiCad. Returns a plan_id."
+    )]
+    pub async fn sch_reconnect_plan(&self, Parameters(args): Parameters<ReconnectArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let design = session.design().await?;
+            let remembered = self.state.intended.lock().await.get(session.id()).cloned();
+            let (nets, source) = match remembered {
+                Some(nets) if !args.use_current_nets => (nets, "the circuit as it was before the parts were moved"),
+                _ => (session.netlist().await?, "the circuit as KiCad reads it now"),
+            };
+            let library = self.redraw_library(&session, &design, &nets).await?;
+            let mut plan = kicad_domain::plan_reconnect(&design, &nets, &library);
+            plan.circuit = "reconnect".into();
+            plan.findings.push(kicad_domain::Finding {
+                severity: kicad_domain::Severity::Warning,
+                code: "RECONNECT_NETS_FROM",
+                message: format!("the connections are drawn from {source}"),
+                objects: vec![],
+            });
+            Ok::<_, ToolError>(plan)
+        }
+        .await;
+        match plan {
+            Ok(plan) => match self.store_plan(&session, plan).await {
+                Ok(view) => envelope::ok(&cid, view, live(&session), vec![]),
+                Err(e) => envelope::error(&cid, &e),
+            },
             Err(e) => envelope::error(&cid, &e),
         }
     }
@@ -1204,4 +1527,69 @@ impl ServerHandler for KicadAiServer {
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+fn mm_point(x: f64, y: f64) -> Result<kicad_domain::Point, ToolError> {
+    kicad_domain::Point::from_mm(x, y)
+        .map_err(|e| ToolError::new(ErrorCode::InvalidArgument, format!("({x}, {y}) mm: {e}")))
+}
+
+fn tidy_hints(args: &TidyArgs) -> Result<kicad_domain::LayoutHints, ToolError> {
+    let mut hints = kicad_domain::LayoutHints {
+        keep: args.keep.clone(),
+        ..Default::default()
+    };
+    for p in &args.place {
+        hints.place.push(kicad_domain::PlaceHint {
+            reference: p.reference.clone(),
+            position: mm_point(p.x_mm, p.y_mm)?,
+            rotate_deg: p.rotate_deg,
+            mirror: p.mirror.map(Into::into),
+        });
+    }
+    for n in &args.near {
+        let gap = kicad_domain::Nm::from_mm(n.gap_mm.unwrap_or(10.0))
+            .map_err(|e| ToolError::new(ErrorCode::InvalidArgument, format!("gap_mm: {e}")))?;
+        hints.near.push(kicad_domain::NearHint {
+            reference: n.reference.clone(),
+            to: n.to.clone(),
+            side: match n.side {
+                SideArg::Left => kicad_domain::Dir::Left,
+                SideArg::Right => kicad_domain::Dir::Right,
+                SideArg::Above => kicad_domain::Dir::Up,
+                SideArg::Below => kicad_domain::Dir::Down,
+            },
+            gap,
+        });
+    }
+    Ok(hints)
+}
+
+fn arrange_edits(args: &ArrangeArgs) -> Result<Vec<kicad_domain::PartEdit>, ToolError> {
+    let bad = |m: String| ToolError::new(ErrorCode::InvalidArgument, m);
+    args.edits
+        .iter()
+        .map(|e| {
+            let at = match (e.x_mm, e.y_mm) {
+                (Some(x), Some(y)) => Some(mm_point(x, y)?),
+                (None, None) => None,
+                _ => return Err(bad(format!("{}: give both x_mm and y_mm", e.reference))),
+            };
+            let by = match (e.dx_mm, e.dy_mm) {
+                (None, None) => None,
+                (dx, dy) => Some(mm_point(dx.unwrap_or(0.0), dy.unwrap_or(0.0))?),
+            };
+            Ok(kicad_domain::PartEdit {
+                reference: e.reference.clone(),
+                at,
+                by,
+                rotate_deg: e.rotate_deg,
+                mirror: e.mirror.map(Into::into),
+            })
+        })
+        .collect()
 }

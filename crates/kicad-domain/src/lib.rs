@@ -4,6 +4,7 @@
 //! Nothing here depends on how KiCad is reached (IPC, files, or CLI). Backends translate between
 //! these types and KiCad's own representations.
 
+pub mod arrange;
 pub mod capability;
 pub mod circuit;
 pub mod connectivity;
@@ -12,11 +13,13 @@ pub mod ids;
 pub mod layout;
 pub mod plan;
 pub mod readability;
+pub mod reconnect;
 pub mod result;
 pub mod schematic;
 pub mod tidy;
 pub mod validation;
 
+pub use arrange::{plan_arrange, Mirror, PartEdit};
 pub use capability::{Backend, Capability, CapabilitySet, Support};
 pub use circuit::{CircuitSpec, ComponentSpec, NetSpec, PinRef};
 pub use connectivity::attach_power_pins;
@@ -32,5 +35,7 @@ pub use schematic::{
     DesignJunction, DesignLabel, DesignSymbol, DesignWire, NetInfo, NetPin, PinInfo, PointMm, SchematicDesign,
     SymbolInfo, SymbolPins,
 };
-pub use tidy::{design_library_ids, plan_tidy, tidy_spec};
+pub use tidy::{
+    design_library_ids, plan_reconnect, plan_tidy, plan_tidy_with_hints, tidy_spec, LayoutHints, NearHint, PlaceHint,
+};
 pub use validation::{validate_circuit, Finding, Severity};

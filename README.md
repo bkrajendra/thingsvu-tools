@@ -134,6 +134,14 @@ To clean up a schematic that already exists:
 
 The tidy lays the circuit out again, keeping every part, value, and footprint and checking that every net is identical afterwards. It handles a single sheet of parts joined by wires, labels, and power symbols; buses, global labels, hierarchical sheets, and no-connect flags are refused with a reason, and text notes stay where they are.
 
+To steer it, or to arrange a small circuit yourself:
+
+> Keep J1 where it is and put C1 and C2 next to each other, then tidy.
+>
+> Move the regulator to the top right, group R1 and R2 below it, then reconnect everything.
+
+Moving, turning, or deleting a part leaves its wires behind, so the circuit is broken until you ask for **reconnect**, which draws every connection again around the parts where they now are (and checks every net against KiCad). Good for the start of a design and for small circuits; for a whole sheet use the tidy.
+
 ## Three ways to work
 
 | Provider | KiCad | What it does | Choose it when |
@@ -156,7 +164,10 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `sch_plan_changes` | Turn a circuit (parts and nets) into an exact, reviewable plan. Changes nothing |
 | `sch_apply_plan` | Apply a plan you confirmed (new circuit or tidy), verify it against KiCad, and report any difference |
 | `sch_review` | Look at an existing schematic: overlapping parts, wires through parts, and whether it can be tidied. Read-only |
-| `sch_tidy_plan` | Plan a cleaner layout for an existing schematic: parts re-laid out, old wires and labels replaced, nets kept identical. Changes nothing until applied |
+| `sch_tidy_plan` | Plan a cleaner layout for an existing schematic: parts re-laid out, old wires and labels replaced, nets kept identical. Optional hints: `keep`, `place`, `near`. Changes nothing until applied |
+| `sch_describe_layout` | Where every part and pin is (mm), its rotation and body, and the net of each pin. Read-only |
+| `sch_arrange_plan` | Plan moving, turning, mirroring, or deleting named parts. Their wires stay and break until reconnected |
+| `sch_reconnect_plan` | Plan drawing all connections again with the parts where they are, for the circuit as it was before the moves |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |

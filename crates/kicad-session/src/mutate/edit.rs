@@ -226,7 +226,9 @@ impl Session {
     pub(super) async fn apply_edit(&self, plan: &OperationPlan) -> Result<ApplyReport, ToolError> {
         let use_commit = self.capabilities().is_available(Capability::Commits);
         let headless = self.provider() == Provider::Headless;
-        if headless {
+        // Redrawing the wires after moving parts by hand is the one change that may start from
+        // unsaved work: if it fails, the document goes back to the saved file, which says so.
+        if headless && plan.circuit != "reconnect" {
             let mut inner = self.inner.lock().await;
             if Self::unsaved_changes(&mut inner, &self.document).await != Some(false) {
                 return Err(ToolError::new(
