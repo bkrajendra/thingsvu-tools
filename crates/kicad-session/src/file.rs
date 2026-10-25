@@ -26,8 +26,6 @@ use crate::mutate::{verify_nets, ApplyReport, PlacedComponent};
 use crate::schematic::{natural_key, natural_reference, OpenDocument};
 use crate::session::{check_target, lock_file, new_session_id, OpenTarget, Provider, SessionConfig, SessionStatus};
 
-const CLI_TIMEOUT: Duration = Duration::from_secs(180);
-
 /// The newest schematic format a `kicad-cli` of this series reads and writes.
 fn format_of(series: u32) -> u32 {
     if series >= 11 {
@@ -161,6 +159,7 @@ pub struct FileSession {
     render_cli: Option<KicadInstall>,
     symbol_dir: PathBuf,
     runtime_dir: PathBuf,
+    cli_timeout: Duration,
     capabilities: CapabilitySet,
     libraries: StdMutex<HashMap<String, Arc<SymbolLibrary>>>,
     /// Serializes changes to the file.
@@ -225,6 +224,7 @@ impl FileSession {
             render_cli,
             symbol_dir,
             runtime_dir: config.runtime_dir.clone(),
+            cli_timeout: config.cli_timeout,
             capabilities,
             libraries: StdMutex::new(HashMap::new()),
             writing: Mutex::new(()),
@@ -473,7 +473,7 @@ impl FileSession {
     /// Connectivity from `kicad-cli`'s netlister for the schematic at `path`.
     async fn netlist_of(&self, path: &Path, symbols: &[PlacedSymbol]) -> Result<Vec<NetInfo>, ToolError> {
         let dir = self.scratch()?;
-        let result = netlist::export_netlist(&self.cli, path, &dir.join("out.net"), CLI_TIMEOUT).await;
+        let result = netlist::export_netlist(&self.cli, path, &dir.join("out.net"), self.cli_timeout).await;
         let _ = std::fs::remove_dir_all(&dir);
         let netlist = result.map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
         let owner: HashMap<&str, &str> = symbols

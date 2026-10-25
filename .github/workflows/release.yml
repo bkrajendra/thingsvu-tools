@@ -1,0 +1,159 @@
+name: Release
+
+# A release is made when the version in Cargo.toml ([workspace.package]) has no tag yet: the tag is
+# `v<version>`, created together with the GitHub release. To release, change the version and push to
+# main (see docs/releasing.md). Pushes that leave the version alone do nothing here.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Version and tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      release: ${{ steps.check.outputs.release }}
+      prerelease: ${{ steps.read.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(awk '/^\[workspace\.package\]/{p=1} p && /^version *=/{gsub(/[" ]/,"",$0); sub(/version=/,"",$0); print; exit}' Cargo.toml)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "cannot read a version from Cargo.toml (got '$version')"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          # Anything before 1.0, or with a suffix such as -rc.1, is a pre-release.
+          if [[ "$version" == 0.* || "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.read.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "$tag already exists; nothing to release."
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "$tag is new; releasing."
+          fi
+
+  windows:
+    name: Windows package
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      # Never release a commit whose tests fail.
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p kicad-ai-mcp -p kicad-ai-plugin
+      - name: Package
+        run: ./scripts/package.ps1 -BinDir target/release -OutDir dist
+      - name: Smoke-test the installer
+        run: ./scripts/test-installer.ps1 -DistDir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/install.ps1
+          if-no-files-found: error
+
+  linux:
+    name: Linux package
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p kicad-ai-mcp
+      - name: Package
+        run: |
+          name="thingsvu-tools-v${{ needs.version.outputs.version }}-linux-x64"
+          mkdir -p "dist/$name/bin"
+          cp target/release/kicad-ai-mcp "dist/$name/bin/"
+          cp README.md LICENSE "dist/$name/"
+          echo "${{ needs.version.outputs.version }}" > "dist/$name/VERSION.txt"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Tag and publish
+    needs: [version, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd staged
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Release notes
+        run: |
+          cat > notes.md <<'EOF'
+          ## Install (Windows)
+
+          1. Download `thingsvu-tools-v${{ needs.version.outputs.version }}-windows-x64.zip` below and extract it.
+          2. Right-click `install.ps1` > **Run with PowerShell** (or run `.\install.ps1` in a terminal).
+          3. Restart your AI assistant. In KiCad 11, press **KiCad AI: connect** in the Schematic Editor.
+
+          Or in one step, in PowerShell: `irm https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.version.outputs.tag }}/scripts/install.ps1 | iex`
+
+          Verify downloads with `SHA256SUMS.txt`. The full guide is in the [README](https://github.com/${{ github.repository }}/blob/${{ needs.version.outputs.tag }}/README.md).
+
+          ## Files
+
+          | File | What it is |
+          |---|---|
+          | `thingsvu-tools-v${{ needs.version.outputs.version }}-windows-x64.zip` | The MCP server, the KiCad plugin, and the installer |
+          | `install.ps1` | The same installer on its own; it downloads and verifies the zip |
+          | `thingsvu-kicad-ai-pcm-v${{ needs.version.outputs.version }}.zip` | The KiCad plugin for the Plugin and Content Manager (Install from File); experimental |
+          | `thingsvu-tools-v${{ needs.version.outputs.version }}-linux-x64.tar.gz` | The MCP server for Linux (file provider and headless; no KiCad plugin) |
+          | `SHA256SUMS.txt` | Checksums of everything above |
+
+          ---
+          EOF
+      - name: Create the tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          if [ "${{ needs.version.outputs.prerelease }}" = "true" ]; then flags="--prerelease"; fi
+          gh release create "${{ needs.version.outputs.tag }}" staged/* \
+            --target "$GITHUB_SHA" \
+            --title "thingsvu-tools ${{ needs.version.outputs.tag }}" \
+            --notes-file notes.md --generate-notes $flags

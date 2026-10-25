@@ -1,12 +1,18 @@
-# KiCad AI MCP design-plan archive
+# Documentation
 
-This archive contains the architecture, technical specification, milestones, tool contracts, and validation plan for a Rust MCP server plus executable IPC plugin. KiCad 11 is the primary target, developed against a pinned 10.99 nightly; KiCad 10.0.x is a supported fallback.
+How thingsvu-tools is built, what it can do, and how it is released. For installing and using it, start with the [README](../README.md).
 
-Files:
-- `kicad-ai-mcp-design-plan.md` — main design document (revision 2).
-- `kicad-api-compatibility.md` — pinned KiCad builds, proto commit, CLI differences, and Phase 0 probe results.
-- `tasks.md` — phase-by-phase task list with decisions to review.
-- The KiCad 11 plugin manifest lives in `plugin-package/plugin.json`; `scripts/install-plugin.ps1` installs it.
-- `examples/two-resistor-series-chain.json` — circuit intent for the first integration test.
+| Document | What it is |
+|---|---|
+| [architecture.md](architecture.md) | **Start here.** The current component and crate diagrams, the editor registration flow, how plans are made and applied, the release pipeline, and what changed from the original plan |
+| [capability-matrix.md](capability-matrix.md) | What each kind of session (`headless`, `gui`, `file`) can do, and which backend serves it |
+| [kicad-api-compatibility.md](kicad-api-compatibility.md) | Pinned KiCad builds, the proto commit, `kicad-cli` differences, and everything observed while probing KiCad 10 and 11 |
+| [releasing.md](releasing.md) | How a release is made (the Cargo version drives the tag) and what is published |
+| [tasks.md](tasks.md) | Phase-by-phase task list, with the decisions and workarounds that need the project owner's review |
+| [kicad-ai-mcp-design-plan.md](kicad-ai-mcp-design-plan.md) | The design plan: reasoning, requirements, tool contracts, test plan, and risks. Written before the code; where it differs from [architecture.md](architecture.md), the architecture page is right |
+| [examples/](examples/) | Circuit descriptions used as test fixtures: a two-resistor chain, a 3.3 V regulator, an NE555 blinker |
 
-The manifest uses a plugin-relative entrypoint (KiCad skips absolute ones) and is valid against the plugin schema shipped with the pinned KiCad build.
+Other files that matter:
+
+- `plugin-package/plugin.json` is the KiCad 11 plugin manifest. It uses a plugin-relative entrypoint, because KiCad skips absolute ones, and is valid against the plugin schema shipped with the pinned KiCad build.
+- `scripts/` holds the installer and uninstaller (shipped in the release zip), the packaging and installer test scripts, and the developer scripts.

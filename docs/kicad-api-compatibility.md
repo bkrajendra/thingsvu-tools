@@ -99,3 +99,14 @@ Observed 25 Oct 2026 while building the file provider (`kicad-sexpr`, `FileSessi
 | 10.99 CLI on 10.0 files | Reads a 20260306 file and exports PNG of it; used for rendering in file sessions. |
 | Library lookup | Global libraries live in `<install>/share/kicad/symbols/<nickname>.kicad_sym` (10.0 and 10.99 on Windows). The project's own `sym-lib-table` can name others; the user's global table (custom libraries) is not read. |
 | KiCad 10 GUI loading of a generated file | **Not yet checked by the author**: loaded by `kicad-cli` 10.0.7 (netlist, ERC) only. See docs/tasks.md, Phase 6 notes. |
+
+## Re-pinning to a new KiCad build
+
+Do this when KiCad 11.0 is released (the nightly `10.99` stops being the target), and whenever the pinned nightly is replaced.
+
+1. Install the new build. Update the *Pinned builds* table above.
+2. Run `scripts\probe-kicad.ps1` against the new build and compare with the probe table. Any difference is a finding to record here.
+3. If the API protos changed, vendor them again from the new KiCad commit into `crates/kicad-ipc/proto/`, regenerate `SHA256SUMS`, and update the commit in this file. Rebuild; fix what the new definitions break.
+4. Run the whole live suite: `$env:KICAD_LIVE = '1'; cargo test --workspace -- --test-threads=1`. The `library_geometry_matches_kicads_own` and `both_backends_build_the_same_circuit` tests in `kicad-session` are the ones that notice a format or geometry change.
+5. If the schematic format version changed, extend the supported range (`MIN_VERSION` / `MAX_VERSION` in `crates/kicad-sexpr/src/sch.rs`) only after the live tests pass on files of the new format, and add its series to `format_of` in `crates/kicad-session/src/file.rs`.
+6. Update `docs/capability-matrix.md`, the README's supported-version table, and the badges.

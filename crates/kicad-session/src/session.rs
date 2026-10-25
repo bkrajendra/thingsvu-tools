@@ -37,6 +37,8 @@ pub struct SessionConfig {
     pub runtime_dir: PathBuf,
     pub start_timeout: Duration,
     pub request_timeout: Duration,
+    /// Longest a `kicad-cli` job (netlist, ERC) may run in a file session.
+    pub cli_timeout: Duration,
 }
 
 impl Default for SessionConfig {
@@ -45,6 +47,7 @@ impl Default for SessionConfig {
             runtime_dir: std::env::temp_dir().join("thingsvu"),
             start_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            cli_timeout: Duration::from_secs(180),
         }
     }
 }

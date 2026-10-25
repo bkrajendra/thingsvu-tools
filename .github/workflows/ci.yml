@@ -25,6 +25,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Live KiCad tests skip themselves unless KICAD_LIVE=1.
       - run: cargo test --workspace
+      # The release package and its installer, built from the debug binaries the tests just made.
+      - name: Package and smoke-test the installer
+        run: |
+          cargo build -p kicad-ai-mcp -p kicad-ai-plugin
+          ./scripts/package.ps1 -BinDir target/debug -OutDir dist-test
+          ./scripts/test-installer.ps1 -DistDir dist-test
 
   linux:
     name: Linux (build and tests)

@@ -48,6 +48,15 @@ pub fn registry_dir() -> PathBuf {
         .join("instances")
 }
 
+/// Folder for the MCP server's rotating log files. `THINGSVU_LOG_DIR` overrides it.
+pub fn log_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("THINGSVU_LOG_DIR") {
+        return PathBuf::from(dir);
+    }
+    // `<state>/thingsvu/kicad-ai/instances` and `.../logs` are siblings.
+    registry_dir().with_file_name("logs")
+}
+
 /// KiCad passes sockets as `ipc://<path>`.
 pub fn socket_path_from_env(value: &str) -> PathBuf {
     PathBuf::from(value.strip_prefix("ipc://").unwrap_or(value))

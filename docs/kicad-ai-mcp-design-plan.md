@@ -21,6 +21,12 @@
 
 ---
 
+### Revision 3 summary (after Phases 0–7)
+
+The plan below is kept as written where it still holds. Where building it led elsewhere, the sections were updated and the full list is in [architecture.md](architecture.md#changes-from-the-original-plan): the plugin is a registrar, not a bridge; `AnySession` replaced the backend trait; there is no direct-socket provider; the file backend inserts text instead of keeping a full syntax tree; a layout engine and a release pipeline were added.
+
+---
+
 ## 1. Executive decision
 
 Build the first version as separate layers with clear process boundaries:
@@ -33,7 +39,7 @@ Supporting library crates: `kicad-ipc` (protobuf + NNG adapter), `kicad-sexpr` (
 
 Core rules:
 
-- The MCP server does not guess which KiCad instance to mutate. It either owns the instance (headless provider), receives it from KiCad (plugin bridge), or — only with explicit configuration — attaches to a discovered socket and pins the instance by token and open-document match.
+- The MCP server does not guess which KiCad instance to mutate. It either owns the instance (headless provider), takes it from the registration the user made in the editor (gui provider, token pinned), or works on a file no editor has open (file provider).
 - All requests to one KiCad instance are serialized through one IPC connection. KiCad handles API requests synchronously on its event loop; multiple connections give no throughput and risk ordering problems.
 - Tool contracts never mention a backend. A result states its backend in `provenance`.
 
@@ -41,10 +47,10 @@ Core rules:
 
 **Included**
 - KiCad 11 (pinned nightly) schematic IPC: open/inspect a schematic, place library symbols, set fields, create wires and local labels, read the schematic netlist, save.
-- Headless provider (`kicad-cli api-server`) as the first IPC path; GUI plugin bridge as the second.
+- Headless provider (`kicad-cli api-server`) as the first IPC path; the GUI provider (plugin registrar) as the second.
 - KiCad 10 fallback: read-only inspection via file parsing, ERC and netlist via `kicad-cli`, and — in a later phase of the milestone — file-based mutation of documents not open in an editor.
 - Rust MCP server using the official Rust MCP SDK (`rmcp`) over stdio.
-- Secure local bridge protocol (Windows named pipe first; Unix socket second).
+- A private, current-user-only registry for editor registrations (revision 3: no bridge protocol).
 - A deterministic two-resistor / three-net test schematic, verified on both KiCad versions.
 - Integration tests, a mock IPC server for CI, and a repeatable local workflow.
 
@@ -53,7 +59,7 @@ Core rules:
 - PCB layout, footprint placement, routing, manufacturing release.
 - Part selection, distributor lookup, datasheet interpretation, simulation.
 - Custom-symbol authoring, hierarchical generation, variants, buses, complex multi-unit symbols, placement optimization.
-- Remote network access to the bridge.
+- Remote network access to the MCP server or the editor registry.
 - 3D enclosure design (suite roadmap; see §16.1).
 
 ---
@@ -113,34 +119,55 @@ The proto commit to vendor for Tier 1 is the nightly's git hash, `d033635628`.
 
 ```mermaid
 flowchart TB
-    LLM[AI agent / MCP host]
-    MCP[kicad-ai-mcp\nRust + rmcp, stdio]
-    DOMAIN[kicad-domain\nCircuit IR, plans, validation, capabilities]
-    BACK[KiCadBackend trait\ncapability-probed]
-    IPC[kicad-ipc\nProtobuf + NNG, one serialized client]
-    SEXPR[kicad-sexpr\nlossless .kicad_sch engine]
-    CLI[kicad-cli-runner\nERC / netlist / export / diff]
-    HL[kicad-cli api-server\nheadless, owned child]
-    BRIDGE[kicad-ai-plugin\nexec plugin bridge, KiCad 11]
-    GUI[KiCad GUI\n11 or 10]
-    FILES[(project files)]
+    LLM["AI assistant<br/>(MCP host)"]
 
-    LLM <-->|MCP JSON-RPC over stdio| MCP
-    MCP --- DOMAIN
-    MCP --> BACK
-    BACK --> IPC
-    BACK --> SEXPR
-    BACK --> CLI
-    IPC <-->|Headless provider| HL
-    IPC <-->|Direct-socket provider, opt-in| GUI
-    MCP <-->|Plugin provider: kicad-ai-bridge/v1\nnamed pipe / Unix socket| BRIDGE
-    BRIDGE --> IPC
-    BRIDGE <-->|KiCad IPC| GUI
+    subgraph MCP["kicad-ai-mcp: one process per assistant, stdio"]
+        TOOLS["MCP tools<br/>session_*  sch_*<br/>plan store, idempotency keys,<br/>result envelope"]
+    end
+
+    DOMAIN["kicad-domain<br/>circuit spec, plans, layout engine,<br/>readability checks, capabilities, results"]
+    ANY["kicad-session<br/>AnySession"]
+
+    subgraph API["API sessions: KiCad 11"]
+        SESS["Session<br/>headless or gui"]
+        IPC["kicad-ipc<br/>protobuf over a native NNG client"]
+        REG[("instance registry<br/>one JSON file per editor")]
+    end
+
+    subgraph FILE["File sessions: KiCad 10, or no KiCad running"]
+        FS["FileSession<br/>verified copy, atomic replace"]
+        SEXPR["kicad-sexpr<br/>parser, library reader,<br/>insert-only writer"]
+    end
+
+    CLIR["kicad-cli-runner<br/>discovery, ERC, netlist, PNG"]
+    CLI["kicad-cli"]
+    HL["kicad-cli api-server<br/>headless, a child of the MCP process"]
+    GUI["KiCad 11 editor"]
+    PLUGIN["kicad-ai-plugin<br/>toolbar button: registers the editor"]
+    FILES[("schematic files")]
+
+    LLM <-->|"MCP JSON-RPC over stdio"| TOOLS
+    TOOLS --> DOMAIN
+    TOOLS --> ANY
+    ANY --> SESS
+    ANY --> FS
+    SESS --> IPC
+    IPC <-->|"private named pipe or socket"| HL
+    IPC <-->|"socket and token from the registry"| GUI
+    GUI -->|"runs it on a button press"| PLUGIN
+    PLUGIN -->|"writes socket, token, version"| REG
+    SESS -->|"reads"| REG
+    FS --> SEXPR
     SEXPR <--> FILES
+    SESS --> CLIR
+    FS --> CLIR
+    CLIR --> CLI
     CLI --> FILES
     HL <--> FILES
     GUI <--> FILES
 ```
+
+The same picture with the crate graph, the registration flow, and both apply sequences is in [architecture.md](architecture.md).
 
 ### 3.1 Session providers
 
@@ -148,9 +175,11 @@ flowchart TB
 
 | Provider | KiCad | How the instance is chosen | Use |
 |---|---|---|---|
-| `HeadlessSessionProvider` | 11 | MCP spawns `kicad-cli api-server --socket <private path> <project>` with a fixed argument array; the socket path is in a private runtime directory | **First IPC path.** Deterministic automation, CI, and generation of designs not open in a GUI |
-| `PluginSessionProvider` (`provider: gui`) | 11 | The user presses the "KiCad AI: connect" toolbar button; the plugin registers the instance (socket + token) and the MCP server connects to it with the token pinned | Live co-editing with the user; changes appear in the editor with undo |
-| `DirectSocketProvider` | 10 and 11 | Explicit configuration only. Attach to a configured or discovered socket, pin the instance token from the first reply, and require the target document in `GetOpenDocuments` | KiCad 10 GUI liveness/open-document checks and PCB work; KiCad 11 GUI without the plugin |
+| `Session`, headless (`provider: headless`) | 11 | MCP spawns `kicad-cli api-server --socket <private path> <project>` with a fixed argument array; the socket path is in a private runtime directory | **First IPC path.** Deterministic automation, CI, and generation of designs not open in a GUI |
+| `Session`, GUI (`provider: gui`) | 11 | The user presses the "KiCad AI: connect" toolbar button; the plugin registers the instance (socket + token) and the MCP server connects to it with the token pinned | Live co-editing with the user; changes appear in the editor with undo |
+| `FileSession` (`provider: file`) | 10 and 11 | An explicit `.kicad_sch` path that no editor has open | KiCad 10 fallback, and any generation that needs no running KiCad; edits verified in a copy, then replaced atomically |
+
+A `DirectSocketProvider` for attaching to a KiCad 10 editor was planned and not built: KiCad 10's API reports open documents by filename only and only the first KiCad on Windows gets an endpoint, so the lock file is the guard against an open editor instead.
 
 Rules:
 - Never attach to a socket the current user does not own.
@@ -165,38 +194,23 @@ Rules:
 - On Windows only one GUI instance gets an API endpoint: with two KiCad GUIs running (one 10.99, one 10.0.7), the second had no reachable socket at all. `session_status` must report which instance answered (version + token) and never assume the endpoint belongs to the KiCad the user means; the plugin provider (which receives the socket from KiCad) and the headless provider (own socket) avoid the ambiguity.
 - One provider per target document at a time. A document open in a GUI must not also be mutated through a headless server or the file backend.
 
-### 3.2 Backends and capability model
+### 3.2 Sessions and the capability model
 
 ```text
-trait KiCadBackend {
-    fn capabilities(&self) -> &CapabilitySet;   // probed, not assumed
-    // read, plan-apply, netlist, erc, export … each gated by a capability
-}
+enum AnySession { Ipc(Session), File(FileSession) }   // same operations on both
 ```
 
-| Backend | KiCad | Provides |
+| Part | KiCad | Provides |
 |---|---|---|
-| `IpcSchematicBackend` | 11 | Schematic read/mutate, hierarchy, netlist, save, IPC jobs |
-| `IpcCoreBackend` | 10, 11 | Version, open documents, save/revert, selection; PCB read/mutate (later) |
-| `SchFileBackend` (`kicad-sexpr`) | 10, 11 | Schematic read from saved files; on KiCad 10, guarded mutation of documents not open in an editor |
-| `CliBackend` | 10, 11 | ERC (`--format json`), netlist, SVG/PDF/PNG/BOM export, `sch diff` (11) |
+| `Session` over `kicad-ipc` | 11 | Schematic read/mutate, hierarchy, netlist, save, document lifecycle |
+| `FileSession` over `kicad-sexpr` | 10, 11 | Schematic read from the file; guarded mutation of a document no editor has open |
+| `kicad-cli-runner` (used by both) | 10, 11 | ERC (`--format json`), netlist, PNG (11 only) and other exports, `sch upgrade` |
 
-Capabilities are probed at session start (`GetVersion`, then a harmless request per capability family; `AS_UNHANDLED` / `AS_UNIMPLEMENTED` → unsupported). Selection order per operation: IPC → CLI → file. A fallback is used only when the preferred backend is **unavailable**. If KiCad answered and rejected a request, the operation stops and reports the KiCad error; it never retries through another backend.
+Capabilities are probed when an API session opens (`GetVersion`, then a harmless request per capability family; `AS_UNHANDLED` / `AS_UNIMPLEMENTED` → unsupported) and fixed for a file session. If KiCad answered and rejected a request, the operation stops and reports the KiCad error; it never retries through another backend.
 
-### 3.3 Capability matrix (MVP target)
+### 3.3 Capability matrix
 
-| Capability | KiCad 11 | KiCad 10 |
-|---|---|---|
-| `session.status`, `session.open_documents` | IPC | IPC (GUI, API server enabled); the open schematic is identified by filename only, with no project path |
-| `sch.read_symbols`, `sch.read_pins`, `sch.read_labels` | IPC | File (saved state only) |
-| `sch.netlist` | IPC (`GetSchematicNetlist`) | CLI (`sch export netlist`) |
-| `sch.place_symbol`, `sch.add_wire`, `sch.add_label`, `sch.set_field` | IPC | File, only if the document is not open in any editor (later phase) |
-| `sch.save` | IPC | File writer (atomic) |
-| `sch.erc` | CLI (KiCad 11 has no ERC job over IPC) | CLI |
-| `sch.render` | CLI on an in-memory snapshot (PNG) | CLI (SVG/PDF) |
-| `sch.export_netlist` | CLI on an in-memory snapshot | CLI |
-| `sch.diff` | CLI | Unavailable |
-| Live co-editing with undo | Plugin provider | Unavailable |
+The observed matrix, per provider, is in [capability-matrix.md](capability-matrix.md); a test keeps it listing every capability.
 
 ### 3.4 Process ownership
 
@@ -204,11 +218,11 @@ Capabilities are probed at session start (`GetVersion`, then a harmless request 
 |---|---|---|---|
 | MCP server | One process per MCP host session | Tools, validation, policy, plans, backend selection, owning the headless child | Write non-protocol text to stdout; attach to unowned sockets; fall back after a KiCad rejection |
 | Headless API server | Child of the MCP server | Load the target project, serve IPC | Outlive the MCP process; listen on a non-private path |
-| Plugin / bridge | Launched by a KiCad 11 editor action | Hold the KiCad-provided connection, serialize requests, serve the local endpoint | Expose TCP; log the token; allow overlapping mutations |
+| Plugin (registrar) | Launched by a KiCad 11 editor action; exits when done | Write the editor's socket, token, version, and open projects to the instance registry; show a confirmation | Serve requests; stay running; log the token |
 | `kicad-ipc` | Library | Envelope/protobuf, NNG, deadlines, status mapping | Leak protobuf types to MCP/domain |
-| `kicad-sexpr` | Library | Lossless parse/serialize, UUID preservation, atomic write, revision checks | Write a file open in an editor; change the format version |
+| `kicad-sexpr` | Library | Parse with source positions, read symbol libraries and schematics, add a plan to a schematic by inserting text | Re-print a file; change its format version |
 | `kicad-cli-runner` | Short-lived children | ERC/export/diff with fixed argument arrays, JSON reports | Use a shell; treat exit 0 as functional correctness |
-| `kicad-domain` | Library | IR, plans, validation, capabilities | Depend on transport or UI state |
+| `kicad-domain` | Library | IR, plans, layout engine and readability checks, validation, capabilities | Depend on transport or UI state |
 
 ---
 
@@ -218,48 +232,39 @@ Single Cargo workspace. No microservices or containers until the core works.
 
 ```text
 thingsvu-tools/
-├── Cargo.toml
-├── Cargo.lock
-├── rust-toolchain.toml
+├── Cargo.toml  Cargo.lock  rust-toolchain.toml  rustfmt.toml
+├── README.md  LICENSE
+├── .github/workflows/{ci,release}.yml
 ├── docs/
-│   ├── kicad-ai-mcp-design-plan.md
+│   ├── README.md
+│   ├── architecture.md                 # current diagrams and the changes from this plan
+│   ├── capability-matrix.md            # per provider
+│   ├── kicad-ai-mcp-design-plan.md     # this file
 │   ├── kicad-api-compatibility.md      # pinned builds, proto commit, probe results
-│   └── tool-contracts.md
-├── examples/
-│   ├── two-resistor-series-chain.json
-│   └── mcp-client-config.example.json
-├── plugin-package/
-│   ├── plugin.json                      # KiCad 11 manifest (schematic + pcb scopes)
-│   └── README.md
+│   ├── releasing.md
+│   ├── tasks.md                        # phase task list with decisions to review
+│   └── examples/                       # circuit specs: two-resistor chain, regulator, NE555
+├── plugin-package/{plugin.json,icons/}
 ├── crates/
-│   ├── kicad-ai-mcp/                    # bin + lib: MCP stdio server (tools, result envelope)
-│   │   └── src/{main,lib,server,envelope}.rs
-│   ├── kicad-session/                   # lib: session providers (headless first), capability
-│   │   └── src/{session,headless,job,capability_map,errors}.rs   # mapping, serialized access
-│   ├── kicad-ai-plugin/                 # bin: KiCad 11 exec plugin / bridge
-│   │   └── src/{main,lifecycle,local_server,config}.rs
-│   ├── kicad-domain/                    # lib: IR, plans, validation, capabilities
-│   │   └── src/{lib,circuit,geometry,operations,validation,ids,capabilities,result}.rs
-│   ├── kicad-ipc/                       # lib: protobuf + NNG adapter
-│   │   ├── build.rs
-│   │   ├── proto/                       # vendored from KiCad commit d033635628
-│   │   └── src/{lib,connection,envelope,errors,probe,schematic,core}.rs
-│   ├── kicad-sexpr/                     # lib: lossless .kicad_sch engine
-│   │   └── src/{lib,parse,write,schematic,atomic,lock}.rs
-│   ├── kicad-cli-runner/                # lib: kicad-cli jobs and report parsing
-│   │   └── src/{lib,install,erc,netlist,export,diff}.rs
-│   └── kicad-ipc-mock/                  # dev lib: fake KiCad API server on a real pipe/socket
-├── tests/
-│   ├── fixtures/{v10,v11}/              # KiCad-authored files per version
-│   ├── mcp_protocol.rs
-│   ├── bridge_protocol.rs
-│   ├── backend_contract.rs              # same assertions on every backend
-│   └── live_kicad_smoke.rs              # #[ignore] unless KICAD_LIVE=1
+│   ├── kicad-ai-mcp/                   # bin + lib: MCP stdio server
+│   │   └── src/{main,lib,server,plans,envelope}.rs
+│   ├── kicad-session/                  # lib: Session (headless, gui), FileSession, AnySession
+│   │   └── src/{any,session,headless,file,mutate,schematic,registry,capability_map,errors,job}.rs
+│   ├── kicad-ai-plugin/                # bin: KiCad 11 plugin that registers the editor
+│   ├── kicad-domain/                   # lib: circuit spec, plans, layout, readability, validation
+│   │   └── src/{circuit,geometry,ids,layout,plan,readability,schematic,validation,capability,result}.rs
+│   ├── kicad-ipc/                      # lib: protobuf + native NNG client (protos vendored)
+│   ├── kicad-sexpr/                    # lib: parser, symbol libraries, schematic reader, writer
+│   │   └── src/{node,sym,sch,emit}.rs
+│   ├── kicad-cli-runner/               # lib: kicad-cli discovery and jobs
+│   ├── kicad-ipc-mock/                 # dev lib: fake KiCad API server on a real pipe/socket
+│   └── kicad-fault-tests/              # failure injection: fake kicad-cli, misbehaving API servers
+├── tests/fixtures/v11/                 # KiCad-authored files
 └── scripts/
-    ├── install-plugin.ps1
-    ├── uninstall-plugin.ps1
-    ├── probe-kicad.ps1                  # Phase 0 capability probe
-    └── run-live-smoke-test.ps1
+    ├── install.ps1  uninstall.ps1      # for users (shipped in the release zip)
+    ├── package.ps1  test-installer.ps1 # release packaging and its smoke test
+    ├── install-plugin.ps1  uninstall-plugin.ps1   # for developers: plugin only, from a build
+    └── probe-kicad.ps1                 # Phase 0 capability probe
 ```
 
 Shell (`.sh`) equivalents are added when Linux/macOS are supported.
@@ -621,7 +626,7 @@ If no file exists: `KICAD_HOME`, then standard install directories. `session_sta
 1. `cargo build`.
 2. `scripts\install-plugin.ps1` (KiCad 11 plugin directory only).
 3. Headless path: run the MCP server, `session_open` with provider `headless` on a disposable project.
-4. GUI path: open the disposable project in the nightly, click **Start / reconnect AI bridge**, `session_open` with provider `plugin`.
+4. GUI path: open the disposable project in the nightly, press **KiCad AI: connect**, `session_open` with provider `gui`.
 5. Tier 2: close KiCad 10, `session_open` with provider `file`.
 6. Run `cargo test`, then live tests with `KICAD_LIVE=1`.
 
@@ -680,7 +685,7 @@ Plan/apply, symbol placement, fields, wires, labels, one commit per apply, read-
 Exit: all Tier 1 headless acceptance criteria.
 
 ### Phase 4 — KiCad 11 GUI plugin provider
-`kicad-ai-plugin`, `kicad-ai-bridge/v1` over named pipe, discovery file, start/stop, reconnect. Same demo live in the Schematic Editor with undo.
+`kicad-ai-plugin` as a registrar (revision 3: no bridge protocol): the toolbar button records the editor's socket and token, and the MCP server connects to it. Same demo live in the Schematic Editor with undo.
 
 Exit: all Tier 1 acceptance criteria.
 
@@ -700,7 +705,7 @@ Generated schematics must read like a person drew them, not only be electrically
 Exit: all Tier 2 acceptance criteria.
 
 ### Phase 7 — Hardening and packaging
-PCM package and PowerShell installer, log rotation, failure-injection suite, documentation of the observed capability matrix. Re-pin to KiCad 11.0 when released and re-run the Phase 0 probes.
+**Done**, except the re-pin. A rotating log file for the MCP server; a failure-injection suite (`kicad-fault-tests`: a fake `kicad-cli` that crashes, hangs, lies, or races, and misbehaving API servers) with a source-level guard that no log call mentions a token; the observed capability matrix ([capability-matrix.md](capability-matrix.md)); release automation that tags `v<Cargo version>` and publishes a Windows zip, a PCM package, a Linux archive, and checksums ([releasing.md](releasing.md)); a PowerShell installer that sets up the server, the plugin, and the assistant entry, with a sandbox smoke test in CI; and the architecture documentation brought up to date ([architecture.md](architecture.md)). Re-pinning to KiCad 11.0 waits for its release: re-run `scripts/probe-kicad.ps1` and the live tests against it, update docs/kicad-api-compatibility.md, and bump the supported format range in `kicad-sexpr`.
 
 ### Later
 PCB tools on IPC (both versions), hierarchical sheets, multi-unit symbols, BOM/part tooling, design-review checks, simulation hand-off, MCP prompts/resources and a bundled skill with KiCad conventions, on-demand tool groups, enclosure integration (§16.1).
@@ -735,7 +740,7 @@ From a clean checkout on Windows 11:
 
 1. Build with locked dependencies.
 2. **KiCad 11 headless:** MCP host launches `kicad-ai-mcp`; agent creates the two-resistor demo through plan/apply; save, netlist, ERC; netlist matches the fixture; file reopens in the nightly GUI.
-3. **KiCad 11 GUI:** install the plugin, open the project, start the bridge, repeat the demo live; one undo step reverts it.
+3. **KiCad 11 GUI:** install the plugin, open the project, press **KiCad AI: connect**, repeat the demo live; one undo step reverts it.
 4. **KiCad 10 fallback:** with KiCad 10.0.7, the same agent request produces a correct schematic via the file backend on a closed project, and the result opens in KiCad 10.0.7.
 5. Close KiCad mid-session: tools report a clean disconnected error; reconnect and repeat.
 6. `session_status` truthfully reports provider, version, and capability matrix in every case.
@@ -751,9 +756,8 @@ Keep `kicad-domain` KiCad-specific. When the mechanical/enclosure tools start, d
 
 - Workspace: `thingsvu-tools`
 - MCP binary: `kicad-ai-mcp`
-- Plugin/bridge binary: `kicad-ai-plugin`
-- Bridge protocol: `kicad-ai-bridge/v1`
-- Crates: `kicad-domain`, `kicad-ipc`, `kicad-sexpr`, `kicad-cli-runner`, `kicad-ipc-mock`
+- Plugin binary: `kicad-ai-plugin`
+- Crates: `kicad-domain`, `kicad-ipc`, `kicad-sexpr`, `kicad-cli-runner`, `kicad-session`, `kicad-ipc-mock`, `kicad-fault-tests`
 - First composite tool: `sch_create_demo_circuit`
 - First fixture: `two_resistor_series_chain`
 

@@ -207,3 +207,29 @@ Phase 6 notes for review:
 - **Attention — please check in the KiCad 10.0.7 GUI:** open `C:\Users\bkraj\AppData\Local\Temp\claude\d--projects-thingsvu-tools\9f114868-d441-4ca7-a21f-9cd845c55fae\scratchpad\file-sample\regulator_3v3.kicad_sch` (File → Open). `kicad-cli` 10.0.7 loads it, and its netlist and ERC run, but the editor itself has not been driven by me. Things to look for: no format-upgrade or repair prompt, the same layout as the KiCad 11 build, and the text next to each part.
 - **Review:** only the root sheet of a schematic is read and edited. Hierarchical sheets and multi-unit symbols are not supported (as before).
 - **Review:** the new symbols' instance data is recorded under the project name that existing symbols use, else the `.kicad_pro` name beside the file, else an empty name — which is how KiCad writes a standalone schematic.
+
+---
+
+## Phase 7 — Hardening and packaging
+
+Exit criteria: a user can install everything with one script and connect an assistant; a release is built, checked, and published from the Cargo version alone; failures leave the design untouched and say so; the documentation matches what was built.
+
+- [x] **7.1 Rotating logs** — `kicad-ai-mcp` writes to stderr and to a daily rotating file under `%LOCALAPPDATA%\thingsvu\kicad-ai\logs` (the last 7 days kept). `--log-dir`, `THINGSVU_LOG_DIR`, and `--no-log-file` change or turn that off; a folder that cannot be written is a warning, not a failure.
+- [x] **7.2 Failure-injection suite** — new crate `kicad-fault-tests` (16 tests, no KiCad needed). A fake `kicad-cli` that crashes, hangs, writes a non-netlist, reports the wrong nets, or edits the file while it is being verified drives the file provider: in every case the schematic is exactly as it was (or, for an outside edit, exactly as the outside edit left it) and no verification copy is left. Also covered: stale plans, an editor opening the file, plans with errors, unsupported file formats, and clean-up of old leftover copies. For the API: a busy, replaced, slow, or vanished KiCad, and what each means for a read versus a change.
+  - **Review:** what the suite cannot do is kill a real KiCad mid-request; the API side uses the mock server. A manual check with the nightly (kill it during an apply) is still worth doing once.
+  - `FILE_CHANGED_ON_DISK` now exists: the file is compared once more after verification, just before it is replaced. `SessionConfig` gained `cli_timeout`.
+- [x] **7.3 No token in logs** — a test reads every `tracing` call in the workspace and fails if one mentions a token (plan §5.6).
+- [x] **7.4 Capability matrix** — [docs/capability-matrix.md](capability-matrix.md), per provider; a test in `kicad-domain` fails if a capability has no row.
+- [x] **7.5 Packages** — `scripts/package.ps1` builds the Windows zip (server, plugin, installer, README), a KiCad Plugin and Content Manager package, the standalone `install.ps1`, and `SHA256SUMS.txt`. Zips are written with forward-slash entry names (Windows PowerShell 5.1's `Compress-Archive` writes backslashes, which the zip format does not allow).
+  - **Attention:** the PCM package follows the published schema (`runtime: ipc`, `plugins/` at the root) but **has not been installed through KiCad's Plugin and Content Manager**. Where KiCad 11 looks for an API plugin installed that way is unconfirmed. Please try *Plugin and Content Manager → Install from File…* once and tell me what happens.
+- [x] **7.6 Installer** — `scripts/install.ps1` (from the extracted zip, or downloading and verifying the newest release) installs the server, the plugin for every KiCad 11 / 10.99 folder it finds, and — after asking — the Claude Code and Claude Desktop entries (settings are backed up; a settings file that is not JSON is left alone). `scripts/uninstall.ps1` removes exactly that. `scripts/test-installer.ps1` runs both in a sandbox and is part of CI.
+  - **Review:** the README's one-line install runs `install.ps1` from the `main` branch. Anyone preferring not to run a downloaded script can use the zip. `irm … | iex` cannot pass options; `install.ps1 -Yes` and friends need the zip or `& ([scriptblock]::Create((irm …))) -Yes`.
+- [x] **7.7 Release automation** — `.github/workflows/release.yml`: on a push to `main`, if `v<Cargo version>` has no tag, it runs the tests, builds Windows and Linux, packages, smoke-tests the installer, and creates the tag and release (with generated notes, install steps, and checksums). A version below 1.0 is a pre-release. Documented in [releasing.md](releasing.md).
+  - **Decision:** the version is now **0.1.0** (was 0.0.1), so this push publishes the first release, `v0.1.0`, as a pre-release.
+  - **Review:** binaries are not code-signed (SmartScreen may warn). Linux gets the MCP server only; the plugin's dialog and paths are Windows-specific.
+- [x] **7.8 README** — quick start (install, enable the API, connect an assistant, first prompts), the three providers, tools, troubleshooting, update and removal, build from source.
+- [x] **7.9 Architecture documentation** — new [docs/architecture.md](architecture.md) with current diagrams (components, crates, editor registration, planning pipeline, both apply sequences, releases) and a table of what changed from the plan; the plan's diagram, provider and backend sections, process table, repository layout, and stale "bridge" wording were brought in line.
+- [~] **7.10 Re-pin to KiCad 11.0** — waits for the release. The procedure is in docs/kicad-api-compatibility.md.
+- [~] **7.11 One s-expression parser** — `kicad-cli-runner` still has its own small text parser for netlists next to `kicad-sexpr`. Merging them is a cleanup with no user-visible effect.
+- [~] **7.12 Layout hints and editing tools (task 5.9)** — still not done.
+  - **Review:** the README roadmap lists them under *Next*. Decision for you: make them Phase 8, or fold them into PCM / PCB work?

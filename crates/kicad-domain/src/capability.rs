@@ -36,6 +36,25 @@ pub enum Capability {
     SchExportNetlist,
 }
 
+impl Capability {
+    /// Every capability, in the order the capability matrix lists them.
+    pub const ALL: [Capability; 13] = [
+        Capability::SessionStatus,
+        Capability::SessionOpenDocuments,
+        Capability::DocumentLifecycle,
+        Capability::Commits,
+        Capability::SchReadHierarchy,
+        Capability::SchReadSymbols,
+        Capability::SchNetlist,
+        Capability::SchPlaceSymbol,
+        Capability::SchEditItems,
+        Capability::SchSave,
+        Capability::SchErc,
+        Capability::SchRender,
+        Capability::SchExportNetlist,
+    ];
+}
+
 /// Where a capability is served from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +122,24 @@ impl CapabilitySet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// docs/capability-matrix.md has a row for every capability, so it cannot fall behind the code.
+    #[test]
+    fn the_capability_matrix_lists_every_capability() {
+        let doc = include_str!("../../../docs/capability-matrix.md");
+        for capability in Capability::ALL {
+            let name = serde_json::to_value(capability).unwrap();
+            let name = name.as_str().unwrap();
+            assert!(
+                doc.contains(&format!("| `{name}` |")),
+                "{name} has no row in docs/capability-matrix.md"
+            );
+        }
+        // Nothing was added to the enum without being added to ALL: every name round-trips and
+        // the list has no duplicates.
+        let unique: std::collections::BTreeSet<_> = Capability::ALL.iter().collect();
+        assert_eq!(unique.len(), Capability::ALL.len());
+    }
 
     #[test]
     fn serializes_with_dotted_names() {

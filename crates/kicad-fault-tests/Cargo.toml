@@ -1,0 +1,22 @@
+[package]
+name = "kicad-fault-tests"
+description = "Failure-injection tests: a fake kicad-cli and fake KiCad API servers that misbehave on purpose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "fake-kicad-cli"
+path = "src/main.rs"
+
+[dev-dependencies]
+kicad-cli-runner = { path = "../kicad-cli-runner" }
+kicad-domain = { path = "../kicad-domain" }
+kicad-ipc = { path = "../kicad-ipc" }
+kicad-ipc-mock = { path = "../kicad-ipc-mock" }
+kicad-session = { path = "../kicad-session" }
+kicad-sexpr = { path = "../kicad-sexpr" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

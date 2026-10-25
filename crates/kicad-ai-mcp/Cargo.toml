@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "sync", "signal"] }
 tracing.workspace = true
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
