@@ -11,6 +11,7 @@ rust-version.workspace = true
 kicad-cli-runner = { path = "../kicad-cli-runner" }
 kicad-domain = { path = "../kicad-domain" }
 kicad-ipc = { path = "../kicad-ipc" }
+kicad-sexpr = { path = "../kicad-sexpr" }
 prost.workspace = true
 prost-types.workspace = true
 serde.workspace = true

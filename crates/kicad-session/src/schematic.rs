@@ -148,7 +148,7 @@ pub(crate) fn symbol_pins(s: &SchematicSymbolInstance) -> Result<Vec<PinInfo>, T
 }
 
 /// Sorts "2" before "10" and keeps alphanumeric pin numbers stable.
-fn natural_key(number: &str) -> (u64, String) {
+pub(crate) fn natural_key(number: &str) -> (u64, String) {
     (number.parse::<u64>().unwrap_or(u64::MAX), number.to_owned())
 }
 
@@ -329,7 +329,7 @@ impl Session {
 }
 
 /// Sorts R2 before R10.
-fn natural_reference(reference: &str) -> (String, u64, String) {
+pub(crate) fn natural_reference(reference: &str) -> (String, u64, String) {
     let prefix: String = reference.chars().take_while(|c| !c.is_ascii_digit()).collect();
     let number = reference[prefix.len()..].parse::<u64>().unwrap_or(u64::MAX);
     (prefix, number, reference.to_owned())

@@ -79,3 +79,23 @@ Probe tool: `scripts/probe-kicad.ps1`. Fixtures produced along the way: `tests/f
 | `GetItemsFromLibrary` (symbols) | ✅ returns `SchematicSymbol` per id with reference prefix, `unit_count`, and pins (number, name, local position in the placed y-down axes, unit). Unknown entries are omitted | _not run_ | — |
 | `UpdateItems` of one field with `ItemHeader.field_mask` and no embedded `definition` | ✅ value changes, no duplicate library symbol (one or two instances) | ⚠ the earlier full-object update inside a commit replied `10k` but did not persist; the masked form is untested in the GUI | — |
 | `DeleteItems` (cleanup of placed symbols) | ✅ used to undo a failed apply; document returned to its starting fingerprint | _not run_ | — |
+
+## File provider observations (KiCad 10.0.7, Phase 6)
+
+Observed 25 Oct 2026 while building the file provider (`kicad-sexpr`, `FileSession`).
+
+| Topic | Observation |
+|---|---|
+| Schematic format | 10.0.7 writes `(version 20260306)`, `(generator_version "10.0")`. The 10.99 nightly writes `20261015`. The 10.0 CLI refuses `20261015` files ("Failed to load schematic"); the 10.99 CLI reads both. |
+| Symbol library format | 10.0.7 libraries are `(version 20251024)`, `(generator_version "10.0")`; same structure as the nightly's for everything the layout reads. |
+| `kicad-cli sch upgrade --force <file>` | 10.0.7 rewrites an older schematic (e.g. a bundled demo, format `20250114`) in the current format. Used to make KiCad-authored fixtures. |
+| Instance syntax | Identical in 20260306 and 20261015: `lib_id`, `at`, `(mirror x\|y)`, `unit`, `body_style`, flags, `uuid`, `property`×5, `pin`, `instances`. Wires use `(stroke (width 0) (type default))`; labels use `(justify left\|right bottom)` with angle 0/90/180/270; junctions `(diameter 0) (color 0 0 0 0)`. |
+| Field text | A property's `(at x y angle)` is the library's offset moved by the symbol's transform; the **angle is stored relative to the symbol** (a fuse rotated 90° keeps the library's 90 for its reference and is drawn horizontal). |
+| Pin geometry | Library y-up coordinates map to the API's y-down ones by negating y; the library's pin angle points from the connection point toward the body. The geometry read from 10.0.7's library files equals the 10.99 API's for every symbol of the golden circuits. |
+| `extends` | A derived symbol (`NE555P` extends `NE555D`) is embedded in schematics as one flattened symbol; its sub-symbols take the derived name. |
+| Netlist | `kicad-cli sch export netlist` omits power symbols and flags (`#PWR…`, `#FLG…`), unlike the API's `GetSchematicNetlist`. Net names are still set by power symbols (`+5V`, `GND`). |
+| Lock file | An editor with a schematic open leaves `~<name>.kicad_sch.lck` beside it (seen beside the demo project while the nightly had it open). |
+| PNG export | `kicad-cli sch export png` exists only in the 10.99 CLI; 10.0.7 has `svg`, `pdf`, `ps`, `dxf`, `hpgl`. |
+| 10.99 CLI on 10.0 files | Reads a 20260306 file and exports PNG of it; used for rendering in file sessions. |
+| Library lookup | Global libraries live in `<install>/share/kicad/symbols/<nickname>.kicad_sym` (10.0 and 10.99 on Windows). The project's own `sym-lib-table` can name others; the user's global table (custom libraries) is not read. |
+| KiCad 10 GUI loading of a generated file | **Not yet checked by the author**: loaded by `kicad-cli` 10.0.7 (netlist, ERC) only. See docs/tasks.md, Phase 6 notes. |

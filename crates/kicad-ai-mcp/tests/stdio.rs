@@ -408,6 +408,145 @@ async fn live_demo_circuit_end_to_end() {
 }
 
 #[tokio::test]
+async fn live_file_provider_on_kicad_10() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("demo.kicad_sch");
+
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "create": true, "provider": "file" }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    assert_eq!(opened["result"]["provider"], "file");
+    assert_eq!(opened["provenance"][0]["origin"], "project_file");
+    assert!(
+        opened["result"]["kicad_version"].as_str().unwrap().starts_with("10.0"),
+        "{opened}"
+    );
+    assert_eq!(
+        opened["result"]["capabilities"]["sch.place_symbol"]["backend"],
+        "project_file"
+    );
+    assert_eq!(opened["result"]["capabilities"]["session.commits"]["available"], false);
+    let id = opened["result"]["session_id"].clone();
+    assert!(schematic.is_file(), "a file session creates the file");
+
+    let plan = mcp.call("sch_create_demo_circuit", json!({ "session_id": id })).await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    let plan_id = plan["result"]["plan_id"].clone();
+
+    // An edit made outside the tool after planning makes the plan stale and changes nothing more.
+    let original = std::fs::read_to_string(&schematic).unwrap();
+    std::fs::write(&schematic, format!("{original}\n")).unwrap();
+    let stale = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "file-key-0001" }),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], "STALE_PLAN", "{stale}");
+    std::fs::write(&schematic, &original).unwrap();
+
+    // An editor that opened the file in the meantime blocks the change.
+    let lock = dir.join("~demo.kicad_sch.lck");
+    std::fs::write(&lock, "{}").unwrap();
+    let plan = mcp.call("sch_create_demo_circuit", json!({ "session_id": id })).await;
+    let plan_id = plan["result"]["plan_id"].clone();
+    let blocked = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "file-key-0002" }),
+        )
+        .await;
+    assert_eq!(blocked["error"]["code"], "DOCUMENT_OPEN_ELSEWHERE", "{blocked}");
+    assert_eq!(std::fs::read_to_string(&schematic).unwrap(), original);
+    std::fs::remove_file(&lock).unwrap();
+
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan_id, "confirm": true, "idempotency_key": "file-key-0003" }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result_state"], "done", "{applied}");
+    assert_eq!(applied["result"]["verified"], true);
+    assert_eq!(applied["result"]["undo_steps"], 0);
+    let backup = applied["result"]["backup_path"]
+        .as_str()
+        .expect("the previous file is kept");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert_eq!(symbols["result"]["count"], 2, "{symbols}");
+    assert_eq!(symbols["provenance"][0]["origin"], "project_file");
+    let pins = mcp
+        .call("sch_get_symbol_pins", json!({ "session_id": id, "symbol": "R1" }))
+        .await;
+    assert_eq!(pins["result"]["pins"].as_array().unwrap().len(), 2, "{pins}");
+    let nets = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert_eq!(nets["provenance"][0]["origin"], "kicad_cli");
+    assert_eq!(nets["result"]["unconnected_pins"], 0, "{nets}");
+
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    assert_eq!(erc["ok"], true, "{erc}");
+    assert!(
+        erc["warnings"].to_string().contains("copy of the schematic file"),
+        "{erc}"
+    );
+
+    let render = mcp
+        .request(
+            "tools/call",
+            json!({ "name": "sch_render", "arguments": { "session_id": id } }),
+        )
+        .await;
+    let image = render["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "image")
+        .unwrap_or_else(|| panic!("no image block: {render}"));
+    assert_eq!(image["mimeType"], "image/png");
+
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+
+    // The file as KiCad 10 itself reads it.
+    let installs = kicad_cli_runner::discover(&[]).await;
+    let cli = installs
+        .iter()
+        .find(|i| i.version.series() == 10)
+        .expect("a KiCad 10 install");
+    let netlist =
+        kicad_cli_runner::netlist::export_netlist(cli, &schematic, &dir.join("check.net"), Duration::from_secs(120))
+            .await
+            .unwrap();
+    let topology = netlist.topology();
+    for (name, pins) in [
+        ("/INPUT", vec!["R1.1"]),
+        ("/MID", vec!["R1.2", "R2.1"]),
+        ("/OUTPUT", vec!["R2.2"]),
+    ] {
+        let pins: std::collections::BTreeSet<String> = pins.into_iter().map(str::to_owned).collect();
+        assert!(topology.contains(&(name.to_owned(), pins)), "{name} in {topology:?}");
+    }
+    assert!(netlist
+        .components
+        .iter()
+        .all(|c| c.value == "10k" && c.lib_source == "Device:R"));
+}
+
+#[tokio::test]
 async fn read_only_mode_refuses_changes() {
     let mut mcp = Mcp::start_with(&["--read-only"]).await;
     for (tool, args) in [

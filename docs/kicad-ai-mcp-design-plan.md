@@ -286,12 +286,12 @@ Shell (`.sh`) equivalents are added when Linux/macOS are supported.
 - Protobuf `Any` payloads are dispatched by full type URL. Unknown types are an error, never decoded as empty.
 
 ### 5.3 File backend (`kicad-sexpr`)
-- Lossless concrete syntax tree: untouched nodes, ordering, and formatting survive a round trip byte-for-byte where KiCad's writer would also keep them.
+- Lossless by construction: the parser keeps each node's byte span and the writer only **inserts** text (new library symbols at the end of `lib_symbols`, new items before `sheet_instances`), so every other byte of the file stays as it was. Moving or deleting existing items would need a richer edit API (Phase 7 / editing tools).
 - UUIDs preserved; new objects get v4 UUIDs. File UUIDs are the same KIIDs the IPC API returns, so object identities survive a backend switch.
 - Atomic write: temp file in the same directory → flush/fsync → rename. Capture a content hash at read; refuse to write if the file changed since (`FILE_CHANGED_ON_DISK`).
 - Refuse mutation if the document is open in any editor: KiCad lock file (`~<name>.kicad_sch.lck`), `GetOpenDocuments` on any reachable instance, or a headless session holding it.
 - Preserve the file's `(version …)`; refuse unknown newer versions.
-- Validate every write by re-parsing and running `kicad-cli sch erc` / `sch export netlist` on the result.
+- Validate every write before it replaces the file: the result is written to a copy that `kicad-cli sch export netlist` must load, with exactly the planned nets (`kicad-cli`'s netlister omits power symbols, so nets are compared by real parts and by name). Built in Phase 6, as `provider: "file"`.
 
 ### 5.4 CLI runner (`kicad-cli-runner`)
 - Discover installs from configuration first, then `KICAD_HOME`, then standard install directories. Each install records its `kicad-cli version` output. Pair the CLI with the KiCad version of the target session; never run the 10.0 CLI on a file written by 11.
@@ -695,7 +695,7 @@ Generated schematics must read like a person drew them, not only be electrically
 - Acceptance: golden circuits (3.3 V regulator first) pass automated readability checks (no overlapping parts or text, power as symbols, local nets drawn as wires) and a rendered review.
 
 ### Phase 6 — KiCad 10 fallback
-`kicad-sexpr` read path, then guarded mutation for closed documents, reusing the Phase 5 layout engine; CLI-based ERC/netlist with the 10.0 CLI; direct-socket provider for open-document checks. Backend-contract tests run the demo on both backends.
+**Done.** `kicad-sexpr` (parser with spans, symbol library and schematic readers, insert-only writer); the `file` provider (`FileSession`, behind `AnySession`) with guarded mutation — content-hash and lock-file checks, a `kicad-cli`-verified copy, atomic replace, a kept backup; the Phase 5 layout engine unchanged on file-derived symbol geometry; ERC, netlist, and export on the 10.0 CLI. The planned direct-socket check for open documents was replaced by the lock-file check (KiCad 10's API is too limited to add value). Backend-contract tests run the circuit on both backends and compare the CLI's netlists. Known limits: root sheet only, global library table not read, no PNG render with only KiCad 10 installed.
 
 Exit: all Tier 2 acceptance criteria.
 

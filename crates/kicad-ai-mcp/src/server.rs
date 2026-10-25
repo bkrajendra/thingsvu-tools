@@ -8,7 +8,7 @@ use std::sync::Arc;
 use kicad_cli_runner::KicadInstall;
 use kicad_domain::{plan_circuit, CircuitSpec, ErrorCode, Origin, Provenance, ResultState, ToolError};
 use kicad_session::registry::{self, Registration};
-use kicad_session::{OpenTarget, Provider, Session, SessionConfig};
+use kicad_session::{AnySession, FileSession, OpenTarget, Provider, Session, SessionConfig};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
@@ -22,11 +22,13 @@ use crate::plans::{plan_view, PlanStore, StoredPlan};
 
 const INSTRUCTIONS: &str = "KiCad schematic tools. Start with session_status to see the KiCad installs \
 and what each session can do, then session_open on a .kicad_sch file (or create: true for a new one). \
+Use the headless or gui provider with KiCad 11; with KiCad 10 (or a file no editor has open) use the \
+file provider, which edits the file itself and checks the result with kicad-cli before replacing it. \
 Every result has ok, result_state, and provenance; a check that could not run is reported as not_run, \
 never as passing. To change a schematic, describe the circuit as components and nets, call \
 sch_plan_changes, show the plan to the user, then call sch_apply_plan with confirm: true and a fresh \
 idempotency_key. sch_apply_plan reads connectivity back from KiCad and reports any mismatch. Save with \
-sch_save; check with sch_run_erc and sch_render. Close sessions with session_close when done.";
+sch_save (a file session is saved whenever a plan is applied); check with sch_run_erc and sch_render. Close sessions with session_close when done.";
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -40,7 +42,7 @@ pub struct Options {
 struct State {
     options: Options,
     installs: OnceCell<Vec<KicadInstall>>,
-    sessions: Mutex<BTreeMap<String, Arc<Session>>>,
+    sessions: Mutex<BTreeMap<String, Arc<AnySession>>>,
     plans: Mutex<PlanStore>,
 }
 
@@ -67,16 +69,20 @@ pub enum ProviderArg {
     /// The KiCad 11 editor the user has open, after they pressed the "KiCad AI" toolbar button
     /// (kicad-ai-plugin). Changes appear live in the editor and can be undone there.
     Gui,
+    /// The schematic file itself, for KiCad 10 or any file no editor has open. Needs no running
+    /// KiCad; every applied plan is verified with kicad-cli and then written to the file.
+    File,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OpenArgs {
-    /// Absolute path of the .kicad_sch file. Required for headless; for gui, it selects the
-    /// project (root schematic) when the editor has more than one open.
+    /// Absolute path of the .kicad_sch file. Required for headless and file; for gui, it selects
+    /// the project (root schematic) when the editor has more than one open.
     #[serde(default)]
     pub schematic_path: Option<String>,
-    /// Headless only: create a new schematic at schematic_path instead of opening an existing one.
+    /// Headless and file only: create a new schematic at schematic_path instead of opening an
+    /// existing one (a file session writes the empty file immediately).
     #[serde(default)]
     pub create: bool,
     #[serde(default)]
@@ -177,12 +183,20 @@ fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Headless => "headless",
         Provider::Gui => "gui",
+        Provider::File => "file",
+    }
+}
+
+fn origin_of(provider: Provider) -> Origin {
+    match provider {
+        Provider::File => Origin::ProjectFile,
+        Provider::Headless | Provider::Gui => Origin::KicadIpc,
     }
 }
 
 fn provenance(status: &kicad_session::SessionStatus) -> Provenance {
     Provenance {
-        origin: Origin::KicadIpc,
+        origin: origin_of(status.provider),
         kicad_version: Some(status.kicad_version.clone()),
         provider: Some(provider_name(status.provider).into()),
         document: status.document.as_ref().map(|d| d.display().to_string()),
@@ -190,15 +204,24 @@ fn provenance(status: &kicad_session::SessionStatus) -> Provenance {
     }
 }
 
-/// Provenance for data read live from a session's KiCad.
-fn live(session: &Session) -> Vec<Provenance> {
+/// Provenance for data read from a session's KiCad (or, for a file session, from its file).
+fn live(session: &AnySession) -> Vec<Provenance> {
     vec![Provenance {
-        origin: Origin::KicadIpc,
+        origin: origin_of(session.provider()),
         kicad_version: Some(session.kicad_version().to_owned()),
         provider: Some(provider_name(session.provider()).into()),
         document: Some(session.document_path().display().to_string()),
         revision: None,
     }]
+}
+
+/// Provenance for data that `kicad-cli` produced from a file session's document.
+fn from_cli(session: &AnySession) -> Vec<Provenance> {
+    let mut prov = live(session);
+    if session.provider() == Provider::File {
+        prov[0].origin = Origin::KicadCli;
+    }
+    prov
 }
 
 impl KicadAiServer {
@@ -225,7 +248,7 @@ impl KicadAiServer {
             .await
     }
 
-    async fn session(&self, id: &str) -> Result<Arc<Session>, ToolError> {
+    async fn session(&self, id: &str) -> Result<Arc<AnySession>, ToolError> {
         self.state.sessions.lock().await.get(id).cloned().ok_or_else(|| {
             ToolError::new(
                 ErrorCode::NoSession,
@@ -308,7 +331,7 @@ impl KicadAiServer {
     }
 
     /// Validates, lays out, and stores a plan; returns its client view.
-    async fn make_plan(&self, session: &Arc<Session>, spec: CircuitSpec) -> Result<serde_json::Value, ToolError> {
+    async fn make_plan(&self, session: &Arc<AnySession>, spec: CircuitSpec) -> Result<serde_json::Value, ToolError> {
         let ids = kicad_domain::library_ids_for(&spec);
         let library = session.library_symbols(&ids).await?;
         let existing = session.existing_document().await?;
@@ -327,7 +350,7 @@ impl KicadAiServer {
     }
 
     /// Applies a stored plan once per idempotency key.
-    async fn apply_planned(&self, cid: &str, session: &Arc<Session>, plan_id: &str, key: &str) -> CallToolResult {
+    async fn apply_planned(&self, cid: &str, session: &Arc<AnySession>, plan_id: &str, key: &str) -> CallToolResult {
         if !(8..=128).contains(&key.len()) {
             return envelope::error(
                 cid,
@@ -452,7 +475,7 @@ liveness, unsaved changes, and the capability matrix (which features are availab
         let warnings = if installs.iter().any(|i| i.series >= 11) {
             vec![]
         } else {
-            vec!["no KiCad 11 (or 10.99 nightly) install found: headless sessions are unavailable".to_owned()]
+            vec!["no KiCad 11 (or 10.99 nightly) install found: only file sessions are available".to_owned()]
         };
         // Registered KiCad editors (the token is never shown).
         let gui_editors: Vec<_> = self
@@ -482,8 +505,10 @@ liveness, unsaved changes, and the capability matrix (which features are availab
     #[tool(
         name = "session_open",
         description = "Open a .kicad_sch file (or create a new one with create: true) in a new session. The \
-headless provider starts a private KiCad 11 API server owned by this MCP server. Refuses a file that a KiCad \
-editor has open. Returns the session status, including its capability matrix."
+headless provider starts a private KiCad 11 API server owned by this MCP server; the file provider works on \
+the file directly (KiCad 10 or 11, no KiCad running) and checks every change with kicad-cli before it \
+replaces the file; the gui provider drives the editor the user has open. Refuses a file that a KiCad editor \
+has open. Returns the session status, including its capability matrix."
     )]
     pub async fn session_open(&self, Parameters(args): Parameters<OpenArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -495,14 +520,14 @@ editor has open. Returns the session status, including its capability matrix."
             );
         }
         let installs = self.installs().await.to_vec();
-        let opened = match args.provider {
-            ProviderArg::Headless => {
+        let opened: Result<AnySession, ToolError> = match args.provider {
+            ProviderArg::Headless | ProviderArg::File => {
                 let Some(path) = path else {
                     return envelope::error(
                         &cid,
                         &ToolError::new(
                             ErrorCode::InvalidArgument,
-                            "schematic_path is required for headless sessions",
+                            "schematic_path is required for headless and file sessions",
                         ),
                     );
                 };
@@ -511,7 +536,21 @@ editor has open. Returns the session status, including its capability matrix."
                 } else {
                     OpenTarget::Existing(path)
                 };
-                Session::open_headless(&self.state.options.session, &installs, target).await
+                if matches!(args.provider, ProviderArg::File) {
+                    // A file session writes the new file straight away.
+                    if args.create {
+                        if let Err(e) = self.refuse_if_read_only() {
+                            return envelope::error(&cid, &e);
+                        }
+                    }
+                    FileSession::open(&self.state.options.session, &installs, target)
+                        .await
+                        .map(AnySession::from)
+                } else {
+                    Session::open_headless(&self.state.options.session, &installs, target)
+                        .await
+                        .map(AnySession::from)
+                }
             }
             ProviderArg::Gui => {
                 if args.create {
@@ -525,7 +564,9 @@ editor has open. Returns the session status, including its capability matrix."
                 }
                 match self.pick_registration(path.as_deref()).await {
                     Ok(registration) => {
-                        Session::open_gui(&self.state.options.session, &installs, &registration, path.as_deref()).await
+                        Session::open_gui(&self.state.options.session, &installs, &registration, path.as_deref())
+                            .await
+                            .map(AnySession::from)
                     }
                     Err(e) => Err(e),
                 }
@@ -640,7 +681,7 @@ intended connections really exist."
                     envelope::ok(
                         &cid,
                         serde_json::json!({ "count": nets.len(), "unconnected_pins": unconnected, "nets": nets }),
-                        live(&session),
+                        from_cli(&session),
                         vec![],
                     )
                 }
@@ -788,7 +829,10 @@ not prove the circuit works."
                         "violations": violations,
                     }),
                     provenance,
-                    vec!["ERC ran on a snapshot of the in-memory schematic".to_owned()],
+                    vec![match session.provider() {
+                        Provider::File => "ERC ran on a copy of the schematic file".to_owned(),
+                        _ => "ERC ran on a snapshot of the in-memory schematic".to_owned(),
+                    }],
                 )
             }
             Err(e) => envelope::error(&cid, &e),
@@ -851,7 +895,7 @@ output_path, which must be inside the schematic's folder. Returns the net and co
                     "components": netlist.components.len(),
                     "nets": netlist.nets.len(),
                 }),
-                live(&session),
+                from_cli(&session),
                 vec![],
             ),
             Err(e) => envelope::error(&cid, &e),
@@ -878,10 +922,13 @@ checked visually."
             Ok(d) => d,
             Err(e) => return envelope::error(&cid, &e),
         };
-        let Some(cli) = session.cli().cloned() else {
+        let Some(cli) = session.render_cli().cloned() else {
             return envelope::error(
                 &cid,
-                &ToolError::new(ErrorCode::FeatureUnavailable, "no matching kicad-cli install"),
+                &ToolError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "no kicad-cli that can export PNG (KiCad 10's cannot); install KiCad 11 or the 10.99 nightly",
+                ),
             );
         };
         // Render a snapshot of the in-memory document (IPC plot jobs read the saved file).
@@ -905,7 +952,7 @@ checked visually."
                 let mut r = envelope::ok(
                     &cid,
                     serde_json::json!({ "format": "png", "dpi": dpi, "bytes": bytes.len() }),
-                    live(&session),
+                    from_cli(&session),
                     vec![],
                 );
                 r.content.push(rmcp::model::ContentBlock::image(

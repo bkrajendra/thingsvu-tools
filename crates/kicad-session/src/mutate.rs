@@ -86,6 +86,9 @@ pub struct ApplyReport {
     pub undo_steps: u32,
     pub verification: Vec<NetCheck>,
     pub verified: bool,
+    /// Where the previous version of the file was kept (file sessions only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
 }
 
 /// Items created so far, for cleanup when an apply fails part way.
@@ -322,37 +325,12 @@ impl Session {
             undo_steps: if use_commit { 2 } else { 0 },
             verification,
             verified,
+            backup_path: None,
         })
     }
 
     async fn verify(&self, plan: &OperationPlan) -> Result<Vec<NetCheck>, ToolError> {
-        let nets = self.netlist().await?;
-        let mut checks = Vec::new();
-        for expected in &plan.expected_nets {
-            let first = expected.pins.iter().next().cloned().unwrap_or_default();
-            let found = nets
-                .iter()
-                .find(|n| n.pins.iter().any(|p| format!("{}.{}", p.reference, p.pin) == first));
-            let actual: BTreeSet<String> = found
-                .map(|n| {
-                    n.pins
-                        .iter()
-                        .map(|p| format!("{}.{}", p.reference, p.pin))
-                        // Power symbols the layout added (#PWR…) name the net; they are not circuit parts.
-                        .filter(|r| !r.starts_with('#') || expected.pins.contains(r))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let name_ok = found.is_some_and(|n| n.name.trim_start_matches('/') == expected.name);
-            checks.push(NetCheck {
-                net: expected.name.clone(),
-                ok: actual == expected.pins && name_ok,
-                expected: expected.pins.clone(),
-                actual,
-                kicad_net_name: found.map(|n| n.name.clone()),
-            });
-        }
-        Ok(checks)
+        Ok(verify_nets(plan, &self.netlist().await?, false))
     }
 
     /// Saves the document to its own path.
@@ -832,6 +810,49 @@ fn outward(orientation: i32, local: Point) -> Dir {
         _ if local.y.0 < 0 => Dir::Up,
         _ => Dir::Down,
     }
+}
+
+/// Compares the nets KiCad reports with the nets the plan expects. `kicad-cli`'s netlister
+/// leaves power symbols and flags out, so a check against it passes `ignore_power_symbols`.
+pub(crate) fn verify_nets(
+    plan: &OperationPlan,
+    nets: &[kicad_domain::NetInfo],
+    ignore_power_symbols: bool,
+) -> Vec<NetCheck> {
+    let mut checks = Vec::new();
+    for expected in &plan.expected_nets {
+        let wanted: BTreeSet<String> = expected
+            .pins
+            .iter()
+            .filter(|p| !(ignore_power_symbols && p.starts_with('#')))
+            .cloned()
+            .collect();
+        let Some(first) = wanted.iter().next().cloned() else {
+            continue;
+        };
+        let found = nets
+            .iter()
+            .find(|n| n.pins.iter().any(|p| format!("{}.{}", p.reference, p.pin) == first));
+        let actual: BTreeSet<String> = found
+            .map(|n| {
+                n.pins
+                    .iter()
+                    .map(|p| format!("{}.{}", p.reference, p.pin))
+                    // Power symbols the layout added (#PWR…) name the net; they are not circuit parts.
+                    .filter(|r| !r.starts_with('#') || wanted.contains(r))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let name_ok = found.is_some_and(|n| n.name.trim_start_matches('/') == expected.name);
+        checks.push(NetCheck {
+            net: expected.name.clone(),
+            ok: actual == wanted && name_ok,
+            expected: wanted,
+            actual,
+            kicad_net_name: found.map(|n| n.name.clone()),
+        });
+    }
+    checks
 }
 
 /// The points that bound a graphic shape, for the symbol body box.

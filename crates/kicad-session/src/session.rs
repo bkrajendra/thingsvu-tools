@@ -27,6 +27,8 @@ pub enum Provider {
     Headless,
     /// A KiCad GUI that registered itself through the `kicad-ai-plugin` toolbar action.
     Gui,
+    /// The schematic file itself, edited while no editor has it open (KiCad 10 fallback).
+    File,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +92,7 @@ pub(crate) struct Inner {
     server: Option<HeadlessServer>,
 }
 
-fn new_session_id() -> String {
+pub(crate) fn new_session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -112,12 +114,12 @@ fn fingerprint(token: &str) -> String {
 }
 
 /// KiCad keeps `~<file>.lck` next to a document while an editor has it open.
-fn lock_file(path: &Path) -> Option<PathBuf> {
+pub(crate) fn lock_file(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_string_lossy();
     Some(path.with_file_name(format!("~{name}.lck")))
 }
 
-fn check_target(target: &OpenTarget) -> Result<PathBuf, ToolError> {
+pub(crate) fn check_target(target: &OpenTarget) -> Result<PathBuf, ToolError> {
     let (OpenTarget::Existing(path) | OpenTarget::New(path)) = target;
     let path = std::path::absolute(path).map_err(|e| ToolError::new(ErrorCode::InvalidArgument, e.to_string()))?;
     if path.extension().and_then(|e| e.to_str()) != Some("kicad_sch") {

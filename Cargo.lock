@@ -434,6 +434,7 @@ dependencies = [
  "kicad-domain",
  "kicad-ipc",
  "kicad-ipc-mock",
+ "kicad-sexpr",
  "prost",
  "prost-types",
  "serde",
@@ -442,6 +443,15 @@ dependencies = [
  "tokio",
  "tracing",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "kicad-sexpr"
+version = "0.0.1"
+dependencies = [
+ "kicad-domain",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

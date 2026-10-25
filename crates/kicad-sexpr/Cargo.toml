@@ -1,0 +1,13 @@
+[package]
+name = "kicad-sexpr"
+description = "Reads KiCad schematic and symbol library files and adds planned items to a schematic file without disturbing the rest of it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kicad-domain = { path = "../kicad-domain" }
+thiserror.workspace = true
+uuid = { version = "1", features = ["v4"] }
