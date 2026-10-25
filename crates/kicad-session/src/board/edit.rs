@@ -362,7 +362,7 @@ fn status_ok(status: &Option<kicad_ipc::proto::kiapi::common::commands::ItemStat
 /// A footprint instance at the origin, front side, from a library definition, with its reference
 /// on the silkscreen above the courtyard and its value on the fabrication layer below (the
 /// library's own field places are not in the definition KiCad returns).
-fn new_instance(definition: Footprint, reference: &str, value: &str) -> FootprintInstance {
+fn new_instance(definition: Footprint, reference: &str, value: &str, reference_below: bool) -> FootprintInstance {
     let courtyard = Rect::from_points(
         definition
             .items
@@ -377,6 +377,7 @@ fn new_instance(definition: Footprint, reference: &str, value: &str) -> Footprin
         min: Point::new(Nm(-1_000_000), Nm(-1_000_000)),
         max: Point::new(Nm(1_000_000), Nm(1_000_000)),
     });
+    let (above, below) = (courtyard.min.y - Nm(1_000_000), courtyard.max.y + Nm(1_000_000));
     let field = |id: i32, name: &str, text: &str, y: Nm, layer: BoardLayer| {
         Some(Field {
             id: Some(FieldId { id }),
@@ -413,10 +414,16 @@ fn new_instance(definition: Footprint, reference: &str, value: &str) -> Footprin
             0,
             "Reference",
             reference,
-            courtyard.min.y - Nm(1_000_000),
+            if reference_below { below } else { above },
             BoardLayer::BlFSilkS,
         ),
-        value_field: field(1, "Value", value, courtyard.max.y + Nm(1_000_000), BoardLayer::BlFFab),
+        value_field: field(
+            1,
+            "Value",
+            value,
+            if reference_below { above } else { below },
+            BoardLayer::BlFFab,
+        ),
         definition: Some(definition),
         ..Default::default()
     }
@@ -512,6 +519,7 @@ impl BoardSession {
             .map_err(|e| from_ipc_error(&e, false))?;
         let message = match plan.kind {
             "outline" => "AI: board outline",
+            "place" => "AI: place footprints",
             _ => "AI: move footprints",
         };
         let result = apply_steps(client, &header, plan).await;
@@ -643,7 +651,13 @@ async fn apply_steps(
     // so the footprint is built here from the library's definition, named, moved to its place, and
     // created in the commit like any other item.
     for op in &plan.operations {
-        let BoardOp::PlaceFootprint { reference, lib_id, at } = op else {
+        let BoardOp::PlaceFootprint {
+            reference,
+            lib_id,
+            at,
+            reference_below,
+        } = op
+        else {
             continue;
         };
         let (library, name) = lib_id
@@ -672,7 +686,7 @@ async fn apply_steps(
                 _ => return Err(kerr(format!("KiCad does not find {lib_id} in its libraries"))),
             }
         };
-        let mut instance = new_instance(definition, reference, name);
+        let mut instance = new_instance(definition, reference, name, *reference_below);
         Rigid {
             from: Point::default(),
             to: *at,

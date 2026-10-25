@@ -61,6 +61,8 @@ pub enum BoardOp {
         reference: String,
         lib_id: String,
         at: Point,
+        /// Its reference text goes below it (a hole near the top edge), else above.
+        reference_below: bool,
     },
     /// A footprint moved, turned, or flipped, and its lock set.
     MoveFootprint {
@@ -106,14 +108,14 @@ pub fn normalize_deg(deg: f64) -> f64 {
     }
 }
 
-fn grid_nm(grid_mm: f64) -> Result<Nm, ToolError> {
+pub(crate) fn grid_nm(grid_mm: f64) -> Result<Nm, ToolError> {
     if !(0.0..=10.0).contains(&grid_mm) {
         return Err(bad("grid_mm is 0 (no grid) to 10"));
     }
     Ok(Nm((grid_mm * 1e6).round() as i64))
 }
 
-fn snap(p: Point, grid: Nm) -> Point {
+pub(crate) fn snap(p: Point, grid: Nm) -> Point {
     if grid.0 == 0 {
         p
     } else {
@@ -166,7 +168,7 @@ pub fn measure(board: &Board) -> LayoutMeasure {
 
 /// The inverse of [`place_point`]: where `abs` is in the coordinates of a footprint at `origin`
 /// turned by `deg`.
-fn unplace_point(origin: Point, deg: f64, abs: Point) -> Point {
+pub(crate) fn unplace_point(origin: Point, deg: f64, abs: Point) -> Point {
     let d = abs - origin;
     place_point(Point::default(), -deg, d)
 }
@@ -405,6 +407,7 @@ pub fn plan_outline(board: &Board, req: &OutlineRequest) -> Result<BoardEditPlan
             reference,
             lib_id: req.hole_footprint.clone(),
             at,
+            reference_below: at.y.0 < (rect.min.y.0 + rect.max.y.0) / 2,
         });
     }
     let after = measure(&expected);
@@ -594,7 +597,9 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                     problems.push(format!("the old outline {kind} {id} is still there"));
                 }
             }
-            BoardOp::PlaceFootprint { reference, lib_id, at } => match by_ref.get(reference.as_str()) {
+            BoardOp::PlaceFootprint {
+                reference, lib_id, at, ..
+            } => match by_ref.get(reference.as_str()) {
                 Some(f) => {
                     if !near(f.position, *at) {
                         problems.push(format!("{reference} is not at its planned place"));

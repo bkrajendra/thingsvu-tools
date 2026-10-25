@@ -119,6 +119,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_move_plan",
             "pcb_open",
             "pcb_outline_plan",
+            "pcb_place_plan",
             "pcb_render",
             "pcb_review",
             "pcb_run_drc",
@@ -2148,4 +2149,173 @@ async fn gui_pcb_edit_demo() {
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: {first} is turned and the board has an outline; Ctrl+Z twice undoes both");
+}
+
+/// The regulator board as KiCad leaves it after an update from the schematic (footprints stacked
+/// near the origin): an outline with holes, then every footprint placed, applied, read back,
+/// reviewed, and saved.
+#[tokio::test]
+async fn live_board_is_placed() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("place", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-place-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    let early = mcp.call("pcb_place_plan", json!({ "session_id": id })).await;
+    assert_eq!(early["ok"], false, "no outline yet: {early}");
+
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "corner_radius_mm": 1.5,
+                    "origin": { "x_mm": 100, "y_mm": 80 }, "mounting_holes": "corners", "hole_inset_mm": 3.5 }),
+        )
+        .await;
+    assert_eq!(outline["ok"], true, "{outline}");
+    let applied = apply_board(&mut mcp, &id, &outline, &key("outline")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+
+    let plan = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    let measured = &plan["result"]["measured"];
+    println!("PLACE MEASURED {measured}");
+    println!("PLACE WARNINGS {}", plan["result"]["warnings"]);
+    assert_eq!(measured["main_ic"], "U1", "{measured}");
+    assert_eq!(measured["after"]["overlapping_pairs"], json!([]), "{measured}");
+    assert_eq!(measured["after"]["outside_outline"], json!([]), "{measured}");
+    assert_eq!(
+        measured["before"]["outside_outline"].as_array().unwrap().len(),
+        11,
+        "everything starts clustered at the origin, away from the outline: {measured}"
+    );
+    for h in ["H1", "H2", "H3", "H4"] {
+        assert!(measured["fixed"].to_string().contains(h), "holes stay: {measured}");
+    }
+    assert_eq!(
+        plan["result"]["operations"].as_array().unwrap().len(),
+        11,
+        "every part moves: {plan}"
+    );
+    let applied = apply_board(&mut mcp, &id, &plan, &key("place")).await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(
+        applied["result"]["measured_after"]["overlapping_pairs"],
+        json!([]),
+        "{applied}"
+    );
+
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    let codes = review["result"]["issues"].to_string();
+    println!("REVIEW AFTER PLACING {}", review["result"]["issues"]);
+    for code in [
+        "FOOTPRINTS_OVERLAP",
+        "OUTSIDE_OUTLINE",
+        "DECOUPLING_FAR",
+        "CONNECTOR_FAR_FROM_EDGE",
+        "NO_OUTLINE",
+    ] {
+        assert!(!codes.contains(code), "{code}: {review}");
+    }
+    let drc = &review["result"]["drc"];
+    println!("DRC AFTER PLACING {}", drc["by_type"]);
+    assert_eq!(drc["by_type"]["courtyards_overlap"], Value::Null, "{drc}");
+    assert_eq!(drc["by_type"]["invalid_outline"], Value::Null, "{drc}");
+    let list = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
+    let j1 = footprint(&list, "J1");
+    assert!(
+        j1["courtyard"]["min"]["x"].as_f64().unwrap() < 101.0,
+        "J1 on the left edge: {j1}"
+    );
+
+    let render = mcp
+        .call("pcb_render", json!({ "session_id": id, "width": 800, "height": 600 }))
+        .await;
+    assert_eq!(render["ok"], true, "{render}");
+    if let Ok(dir) = std::env::var("THINGSVU_SAVE_RENDER") {
+        use base64::Engine;
+        let response = mcp
+            .request(
+                "tools/call",
+                json!({ "name": "pcb_render", "arguments": { "session_id": id, "width": 1200, "height": 900 } }),
+            )
+            .await;
+        let data = response["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "image")
+            .unwrap()["data"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data).unwrap();
+        std::fs::write(std::path::Path::new(&dir).join("placed-board.png"), bytes).unwrap();
+    }
+
+    // Placing again changes little: the board is already placed.
+    let again = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    println!(
+        "PLACE AGAIN {} operations",
+        again["result"]["operations"].as_array().map(|a| a.len()).unwrap_or(0)
+    );
+
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    mcp.call("pcb_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
+    let file = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    let fid = file["result"]["session_id"].clone();
+    let review = mcp.call("pcb_review", json!({ "session_id": fid })).await;
+    assert!(
+        !review["result"]["issues"].to_string().contains("FOOTPRINTS_OVERLAP"),
+        "{review}"
+    );
+}
+
+/// Against a real KiCad 11 PCB editor: every unlocked footprint placed inside the outline, one undo
+/// step. Open a **copy** of a project that has an outline in the PCB Editor, press "KiCad AI:
+/// connect" there, then run with THINGSVU_GUI_PCB_PLACE=1.
+#[tokio::test]
+async fn gui_pcb_place_demo() {
+    if std::env::var("THINGSVU_GUI_PCB_PLACE").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_PCB_PLACE=1 with a registered KiCad PCB editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let plan = mcp.call("pcb_place_plan", json!({ "session_id": id })).await;
+    println!("GUI PLACE PLAN {}", plan["result"]["measured"]);
+    println!("GUI PLACE WARNINGS {}", plan["result"]["warnings"]);
+    assert_eq!(plan["ok"], true, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &format!("gui-pcb-place-{}", std::process::id())).await;
+    println!("GUI PLACE APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    println!("GUI REVIEW AFTER PLACING {}", review["result"]["issues"]);
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: the footprints are placed; Ctrl+Z undoes it");
 }

@@ -150,7 +150,13 @@ An assistant can then give the board an outline and move parts, through a live s
 
 > Put a 50 x 40 mm outline with 2 mm rounded corners and an M3 hole in each corner around the parts, then turn U1 by 90 degrees and move C1 to the back.
 
-Each change is shown as a plan first, applied as one step (one Ctrl+Z in the editor), and read back: the outline, and every moved footprint's place, turn, side, lock, pads, and nets. Locked footprints stay where they are unless you say otherwise. Placing all parts automatically and routing come later in Phase 12.
+Each change is shown as a plan first, applied as one step (one Ctrl+Z in the editor), and read back: the outline, and every moved footprint's place, turn, side, lock, pads, and nets. Locked footprints stay where they are unless you say otherwise.
+
+Once the board has an outline, the assistant can place every part:
+
+> Place the parts on the board. Keep J1 on the left edge and put the LED near the connector.
+
+The main IC goes in the middle, connectors on an edge, decoupling capacitors beside the pins they serve, and everything else near what it connects to, with no overlaps; parts you drew a box around on the schematic stay together. The plan shows the measured result before and after (wire length, overlaps, distances) so you can judge it, and individual parts can be adjusted afterwards with a move. Routing comes later in Phase 12.
 
 To get a schematic ready to order parts:
 
@@ -211,6 +217,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_update_from_schematic_plan` / `pcb_apply_plan` | Update the board from its schematic: a dry run first, then apply after you confirm; every footprint and pad net is checked afterwards |
 | `pcb_outline_plan` | A board outline (rectangle, rounded corners) of a given size or fitted around the parts, with mounting holes in the corners or at given places; applied with `pcb_apply_plan` |
 | `pcb_move_plan` | Move, turn, flip, and lock named footprints (places on a grid, exact offsets); shows overlaps before and after; applied with `pcb_apply_plan`, every pad read back |
+| `pcb_place_plan` | Place the footprints inside the outline (main IC central, connectors on edges, decoupling beside its pins, no overlaps), with hints keep, place, near, edge, groups, side, only; measured before and after; applied with `pcb_apply_plan` |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |

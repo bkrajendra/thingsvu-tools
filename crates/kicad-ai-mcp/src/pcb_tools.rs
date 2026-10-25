@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use kicad_domain::board::{place_rect, Board};
 use kicad_domain::board_edit::{self, BoardEditPlan, BoardOp, HolePlacement, MoveRequest, OutlineRequest};
+use kicad_domain::placement::{self, NearHint, PinnedPlace, PlaceHints, PlaceOptions};
 use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
 use kicad_session::{BoardSession, Provider};
 use rmcp::handler::server::wrapper::Parameters;
@@ -129,6 +130,86 @@ pub struct PcbApplyArgs {
     pub confirm: bool,
     /// A new value per intended apply (8-128 characters).
     pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceArg {
+    pub reference: String,
+    pub x_mm: f64,
+    pub y_mm: f64,
+    /// Keeps its turn when left out.
+    #[serde(default)]
+    pub rotation_deg: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NearArg {
+    pub reference: String,
+    /// The footprint it should be near.
+    pub target: String,
+    /// Distance between the two anchors that is close enough, mm (default 5).
+    #[serde(default)]
+    pub max_mm: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeArg {
+    pub reference: String,
+    /// left, right, top, or bottom.
+    pub edge: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SideArg {
+    pub reference: String,
+    /// front or back.
+    pub side: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbPlaceArgs {
+    pub session_id: String,
+    /// Footprints that stay where they are (locked footprints and mounting holes always do).
+    #[serde(default)]
+    pub keep: Vec<String>,
+    /// Footprints put exactly here (snapped to the grid), then left alone.
+    #[serde(default)]
+    pub place: Vec<PlaceArg>,
+    /// Footprints that belong close to another one.
+    #[serde(default)]
+    pub near: Vec<NearArg>,
+    /// Footprints that belong on one edge (connectors go to the nearest edge without a hint).
+    #[serde(default)]
+    pub edge: Vec<EdgeArg>,
+    /// Footprints kept together, e.g. [["U2", "C7", "L1"]].
+    #[serde(default)]
+    pub groups: Vec<Vec<String>>,
+    /// Footprints placed on the back (or front).
+    #[serde(default)]
+    pub side: Vec<SideArg>,
+    /// Place only these; every other footprint stays where it is.
+    #[serde(default)]
+    pub only: Option<Vec<String>>,
+    /// Also keep together the parts inside each rectangle drawn on the schematic (default true).
+    #[serde(default)]
+    pub use_schematic_blocks: Option<bool>,
+    /// The board's schematic, for the blocks. Defaults to the .kicad_sch next to the board.
+    #[serde(default)]
+    pub schematic_path: Option<String>,
+    /// Grid the places snap to, mm (default 0.5).
+    #[serde(default)]
+    pub grid_mm: Option<f64>,
+    /// Space between a courtyard and the outline, mm (default 0.25; connectors may reach it).
+    #[serde(default)]
+    pub edge_clearance_mm: Option<f64>,
+    /// Space kept between courtyards, mm (default 1), for reference text and routing.
+    #[serde(default)]
+    pub spacing_mm: Option<f64>,
 }
 
 /// What a pending board plan does.
@@ -942,8 +1023,107 @@ impl KicadAiServer {
     }
 
     #[tool(
+        name = "pcb_place_plan",
+        description = "Plan placing the footprints inside the board outline: the IC with the most pads in \\nthe middle, connectors on the nearest edge (or the one an edge hint names), decoupling capacitors beside \\nthe IC pin on their supply, the other parts near what they connect to; then an improvement loop on \\nestimated wire length with overlaps and parts outside the outline heavily penalised. Deterministic. \\nLocked footprints and mounting holes stay; hints: keep, place (exact), near, edge, groups, side, only. Parts \\ninside a rectangle drawn on the schematic are kept together. The plan lists every move and the measured \\nresult before and after (wire length, overlaps, outside, decoupling distances, connector edge distances). \\nNeeds an outline (pcb_outline_plan) and a live KiCad 11 session. Apply with pcb_apply_plan; adjust with \\npcb_move_plan."
+    )]
+    pub async fn pcb_place_plan(&self, Parameters(args): Parameters<PcbPlaceArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let mut data = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut data, &libs);
+            let mut groups = args.groups.clone();
+            if args.use_schematic_blocks.unwrap_or(true) {
+                let schematic = match schematic_for(&board, args.schematic_path.as_deref()) {
+                    Ok(p) => Some(p),
+                    Err(e) if args.schematic_path.is_some() => return Err(e),
+                    Err(_) => None,
+                };
+                if let Some(path) = schematic {
+                    if let Ok(Ok(doc)) = std::fs::read_to_string(&path).map(kicad_sexpr::Document::parse) {
+                        let on_board: std::collections::BTreeSet<&str> =
+                            data.footprints.iter().map(|f| f.reference.as_str()).collect();
+                        for block in placement::schematic_blocks(&doc.design()) {
+                            let block: Vec<String> =
+                                block.into_iter().filter(|r| on_board.contains(r.as_str())).collect();
+                            if block.len() >= 2 && !groups.contains(&block) {
+                                groups.push(block);
+                            }
+                        }
+                    }
+                }
+            }
+            let hints = PlaceHints {
+                keep: args.keep.clone(),
+                place: args
+                    .place
+                    .iter()
+                    .map(|p| {
+                        Ok(PinnedPlace {
+                            reference: p.reference.clone(),
+                            at: point_arg(p.x_mm, p.y_mm)?,
+                            rotation_deg: p.rotation_deg,
+                        })
+                    })
+                    .collect::<Result<_, ToolError>>()?,
+                near: args
+                    .near
+                    .iter()
+                    .map(|n| NearHint {
+                        reference: n.reference.clone(),
+                        target: n.target.clone(),
+                        max_mm: n.max_mm.unwrap_or(5.0),
+                    })
+                    .collect(),
+                edge: args
+                    .edge
+                    .iter()
+                    .map(|e| {
+                        placement::Edge::parse(&e.edge)
+                            .map(|edge| (e.reference.clone(), edge))
+                            .ok_or_else(|| bad_arg(format!("{}: edge is left, right, top, or bottom", e.reference)))
+                    })
+                    .collect::<Result<_, _>>()?,
+                groups,
+                side: args
+                    .side
+                    .iter()
+                    .map(|s| match s.side.as_str() {
+                        "front" => Ok((s.reference.clone(), false)),
+                        "back" => Ok((s.reference.clone(), true)),
+                        other => Err(bad_arg(format!("{}: side is front or back, not {other}", s.reference))),
+                    })
+                    .collect::<Result<_, _>>()?,
+                only: args.only.clone(),
+            };
+            let defaults = PlaceOptions::default();
+            let options = PlaceOptions {
+                grid_mm: args.grid_mm.unwrap_or(defaults.grid_mm),
+                edge_clearance_mm: args.edge_clearance_mm.unwrap_or(defaults.edge_clearance_mm),
+                spacing_mm: args.spacing_mm.unwrap_or(defaults.spacing_mm),
+                ..defaults
+            };
+            let (plan, report) = placement::plan_placement(&data, &hints, &options)?;
+            Ok::<_, ToolError>((plan, report, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, report, fp)) => {
+                let extra = serde_json::to_value(&report).unwrap_or_default();
+                self.store_edit_plan_with(&cid, &board, plan, fp, Some(extra)).await
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline or a move is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1296,7 +1476,9 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
             "op": "add_outline", "outline": rect(*r), "corner_radius": mm(corner_radius.0), "line_width": mm(line_width.0),
             "layer": "Edge.Cuts",
         }),
-        BoardOp::PlaceFootprint { reference, lib_id, at } => {
+        BoardOp::PlaceFootprint {
+            reference, lib_id, at, ..
+        } => {
             serde_json::json!({ "op": "place_footprint", "reference": reference, "footprint": lib_id, "at": pt(*at) })
         }
         BoardOp::MoveFootprint {
@@ -1321,8 +1503,20 @@ impl KicadAiServer {
         plan: BoardEditPlan,
         fp: String,
     ) -> CallToolResult {
+        self.store_edit_plan_with(cid, board, plan, fp, None).await
+    }
+
+    /// As `store_edit_plan`, with a placement's measured result shown as `measured`.
+    async fn store_edit_plan_with(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        plan: BoardEditPlan,
+        fp: String,
+        measured: Option<serde_json::Value>,
+    ) -> CallToolResult {
         let plan_id = self.next_pcb_plan_id();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "plan_id": plan_id,
             "kind": plan.kind,
             "can_apply": true,
@@ -1333,6 +1527,9 @@ impl KicadAiServer {
             "units": "mm; x grows right, y grows down; turns counter-clockwise on screen",
             "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
         });
+        if let Some(m) = measured {
+            body["measured"] = m;
+        }
         let warnings = plan.warnings.clone();
         self.state.pending_updates.lock().await.insert(
             plan_id,

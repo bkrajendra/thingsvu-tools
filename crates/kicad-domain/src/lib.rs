@@ -17,6 +17,7 @@ pub mod footprint;
 pub mod geometry;
 pub mod ids;
 pub mod layout;
+pub mod placement;
 pub mod plan;
 pub mod readability;
 pub mod reconnect;

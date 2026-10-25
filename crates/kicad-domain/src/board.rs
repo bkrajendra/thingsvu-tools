@@ -54,6 +54,13 @@ impl BoardFootprint {
     pub fn is_back(&self) -> bool {
         self.layer.starts_with("B.")
     }
+
+    /// A mounting hole: from the `MountingHole` library, or an `H` part with no pad on a net. It
+    /// has no part in the schematic and is never moved by a placement.
+    pub fn is_mounting_hole(&self) -> bool {
+        self.lib_id.starts_with("MountingHole:")
+            || (self.reference.starts_with('H') && self.pads.iter().all(|p| p.net.is_empty()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -170,12 +177,12 @@ fn issue(code: &'static str, severity: Severity, message: String, references: Ve
     }
 }
 
-fn is_power_net(name: &str) -> bool {
+pub(crate) fn is_power_net(name: &str) -> bool {
     let n = name.trim_start_matches('/').to_ascii_uppercase();
     n.starts_with('+') || n.starts_with("VCC") || n.starts_with("VDD") || n.starts_with("VBUS") || n.starts_with("VIN")
 }
 
-fn is_ground_net(name: &str) -> bool {
+pub(crate) fn is_ground_net(name: &str) -> bool {
     crate::layout::is_ground_name(name)
 }
 
@@ -245,7 +252,7 @@ pub fn review(board: &Board, schematic: Option<&SchematicDesign>) -> Vec<BoardIs
         let extra: Vec<String> = board
             .footprints
             .iter()
-            .filter(|f| !parts.contains_key(f.reference.as_str()))
+            .filter(|f| !parts.contains_key(f.reference.as_str()) && !f.is_mounting_hole())
             .map(|f| f.reference.clone())
             .collect();
         if !extra.is_empty() {
