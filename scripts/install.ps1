@@ -171,6 +171,16 @@ if (-not $SkipClients) {
         }
     }
     if ($Clients -contains 'ClaudeDesktop') {
+        # The Microsoft Store edition keeps its settings in its own package folder, not in %APPDATA%.
+        if (-not $PSBoundParameters.ContainsKey('ClaudeDesktopConfig')) {
+            $store = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Packages') -Filter 'Claude_*' -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($store) {
+                $storeDir = Join-Path $store.FullName 'LocalCache\Roaming\Claude'
+                if ((Test-Path $storeDir) -and -not (Test-Path (Split-Path $ClaudeDesktopConfig))) {
+                    $ClaudeDesktopConfig = Join-Path $storeDir 'claude_desktop_config.json'
+                }
+            }
+        }
         if (-not (Test-Path (Split-Path $ClaudeDesktopConfig))) {
             Write-Host 'Claude Desktop: not found (skipping).'
         }

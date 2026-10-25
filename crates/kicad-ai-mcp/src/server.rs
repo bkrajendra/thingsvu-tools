@@ -828,6 +828,7 @@ much it would change. Read-only. Use sch_render to see it."
                     "blockers": blockers,
                     "would_move": counts.moves,
                     "would_remove": counts.removals,
+                    "would_remove_items": plan.removals.iter().map(|r| r.description.clone()).collect::<Vec<_>>(),
                     "would_add": plan.operations.len(),
                     "already_tidy": plan.findings.iter().any(|f| f.code == "NOTHING_TO_CHANGE"),
                 },

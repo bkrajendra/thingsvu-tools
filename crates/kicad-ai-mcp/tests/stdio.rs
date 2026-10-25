@@ -826,6 +826,8 @@ async fn gui_tidy_demo() {
 
     let after = mcp.call("sch_review", json!({ "session_id": id })).await;
     println!("GUI REVIEW AFTER {}", after["result"]);
+    let again = mcp.call("sch_tidy_plan", json!({ "session_id": id })).await;
+    println!("GUI PLAN AGAIN removals={}", again["result"]["removals"]);
     assert_eq!(after["result"]["tidy"]["already_tidy"], true, "{after}");
     let erc_after = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
     println!(
