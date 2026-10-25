@@ -63,6 +63,69 @@ try {
     Check ((Get-Content $desktop -Raw) -eq 'not json {') 'it is not overwritten'
     [IO.File]::WriteAllText($desktop, ($cfg | ConvertTo-Json -Depth 20))
 
+    Write-Host 'Download from a release server (a local stand-in for GitHub)'
+    # Several releases, the newest a draft: the installer must skip it and take the next one.
+    $port = Get-Random -Minimum 20000 -Maximum 40000
+    $served = Join-Path $sandbox 'served'
+    New-Item -ItemType Directory $served | Out-Null
+    Copy-Item $zip.FullName $served
+    Copy-Item (Join-Path $DistDir 'SHA256SUMS.txt') $served
+    $base = "http://localhost:$port"
+    $asset = { param($name) @{ name = $name; browser_download_url = "$base/files/$name" } }
+    $releases = @(
+        @{ tag_name = 'v9.9.9'; draft = $true; prerelease = $true; assets = @() },
+        @{ tag_name = "v$version"; draft = $false; prerelease = $true; assets = @((& $asset $zip.Name), (& $asset 'SHA256SUMS.txt')) },
+        @{ tag_name = 'v0.0.1'; draft = $false; prerelease = $true; assets = @() }
+    )
+    $listing = ConvertTo-Json -InputObject $releases -Depth 6
+    $job = Start-Job -ArgumentList $port, $listing, $served -ScriptBlock {
+        param($port, $listing, $served)
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://localhost:$port/")
+        $listener.Start()
+        try {
+            while ($true) {
+                $context = $listener.GetContext()
+                $path = $context.Request.Url.AbsolutePath
+                if ($path -like '*/releases') {
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($listing)
+                    $context.Response.ContentType = 'application/json'
+                }
+                elseif ($path -like '/files/*') {
+                    $bytes = [IO.File]::ReadAllBytes((Join-Path $served (Split-Path $path -Leaf)))
+                }
+                else { $context.Response.StatusCode = 404; $bytes = @() }
+                $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+                $context.Response.Close()
+            }
+        }
+        finally { $listener.Stop() }
+    }
+    try {
+        # Wait until it answers.
+        $ready = $false
+        for ($i = 0; $i -lt 50 -and -not $ready; $i++) {
+            try { Invoke-RestMethod "$base/repos/x/y/releases" | Out-Null; $ready = $true } catch { Start-Sleep -Milliseconds 200 }
+        }
+        Check $ready 'the local release server is up'
+        $remote = Join-Path $sandbox 'remote'
+        New-Item -ItemType Directory $remote | Out-Null
+        # Run from a folder that has no package next to it, so it has to download.
+        Copy-Item (Join-Path $package 'install.ps1') $remote
+        $text = Run-Script (Join-Path $remote 'install.ps1') @('-Yes', '-SkipClients', '-InstallDir', "$remote\data\bin", '-DocumentsDir', $documents, '-ApiBase', $base, '-Repository', 'x/y')
+        Check ($text -match "Downloading thingsvu-tools-v$([regex]::Escape($version))-windows-x64.zip") 'it skips the draft and picks the newest published release'
+        Check ($text -match 'Checksum verified') 'it verifies the checksum'
+        Check (Test-Path "$remote\data\bin\kicad-ai-mcp.exe") 'and installs the downloaded server'
+        # A download that does not match its checksum is refused.
+        [IO.File]::WriteAllText((Join-Path $served 'SHA256SUMS.txt'), ('0' * 64) + "  $($zip.Name)`n")
+        $failed = $false
+        try { Run-Script (Join-Path $remote 'install.ps1') @('-Yes', '-SkipClients', '-InstallDir', "$remote\other\bin", '-DocumentsDir', $documents, '-ApiBase', $base, '-Repository', 'x/y') | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'checksum' }
+        Check $failed 'a download that does not match its checksum is refused'
+        Check (-not (Test-Path "$remote\other\bin\kicad-ai-mcp.exe")) 'and nothing is installed'
+    }
+    finally { Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
+
     Write-Host 'Claude Code (a stand-in that behaves like the real one)'
     # The real `claude mcp remove` writes to stderr and fails when there is nothing to remove; that
     # must not stop the installer (Windows PowerShell 5.1 turns stderr into an error).

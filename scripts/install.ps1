@@ -27,7 +27,9 @@ param(
     [switch]$Yes,
     [string]$DocumentsDir,
     [string]$ClaudeDesktopConfig,
-    [string]$Repository = 'bkrajendra/thingsvu-tools'
+    [string]$Repository = 'bkrajendra/thingsvu-tools',
+    # Where releases are listed; only the installer's own test changes this.
+    [string]$ApiBase = 'https://api.github.com'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -66,10 +68,16 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'bin\kicad-ai-mcp.exe
 else {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $headers = @{ 'User-Agent' = 'thingsvu-installer' }
-    $api = "https://api.github.com/repos/$Repository/releases"
+    $api = "$ApiBase/repos/$Repository/releases"
     if ($Version -eq 'latest') {
         # /releases/latest skips pre-releases, which every 0.x release is.
-        $release = @(Invoke-RestMethod "${api}?per_page=10" -Headers $headers) | Where-Object { -not $_.draft } | Select-Object -First 1
+        # Do not pipe the response into Where-Object: Windows PowerShell 5.1 passes a JSON array down
+        # the pipeline as ONE object, so the filter would test the array, not each release.
+        $release = $null
+        $listed = Invoke-RestMethod "${api}?per_page=10" -Headers $headers
+        foreach ($candidate in $listed) {
+            if (-not $candidate.draft) { $release = $candidate; break }
+        }
     }
     else {
         $tag = if ($Version.StartsWith('v')) { $Version } else { "v$Version" }
