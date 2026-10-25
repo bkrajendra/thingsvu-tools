@@ -111,7 +111,7 @@ Exit criteria (plan §14): all Tier 1 headless acceptance criteria (plan §9). T
   - **Review — key reuse after failure:** a failed apply that changed nothing (refused before any request) can be retried with the same key. A failed apply after KiCad was contacted marks the plan and key as used, so the caller must make a new plan.
 - [x] **3.5 Field updates** — `UpdateItems` without the embedded `definition`, with a field mask (`value_field`, plus `footprint_field` when set). Each value is read back after updating; headless, no duplicate library symbol appears.
   - Verified in the GUI on 24 Oct 2026 (task 4.7): values persist with the masked update.
-- [~] **3.6 Transforms** — placement sets rotation through `PlaceSymbolFromLibrary` (0° is sent as "unset"), and position and reference are read back after placing. The layout uses rotation 0 only, so writing other rotations and mirrors is not exercised yet. Follow-up when the layout starts rotating symbols: read back every written transform (see 2.5).
+- [~] **3.6 Transforms** — placement sets rotation through `PlaceSymbolFromLibrary` (0° is sent as "unset"), and position and reference are read back after placing. The layout uses rotation 0 only, so writing other rotations and mirrors is not exercised yet. Follow-up when the layout starts rotating symbols: read back every written transform (see 2.5). **Status (v0.3.0):** the tidy, `sch_arrange_plan`, and the hints now rotate and mirror symbols, and the live tests apply them (nets verified, ERC clean), but the apply step does not yet compare each part's position and transform with what the plan asked for; it only checks nets. Carried to Phase 9 as 9.2.
 - [x] **3.7 Save, ERC, export, render** — `sch_save` (`SaveDocument`); `sch_run_erc`, `sch_export_netlist` (to a `.net` inside the schematic's folder), and `sch_render` (PNG returned as an MCP image, 72–600 dpi) all run `kicad-cli` on a `SaveCopyOfDocument` snapshot in a private folder, which is deleted afterwards.
   - **Finding:** KiCad's IPC export jobs read the saved file, not the in-memory document. A never-saved document fails "Failed to load schematic", and a saved one would silently ignore unsaved changes. Hence the snapshot approach.
   - **Review:** `sch_render` returns the first page only; multi-sheet designs are out of MVP scope.
@@ -172,7 +172,7 @@ Exit criteria: golden circuits (3.3 V regulator first) laid out with signal flow
 - [x] **5.8 Readability checks** — `kicad-domain::readability` checks a plan's geometry independently of the layout: shorts between nets (error `LAYOUT_SHORT`), overlapping symbol bodies and wires through bodies (warnings `SYMBOLS_OVERLAP`, `WIRE_THROUGH_SYMBOL`), and power nets drawn as labels. The report is in the `sch_plan_circuit` result (`readability`). Unit tests require both golden circuits to be clean against the test library, and the live harness requires the same against KiCad's real libraries.
   - **Review:** a wire that leaves a symbol's own pin is not counted as passing through it, because some graphics (LED arrows) overhang the pin end.
   - **Attention:** field text (reference, value, and flag text) is not measured, only kept clear by spacing. Next to a two-pin connector the `PWR_FLAG` text can still crowd nearby wires (visible beside J1 in both renders).
-- [~] **5.9 Layout hints and editing tools** — partly done in Phase 8: the tidy and `sch_set_field` exist; move/rotate/delete tools and layout hints are not built (see 8.5 and 8.6).
+- [x] **5.9 Layout hints and editing tools** — done in Phase 8 (v0.3.0): `sch_describe_layout`, `sch_arrange_plan` (move, turn, mirror, delete), `sch_reconnect_plan`, layout hints on `sch_tidy_plan`, and `sch_set_field` (see 8.1–8.6).
   - **Review:** optional layout hints and `sch_move_symbol` / `sch_rotate_symbol` / `sch_add_wire` / `sch_delete_items` are not done. Proposal: do them early in Phase 7, or as their own small phase if you want them before the KiCad 10 fallback.
 
 Phase 5 notes for review:
@@ -231,7 +231,7 @@ Exit criteria: a user can install everything with one script and connect an assi
 - [x] **7.9 Architecture documentation** — new [docs/architecture.md](architecture.md) with current diagrams (components, crates, editor registration, planning pipeline, both apply sequences, releases) and a table of what changed from the plan; the plan's diagram, provider and backend sections, process table, repository layout, and stale "bridge" wording were brought in line.
 - [~] **7.10 Re-pin to KiCad 11.0** — waits for the release. The procedure is in docs/kicad-api-compatibility.md.
 - [~] **7.11 One s-expression parser** — `kicad-cli-runner` still has its own small text parser for netlists next to `kicad-sexpr`. Merging them is a cleanup with no user-visible effect.
-- [~] **7.12 Layout hints and editing tools (task 5.9)** — still not done.
+- [x] **7.12 Layout hints and editing tools (task 5.9)** — done in Phase 8 (v0.3.0), see 5.9.
   - **Review:** the README roadmap lists them under *Next*. Decision for you: make them Phase 8, or fold them into PCM / PCB work?
 
 Phase 7 verification (25 Oct 2026):
@@ -263,7 +263,7 @@ Exit criteria: an assistant can read a whole existing sheet, say what is untidy,
   - [x] **8.5.4 The router** (`kicad-domain::reconnect`) — each pin gets a stub; ground and power nets end in power symbols; other nets are a tree of straight, L- and Z-shaped wires that touch no other net and cross no part, with junctions where three meet; a net it cannot wire that way is named with a label at each pin and reported (`NET_DRAWN_WITH_LABELS`). Wired nets are named with a label unless KiCad's own name (`Net-(…)`) is enough.
   - [x] **8.5.5 Live, headless, and file** — one flow on all three providers (tested on file and headless; the GUI test is below). A reconnect may start from unsaved work on a headless session; if it fails, the saved file comes back.
 - [x] **8.6 Layout hints** (v0.3.0) — `sch_tidy_plan` takes `keep` (parts that stay exactly where they are), `place` (a part to x_mm, y_mm, optionally turned or mirrored), and `near` (a part next to another, on a side, with a gap). With hints the parts are placed as asked (the rest as the layout engine would place them, nudged off the hand-placed ones) and the router draws the wires; an unknown part is a refused plan.
-- [ ] **8.7 Text-aware layout** — not done; moved to Phase 9 (see the v0.2.3 note below). The router and the hints do not know where reference and value text lands, so text can still overlap.
+- [~] **8.7 Text-aware layout** — moved to Phase 9 as 9.1 (see the v0.2.3 note below).
 
 Review of 8.5/8.6 (please look at these):
 - **The moves leave a broken circuit on purpose**, as asked: the assistant places everything, then reconnects once. On a big circuit the router's wires will be less tidy than the layout engine's; for a whole sheet prefer `sch_tidy_plan`.
@@ -299,3 +299,39 @@ Installer fixes (25 Oct 2026, **v0.2.1**), found by the project owner installing
 - **(v0.3.0) Phase 8 completed:** `sch_describe_layout`, `sch_arrange_plan`, `sch_reconnect_plan`, and layout hints on `sch_tidy_plan` (tasks 8.5 and 8.6 above). New live tests: arrange then reconnect then tidy with hints then delete, on the file and headless providers; `gui_arrange_demo` for the editor.
 
 **Attention — please try on the live editor (v0.3.0):** open a **copy**, press **KiCad AI: connect**, and run `THINGSVU_GUI_ARRANGE=1 cargo test -p kicad-ai-mcp --test stdio gui_arrange_demo -- --nocapture` (Git Bash; in PowerShell set `$env:THINGSVU_GUI_ARRANGE='1'` first). It moves two parts, reconnects, and prints ERC before and after; Ctrl+Z undoes each step. Or ask the assistant: *"Move R1 and R2 to the right of U1, then reconnect."*
+
+---
+
+## Phase 9 — Text, labels, shapes, and checks (planned, not started)
+
+Motivation (25 Oct 2026): after Phase 8 a live tidy of a 555 blinker came out well (parts in a row, shunts below, power symbols, flags beside the connector). What is still missing: reference and value text is invisible to the layout and to the checks, so labels and text can overlap (J1 against its flags earlier; "DIS" against a wire in the latest run); there is no tool to add a label or a drawing, and some Phase 3 verification is still open.
+
+Exit criteria: text overlaps are found and avoided; an assistant can add, move, and remove labels, text notes, and simple shapes (to mark blocks such as "Power supply") on the live editor, headless, and file providers with the same confirm, undo, and verification as every other change; every written position and transform is read back.
+
+Where each open item stands (checked 25 Oct 2026):
+
+| Task | Status | Decision |
+|---|---|---|
+| 3.6 Transforms | Used by the tidy, arrange, and hints; nets verified; transform read-back not done | Take up as 9.2 |
+| 5.9 / 7.12 Layout hints and editing tools | Done in Phase 8 (marked `[x]`) | Closed |
+| 8.7 Text-aware layout | Not done | 9.1 |
+| 0.11 Plugin lifetime, 6.6 Direct socket | Replaced or deferred, no user impact | Leave |
+| 7.10 Re-pin to KiCad 11.0 | Waits for the release | Leave |
+| 7.11 One s-expression parser | Cleanup, no user impact | Do last if time |
+
+- [ ] **9.0 Probe the API** — what the schematic API accepts for text, labels, and graphic shapes (`CreateItems` for `LocalLabel`, `SchematicText`/text box, `Line`, `Rectangle`, `Circle`, `Arc`, and their style); what a field's text extents are. Record in docs/kicad-api-compatibility.md. Decides how much 9.4 can do live and how much only through the file.
+- [ ] **9.1 Text-aware layout and checks** (was 8.7) — give every part's reference and value text, every label, and every power symbol's value a bounding box (from font size, string length, field position and angle; read from the document, not guessed, where the API or file gives it). Then:
+  - the readability check reports **text overlapping text, wires, or parts** (`TEXT_OVERLAP`), in `sch_review`, tidy plans (before and after), and reconnect plans;
+  - the layout and the router place labels and moves fields to avoid them; `PWR_FLAG` value text is hidden by default (it is noise), and fields may be moved to a clear side of their part;
+  - tests: a design with J1 and flags that overlaps now is reported before and clean after; the latest 555 run (`DIS` label against the R1/R2 wire) is a regression case.
+- [ ] **9.2 Read back every written position and transform** (closes 3.6) — after applying, compare each part's position, rotation, and mirroring with the plan; a difference is a failed verification, reported like a net mismatch.
+- [ ] **9.3 Label tool** — `sch_label_plan`: add a local label to a pin or to a wire point, with a direction; change a label's text; move it; remove it. A label on a net must not rename it by accident (the plan says which net it joins, and refuses a label that would merge two nets). Global and hierarchical labels only if 9.0 shows they can be done safely; otherwise they stay refused by the tidy.
+- [ ] **9.4 Shapes and notes tool** — `sch_draw_plan`: lines, rectangles (optionally filled), circles, and text notes, with position, size, stroke, and a layer-like order, so a block of the schematic can be boxed and titled ("Power supply", "Timer"). The tidy already works around notes; it must also keep drawings and the boxes it should enclose consistent (a box around parts is moved with them, or refused as a blocker with a reason).
+- [ ] **9.5 Move and delete items other than parts** — wires, labels, junctions, notes, and shapes by id (from `sch_describe_layout`, which grows to list them). Wire moves keep ends attached to pins or are refused.
+- [ ] **9.6 Live checks** — extend `gui_tidy_demo` and `gui_arrange_demo` to report text overlaps before and after; run the full live suite on the file, headless, and editor providers.
+- [ ] **9.7 Docs and release** — README tools table and examples, architecture diagram (a text and drawing step in the plan flow), capability matrix, this file; version **0.4.0**.
+- [ ] **9.8 (optional) 7.11** — merge the CLI runner's netlist parser into `kicad-sexpr`.
+
+Open questions to settle when starting (defaults in brackets):
+- Should boxes drawn around a block belong to it, so tidy and arrange move them with their parts? [Yes: a box is tied to the parts fully inside it when drawn, as a hint stored only in the plan, not in the file; otherwise it stays like any other note.]
+- Hide `PWR_FLAG` value text everywhere, or only when it overlaps? [Only when it overlaps something, so the schematic keeps showing what KiCad shows by default.]
