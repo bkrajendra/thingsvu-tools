@@ -244,7 +244,8 @@ How releases are made: [releasing](docs/releasing.md).
 ## Roadmap
 
 - **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), reviewing and tidying existing schematics, ERC, netlist export, verified demo circuits, KiCad 10 through the schematic file, and a one-step installer
-- **Next:** layout hints and finer editing (move, rotate), PCB tools, hierarchical schematics, part and BOM assistance
+- **Next (planned, see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)):** parts, footprints, and BOM review and export; then PCB tools (read and review, update from the schematic, outline, placement, routing); then manufacturing outputs
+- **Also open:** hierarchical schematics
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 
 ## Project status

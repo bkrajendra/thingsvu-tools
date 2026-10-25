@@ -338,3 +338,67 @@ Where each open item stands (checked 25 Oct 2026):
 Known limits (Phase 9): drawings are free items, not tied to the parts they surround (a tidy or arrange does not move a box with its parts; it treats shapes as annotations that stay); labels are local only; text boxes (`text_box`) and images are listed as annotations but not edited; `PWR_FLAG` text is hidden only when it cannot be placed.
 
 **Attention — please try on the live editor (v0.4.0):** open a **copy**, press **KiCad AI: connect**, and run `THINGSVU_GUI_TEXT=1 cargo test -p kicad-ai-mcp --test stdio gui_text_demo -- --nocapture` (Git Bash; in PowerShell: `$env:THINGSVU_GUI_TEXT='1'; cargo test ...`). It prints the text problems, applies a declutter and a titled box around the first two parts, and prints the problems again; Ctrl+Z undoes each step. Or ask the assistant: *"Check the schematic for overlapping text and fix it. Then put a box titled Regulator around U1 and its capacitors."*
+
+
+---
+
+## Phases 10 to 13 — Parts, BOM, and PCB (planned, not started)
+
+The reasoning, the KiCad facts, the decisions D1 to D7, and the risks are in [pcb-and-bom-plan.md](pcb-and-bom-plan.md). Each phase below ends with the usual steps: tests (offline, then `KICAD_LIVE=1`), docs and architecture diagram, README tools table and examples, version bump (which publishes the release), and a push with CI checked.
+
+**Please review before Phase 10 starts:** decisions D1 to D7 in the plan, in particular D2 (part data comes from the assistant's own lookup tool, never from the server), D3 (KiCad 10 gets read, DRC, and export for boards, not editing), and D4 (autorouting only through an optional external router).
+
+### Phase 10 — Parts, footprints, and BOM (v0.5.0)
+
+Exit criteria: on the 555 blinker and the 3.3 V regulator an assistant assigns every footprint, fills manufacturer and supplier fields from a parts lookup, and `bom_review` is clean; the exported BOM matches KiCad's own.
+
+- [ ] **10.0 Probe** — user fields over the API (`user_fields` on a symbol instance, creating one, DNP and "exclude from BOM" attributes); `kicad-cli sch export bom` presets and column options on 10.0.7 and 10.99; footprint library access (`GetItemsFromLibrary` for footprints, `kicad-cli fp`, reading `.kicad_mod` with `kicad-sexpr`); the global footprint library table. Record in docs/kicad-api-compatibility.md.
+- [ ] **10.1 `bom_get`** — the BOM grouped as KiCad groups it (value, footprint, quantity, references, custom fields, DNP, excluded), read from a live KiCad and from a file. Read-only.
+- [ ] **10.2 Custom fields** — read and write any field of a part (file: `property`; API: `user_fields`), shown in `sch_describe_layout`; `sch_set_fields_plan` for many parts in one plan, one undo step, read back. Fields are hidden by default so the drawing does not change.
+- [ ] **10.3 Footprint library reader** — footprints from `.kicad_mod` files (pads, courtyard, size, description, keywords) and the library table; `fp_search`. Shared with Phase 11, which needs courtyards and pad geometry.
+- [ ] **10.4 `sch_footprint_plan`** — flags missing footprints, pad count against pin count, a package named in the value or description against the footprint; plans setting footprints (through the existing footprint field edit). The assistant chooses; the tool checks.
+- [ ] **10.5 `bom_review`** — missing footprint, MPN, or supplier number; the same value written two ways; apparent duplicates; DNP and exclude mismatches; and the list of lookups the assistant should do. No network.
+- [ ] **10.6 `bom_export`** — CSV through `kicad-cli`, with a generic preset and a JLCPCB preset (Comment, Designator, Footprint, LCSC Part #); written into the project folder, never uploaded.
+- [ ] **10.7 Parts workflow note** — a short section in the README and docs on how an assistant combines `bom_review` with a parts-lookup connector it already has (if none, the fields stay empty and the review says so).
+- [ ] **10.8 Tests, docs, release** — domain tests, fixture BOMs compared with KiCad's own export on both KiCad versions, live tests on the file and headless providers, `gui_bom_demo`; v0.5.0.
+
+### Phase 11 — PCB basics: sessions, read, review, update from schematic (v0.6.0)
+
+Exit criteria: from the footprint-assigned 555 schematic, open the board, update it from the schematic, and read it back; every part and net is there; `pcb_review` lists the footprints as unplaced and runs DRC.
+
+- [ ] **11.0 Probe** — which board commands the headless server and the PCB editor handle (`GetItems` for footprints, tracks, vias, zones, graphics; `GetBoundingBox`; `GetNets`; `GetBoardStackup`; design rules; `ImportNetlist` with `dry_run`; `PlaceFootprintFromLibrary`); how a board document is opened headless; plugin scope `pcb` registration. Record what is unhandled, as was found for schematic bounding boxes.
+- [ ] **11.1 Board sessions** — `session_open` with a board (`.kicad_pcb`) for `gui`, `headless`, and `file`; the capability matrix gains board rows; the plugin registers PCB editors as it does schematic editors (the registry already allows both scopes).
+- [ ] **11.2 Read tools** — `pcb_info`, `pcb_list_footprints`, `pcb_get_footprint`, `pcb_list_nets`, `pcb_list_tracks` (tracks, vias, zones, graphics). A board reader in `kicad-sexpr` serves the file provider and KiCad 10.
+- [ ] **11.3 `pcb_run_drc` and `pcb_render`** — DRC through `kicad-cli pcb drc` (report parsed into findings); a picture of the board for the assistant.
+- [ ] **11.4 `pcb_review`** — DRC, unrouted connections, footprints outside the outline or overlapping (courtyards from 10.3), footprints with no schematic part and the reverse, pads without nets, and the D5 placement rules as warnings.
+- [ ] **11.5 `pcb_update_from_schematic_plan`** — netlist import with `dry_run`, shown as a plan (new, changed, removed footprints; warnings); applied through the same apply tool with confirm and idempotency key; the result is read back and compared with the dry run. KiCad 11 only.
+- [ ] **11.6 Tests, docs, release** — fixture boards, mock-server tests, live tests, `gui_pcb_demo`; v0.6.0.
+
+### Phase 12 — PCB editing: outline, placement, routing (v0.7.0)
+
+Exit criteria: the 555 board gets an outline, placement, routing, and a ground pour on two layers, DRC clean on the default rules, on the editor and headless providers; every footprint, track, and via is read back as planned; the unrouted count is zero.
+
+- [ ] **12.1 `pcb_outline_plan`** — rectangle or rounded rectangle on `Edge.Cuts`, size or "fit around the parts with a margin", corner radius, mounting holes (footprints from the library).
+- [ ] **12.2 `pcb_move_plan`** — bare move, turn, flip, and lock of named footprints, by absolute place or offset, on a grid. Locked footprints are refused unless named.
+- [ ] **12.3 Placement engine** — constructive placement with the D5 rules (connectors to the edge, main IC central, decoupling beside the pins they serve, blocks from the schematic's grouping), then an improvement loop on wire length with overlap and boundary penalties. Deterministic. Reports measured results before and after.
+- [ ] **12.4 `pcb_place_plan`** — the engine with hints `keep`, `place`, `near`, `edge`, `group`, `side`; unknown parts refused; plan shows every move and the measured result.
+- [ ] **12.5 `pcb_route_plan`** — explicit tracks and vias for named nets at the netclass width and clearance, on a layer, with via placement; refuses anything that crosses another net's copper (checked against the board's geometry, then DRC after applying).
+- [ ] **12.6 `pcb_zone_plan`** — copper pours (ground first) with clearance and thermal settings; refill after applying; reports DRC.
+- [ ] **12.7 `pcb_autoroute_plan` (optional dependency)** — if Freerouting is configured: export the Specctra DSN job, run the router with a time limit, show the result as a plan (tracks and vias to add and remove, unrouted count), import the session on confirm. Off by default; never downloaded by the installer.
+- [ ] **12.8 Verification and read-back** — footprint positions, sides, tracks, vias, and zones read back; unrouted count and DRC no worse; failures roll back as far as the provider allows (headless reload, editor undo steps reported), as for schematics.
+- [ ] **12.9 (optional) KiCad 10 board editing** through `kicad-sexpr` — only if asked (D3).
+- [ ] **12.10 Tests, docs, release** — domain tests for the engine and router geometry, live tests on headless and file, `gui_pcb_edit_demo`; v0.7.0.
+
+### Phase 13 — Manufacturing outputs and the mechanical exchange (v0.8.0)
+
+Exit criteria: from the 555 board, a JLCPCB-style package opens in KiCad's Gerber viewer with the right layers and drill file, and the mechanical summary matches the board.
+
+- [ ] **13.1 `pcb_export`** — Gerbers, drill, position file, STEP, SVG and PDF plots through `kicad-cli` (or the API jobs on 11), written into the project, results checked (files exist, layer count, drill present).
+- [ ] **13.2 Pre-export checks** — DRC clean or failures listed with the user's confirmation recorded; every footprint has a BOM line; silkscreen inside the board; outline closed.
+- [ ] **13.3 `fab_package`** — Gerbers, drill, BOM (Phase 10 preset), and placement file as one zip named from the project; never uploaded.
+- [ ] **13.4 Mechanical exchange model** — a neutral crate (board outline, mounting holes, keep-outs, connector positions and facing, component heights, STEP path), and `pcb_mechanical_info` to read it. Groundwork for the enclosure tools (design plan §16.1).
+- [ ] **13.5 Tests, docs, release** — golden package checks, live tests; v0.8.0.
+
+### Carried over, not scheduled
+
+- 9.9 Text angle after a part is turned; boxes that follow their parts; the two unexplained tidy removals; 7.10 re-pin to KiCad 11.0 when released; 7.11 one s-expression parser; hierarchical sheets, global labels, and multi-unit symbols for the schematic tools.
