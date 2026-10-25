@@ -305,7 +305,11 @@ impl Session {
             ));
         }
 
-        if !plan.moves.is_empty() || !plan.removals.is_empty() || !plan.field_changes.is_empty() {
+        if !plan.moves.is_empty()
+            || !plan.removals.is_empty()
+            || !plan.field_changes.is_empty()
+            || !plan.property_changes.is_empty()
+        {
             return self.apply_edit(plan).await;
         }
 

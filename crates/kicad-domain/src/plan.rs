@@ -137,6 +137,23 @@ pub enum RemovedKind {
     Shape,
 }
 
+/// A field of an existing part set to a new text: a standard field (`Value`, `Footprint`,
+/// `Datasheet`, `Description`), a custom field (created hidden when the part has none of that
+/// name), or one of the flags `DNP`, `Exclude from BOM`, `Exclude from board` (`yes` or `no`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PropertyChange {
+    /// The symbol's id in the document (its UUID).
+    pub id: String,
+    pub reference: String,
+    pub name: String,
+    /// The text before, when the part had the field.
+    pub from: Option<String>,
+    pub to: String,
+}
+
+/// The names that are flags, not text fields.
+pub const FLAG_FIELDS: [&str; 3] = ["DNP", "Exclude from BOM", "Exclude from board"];
+
 /// Text of an existing part (its reference or value) moved to another place or hidden. The text
 /// keeps its size and angle; only where it sits (and how it is justified) changes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -177,6 +194,9 @@ pub struct OperationPlan {
     /// Existing parts' text to move or hide.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub field_changes: Vec<FieldChange>,
+    /// Fields of existing parts set to new text (part numbers, footprints, flags).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub property_changes: Vec<PropertyChange>,
     pub expected_nets: Vec<ExpectedNet>,
     /// Component logical id → planned reference.
     pub references: BTreeMap<LogicalId, String>,
@@ -195,6 +215,7 @@ pub struct OperationCounts {
     pub moves: usize,
     pub removals: usize,
     pub field_changes: usize,
+    pub property_changes: usize,
     pub texts: usize,
     pub shapes: usize,
     pub symbols: usize,
@@ -210,6 +231,7 @@ impl OperationPlan {
             moves: self.moves.len(),
             removals: self.removals.len(),
             field_changes: self.field_changes.len(),
+            property_changes: self.property_changes.len(),
             ..Default::default()
         };
         for op in &self.operations {

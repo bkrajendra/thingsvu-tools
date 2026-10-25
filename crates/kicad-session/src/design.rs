@@ -100,8 +100,42 @@ impl Session {
                 })
                 .unwrap_or_default()
         };
+        let facts_of = |id: &str| -> (std::collections::BTreeMap<String, String>, [bool; 3]) {
+            let Some(i) = instances.iter().find(|i| i.id.as_ref().is_some_and(|k| k.value == id)) else {
+                return Default::default();
+            };
+            let text = |f: &Option<SchematicField>| {
+                f.as_ref()
+                    .and_then(|f| f.text.as_ref())
+                    .map(|t| t.text.clone())
+                    .unwrap_or_default()
+            };
+            let mut properties = std::collections::BTreeMap::from([
+                ("Reference".to_owned(), text(&i.reference_field)),
+                ("Value".to_owned(), text(&i.value_field)),
+                ("Footprint".to_owned(), text(&i.footprint_field)),
+                ("Datasheet".to_owned(), text(&i.datasheet_field)),
+                ("Description".to_owned(), text(&i.description_field)),
+            ]);
+            for f in &i.user_fields {
+                properties.insert(
+                    f.name.clone(),
+                    f.text.as_ref().map(|t| t.text.clone()).unwrap_or_default(),
+                );
+            }
+            let a = i.attributes.unwrap_or_default();
+            (
+                properties,
+                [
+                    a.do_not_populate,
+                    a.exclude_from_bill_of_materials,
+                    a.exclude_from_board,
+                ],
+            )
+        };
         for s in self.list_symbols().await? {
             let fields = fields_of(s.id.as_str());
+            let (properties, [dnp, exclude_from_bom, exclude_from_board]) = facts_of(s.id.as_str());
             let position = Point::from_mm(s.position_mm.x, s.position_mm.y)
                 .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("{}: {e}", s.reference)))?;
             design.symbols.push(DesignSymbol {
@@ -114,6 +148,10 @@ impl Session {
                 orientation: s.orientation,
                 unit: s.unit,
                 fields,
+                properties,
+                dnp,
+                exclude_from_bom,
+                exclude_from_board,
             });
         }
 

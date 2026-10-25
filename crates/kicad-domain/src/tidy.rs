@@ -860,6 +860,7 @@ mod tests {
                     orientation: *orientation,
                     unit: 1,
                     fields: vec![],
+                    ..Default::default()
                 }),
                 Operation::PlacePowerSymbol {
                     net,
@@ -877,6 +878,7 @@ mod tests {
                     orientation: *orientation,
                     unit: 1,
                     fields: vec![],
+                    ..Default::default()
                 }),
                 Operation::AddWire { start, end, .. } => design.wires.push(DesignWire {
                     id,

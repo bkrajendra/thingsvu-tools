@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use kicad_domain::plan::{FieldChange, Operation, OperationPlan, RemovedKind, SymbolMove};
+use kicad_domain::plan::{FieldChange, Operation, OperationPlan, PropertyChange, RemovedKind, SymbolMove};
 use kicad_domain::schematic::ShapeKind;
 use kicad_domain::text::{HAlign, VAlign};
 use kicad_domain::{Dir, LibraryId, Nm, Orientation, Point};
@@ -408,6 +408,98 @@ fn move_edits(text: &str, node: &Node, from: &PlacedSymbol, to: &SymbolMove) -> 
     Ok(edits)
 }
 
+/// The edits that set fields of one symbol: existing text fields are replaced in place, flags
+/// (`dnp`, `in_bom`, `on_board`) are rewritten, and fields the symbol does not have yet are added
+/// after its last field, hidden, in the style its own fields use.
+fn property_edits(text: &str, symbol: &Node, changes: &[&PropertyChange]) -> Result<Vec<Edit>, EmitError> {
+    let mut edits = Vec::new();
+    let mut additions = String::new();
+    let position = symbol
+        .child("at")
+        .and_then(sheet_point)
+        .ok_or(EmitError::NoInsertPoint("a symbol without a position"))?;
+    // How this file hides a field: on the property, or inside its effects.
+    let hide_in_effects = symbol
+        .children("property")
+        .any(|p| p.child("effects").is_some_and(|e| e.child("hide").is_some()));
+    for change in changes {
+        let flag = match change.name.as_str() {
+            "DNP" => Some(("dnp", change.to.as_str())),
+            "Exclude from BOM" => Some(("in_bom", if change.to == "yes" { "no" } else { "yes" })),
+            "Exclude from board" => Some(("on_board", if change.to == "yes" { "no" } else { "yes" })),
+            _ => None,
+        };
+        if let Some((head, value)) = flag {
+            match symbol.child(head) {
+                Some(existing) => edits.push(Edit {
+                    range: existing.span.clone(),
+                    text: format!("({head} {value})"),
+                }),
+                None => {
+                    let anchor = symbol
+                        .child("at")
+                        .ok_or(EmitError::NoInsertPoint("a symbol without a position"))?;
+                    edits.push(Edit {
+                        range: anchor.span.end..anchor.span.end,
+                        text: format!("\n\t\t({head} {value})"),
+                    });
+                }
+            }
+            continue;
+        }
+        match symbol
+            .children("property")
+            .find(|p| p.arg_text(0) == Some(change.name.as_str()))
+        {
+            Some(property) => {
+                let value = property
+                    .arg(1)
+                    .ok_or_else(|| EmitError::ItemNotFound("property", change.name.clone()))?;
+                edits.push(Edit {
+                    range: value.span.clone(),
+                    text: quote(&change.to),
+                });
+            }
+            None => {
+                let mut parts = vec![
+                    Node::string(change.name.clone()),
+                    Node::string(change.to.clone()),
+                    at(position, 0),
+                ];
+                if !hide_in_effects {
+                    parts.push(word("hide", "yes"));
+                }
+                parts.push(word("show_name", "no"));
+                parts.push(word("do_not_autoplace", "no"));
+                parts.push(if hide_in_effects {
+                    item(
+                        "effects",
+                        vec![
+                            item("font", vec![item("size", vec![atom("1.27"), atom("1.27")])]),
+                            word("hide", "yes"),
+                        ],
+                    )
+                } else {
+                    effects_default()
+                });
+                additions.push_str(&format!("\n\t\t{}", item("property", parts).render(2)));
+            }
+        }
+    }
+    if !additions.is_empty() {
+        let last = symbol
+            .children("property")
+            .last()
+            .ok_or(EmitError::NoInsertPoint("a symbol without fields"))?;
+        edits.push(Edit {
+            range: last.span.end..last.span.end,
+            text: additions,
+        });
+    }
+    let _ = text;
+    Ok(edits)
+}
+
 /// The edits that put one field's text somewhere else, justify it differently, or hide it. The
 /// text itself, its size, and its angle stay as they are.
 fn field_edits(text: &str, symbol: &Node, change: &FieldChange) -> Result<Vec<Edit>, EmitError> {
@@ -617,6 +709,16 @@ pub fn add_plan(
             .item("symbol", &change.id)
             .ok_or_else(|| EmitError::ItemNotFound("symbol", change.id.clone()))?;
         edits.extend(field_edits(text, node, change)?);
+    }
+    let mut by_symbol: BTreeMap<&str, Vec<&PropertyChange>> = BTreeMap::new();
+    for change in &plan.property_changes {
+        by_symbol.entry(change.id.as_str()).or_default().push(change);
+    }
+    for (id, changes) in by_symbol {
+        let node = doc
+            .item("symbol", id)
+            .ok_or_else(|| EmitError::ItemNotFound("symbol", id.to_owned()))?;
+        edits.extend(property_edits(text, node, &changes)?);
     }
     if !items.is_empty() {
         edits.push(insertion(match root.child("sheet_instances") {

@@ -380,6 +380,102 @@ pub struct EditItemsArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BomGetArgs {
+    pub session_id: String,
+    /// Fields that must match for parts to share a line. Default: value, footprint, and every
+    /// custom field (manufacturer, part numbers, ...).
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    /// Leave out parts marked do-not-populate.
+    #[serde(default)]
+    pub exclude_dnp: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BomPreset {
+    /// Reference, value, footprint, datasheet, every custom field, quantity, and DNP.
+    #[default]
+    Generic,
+    /// JLCPCB's columns: Comment, Designator, Footprint, LCSC Part #. DNP parts are left out.
+    Jlcpcb,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BomExportArgs {
+    pub session_id: String,
+    /// Absolute path of the .csv file to write, inside the schematic's folder.
+    pub output_path: String,
+    #[serde(default)]
+    pub preset: BomPreset,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FieldsEditArgs {
+    /// The part's reference, e.g. R1.
+    pub reference: String,
+    /// Field name to text. Any name except Reference: Value, Footprint, Datasheet, Description, or
+    /// a custom field such as MPN, Manufacturer, LCSC (created hidden when missing). The flags
+    /// `DNP`, `Exclude from BOM`, and `Exclude from board` take `yes` or `no`.
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetFieldsPlanArgs {
+    pub session_id: String,
+    pub edits: Vec<FieldsEditArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FpSearchArgs {
+    /// Words the footprint's `Library:Name` must contain, e.g. `r 0603` or `sot-23-5`.
+    pub query: String,
+    /// Only this library, e.g. Resistor_SMD.
+    #[serde(default)]
+    pub library: Option<String>,
+    /// Only footprints with this many pads.
+    #[serde(default)]
+    pub pad_count: Option<usize>,
+    /// How many to return (default 15, at most 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// A session, to include the project's own footprint libraries.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FpGetArgs {
+    /// `Library:Name`, e.g. `Resistor_SMD:R_0603_1608Metric`.
+    pub id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FootprintAssignArgs {
+    pub reference: String,
+    /// `Library:Name`; an empty text clears the footprint.
+    pub footprint: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FootprintPlanArgs {
+    pub session_id: String,
+    /// Footprints to assign. Leave empty to only check the footprints parts already have.
+    #[serde(default)]
+    pub assign: Vec<FootprintAssignArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReconnectArgs {
     pub session_id: String,
     /// Wire what KiCad reads from the drawing now instead of the circuit as it was before the first
@@ -710,6 +806,26 @@ impl KicadAiServer {
             .library_symbols(&kicad_domain::design_library_ids(&design))
             .await?;
         Ok((design, nets, library))
+    }
+
+    /// The footprint libraries on this machine, with the session's project when one is given.
+    async fn footprint_libraries(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<kicad_session::footprints::FootprintLibraries, ToolError> {
+        let project = match session_id {
+            Some(id) => self
+                .session(id)
+                .await?
+                .document_path()
+                .parent()
+                .map(std::path::Path::to_path_buf),
+            None => None,
+        };
+        Ok(kicad_session::footprints::FootprintLibraries::discover(
+            self.installs().await,
+            project.as_deref(),
+        ))
     }
 
     /// Stores a planner's result and answers with the plan.
@@ -1513,6 +1629,262 @@ can split or rename nets, which the plan warns about. Ids come from sch_describe
     }
 
     #[tool(
+        name = "bom_get",
+        description = "The bill of materials of the sheet as KiCad groups it: one line per set of parts \
+with the same value, footprint, and custom fields (do-not-populate parts apart), with quantity, \
+references, datasheet, description, every custom field (manufacturer, part numbers), and the parts left \
+out by their own flag. Read-only."
+    )]
+    pub async fn bom_get(&self, Parameters(args): Parameters<BomGetArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match session.design().await {
+            Ok(design) => {
+                let bom = kicad_domain::bom::build(
+                    &design,
+                    &kicad_domain::bom::BomOptions {
+                        group_by: args.group_by.clone(),
+                        exclude_dnp: args.exclude_dnp,
+                    },
+                );
+                envelope::ok(&cid, bom, live(&session), vec![])
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "bom_review",
+        description = "Review the BOM for what an order needs: parts with no footprint, placeholder values, \
+the same value written two ways (10k and 10K), parts left out of the BOM that go on the board, parts drawn \
+on top of each other, and parts with no manufacturer part number (field MPN), manufacturer, or supplier \
+part number (field LCSC, Mouser, DigiKey). Returns the issues and a list of lookups to do, each with a \
+search hint. The server looks nothing up and uses no network: find the parts with a parts-lookup tool \
+you have, then record the answers with sch_set_fields_plan. Read-only."
+    )]
+    pub async fn bom_review(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match session.design().await {
+            Ok(design) => envelope::ok(&cid, kicad_domain::bom::review(&design), live(&session), vec![]),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "sch_set_fields_plan",
+        description = "Plan setting fields on parts, many at once: Value, Footprint, Datasheet, Description, \
+custom fields such as MPN, Manufacturer, LCSC (added hidden, so the drawing does not change), and the flags \
+DNP, Exclude from BOM, and Exclude from board (yes or no). The reference cannot be set here. Nothing \
+else changes and every net is checked unchanged after applying; each field is read back. Returns a plan_id."
+    )]
+    pub async fn sch_set_fields_plan(&self, Parameters(args): Parameters<SetFieldsPlanArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let edits: Vec<kicad_domain::bom::FieldEdit> = args
+            .edits
+            .iter()
+            .map(|e| kicad_domain::bom::FieldEdit {
+                reference: e.reference.clone(),
+                fields: e.fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            })
+            .collect();
+        let plan = async {
+            let design = session.design().await?;
+            let nets = session.netlist().await?;
+            Ok::<_, ToolError>(kicad_domain::bom::plan_set_fields(&design, &nets, &edits))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
+    }
+
+    #[tool(
+        name = "fp_search",
+        description = "Search the KiCad footprint libraries (the install's, and the project's when a \
+session_id is given) for names containing every word of the query, e.g. `r 0603` or `sot-23-5`, \
+optionally in one library or with a given pad count. Returns the id, pad count, and description. A \
+user's global library table is not read. Read-only."
+    )]
+    pub async fn fp_search(&self, Parameters(args): Parameters<FpSearchArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let libs = match self.footprint_libraries(args.session_id.as_deref()).await {
+            Ok(l) => l,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let limit = args.limit.unwrap_or(15).clamp(1, 50);
+        let hits = libs.search(&args.query, args.library.as_deref(), args.pad_count, limit);
+        let warnings = if libs.library_names().is_empty() {
+            vec!["no footprint libraries were found: is KiCad installed?".to_owned()]
+        } else {
+            vec![]
+        };
+        envelope::ok(
+            &cid,
+            serde_json::json!({ "count": hits.len(), "footprints": hits }),
+            vec![],
+            warnings,
+        )
+    }
+
+    #[tool(
+        name = "fp_get",
+        description = "One footprint: its pads (number, kind, position, size in mm), courtyard size, \
+description, and tags. Read-only."
+    )]
+    pub async fn fp_get(&self, Parameters(args): Parameters<FpGetArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let libs = match self.footprint_libraries(args.session_id.as_deref()).await {
+            Ok(l) => l,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match libs.get(&args.id) {
+            Some(fp) => {
+                let mm =
+                    |p: kicad_domain::Point| serde_json::json!({ "x": round2(p.x.to_mm()), "y": round2(p.y.to_mm()) });
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({
+                        "id": fp.id, "description": fp.description, "tags": fp.tags,
+                        "pad_count": fp.pad_numbers().len(),
+                        "pads": fp.pads.iter().map(|p| serde_json::json!({
+                            "number": p.number, "kind": p.kind, "at": mm(p.at),
+                            "size": { "x": round2(p.size.0.to_mm()), "y": round2(p.size.1.to_mm()) } })).collect::<Vec<_>>(),
+                        "courtyard": fp.courtyard.map(|c| serde_json::json!({
+                            "width": round2(c.width().to_mm()), "height": round2(c.height().to_mm()) })),
+                    }),
+                    vec![],
+                    vec![],
+                )
+            }
+            None => envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::SymbolNotFound,
+                    format!("no footprint '{}' in the KiCad libraries (use fp_search)", args.id),
+                ),
+            ),
+        }
+    }
+
+    #[tool(
+        name = "sch_footprint_plan",
+        description = "Check every part's footprint, and plan assigning footprints. Reports parts with no \
+footprint (with a suggestion for plain resistors, capacitors, inductors, and LEDs), footprints that are not \
+in the libraries, footprints with no pad for one of the part's pins (an error), extra pads, and a package \
+named in the value or description (0603, SOT-23-5) that the footprint is not. Choose footprints with \
+fp_search first. With no assign list it is a check only. Returns a plan_id."
+    )]
+    pub async fn sch_footprint_plan(&self, Parameters(args): Parameters<FootprintPlanArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let assign: Vec<(String, String)> = args
+            .assign
+            .iter()
+            .map(|a| (a.reference.clone(), a.footprint.clone()))
+            .collect();
+        let plan = async {
+            let (design, nets, library) = self.edit_context(&session).await?;
+            let libs = self.footprint_libraries(Some(session.id())).await?;
+            let mut ids: std::collections::BTreeSet<String> = design
+                .symbols
+                .iter()
+                .filter(|s| !s.footprint.is_empty())
+                .map(|s| s.footprint.clone())
+                .collect();
+            ids.extend(assign.iter().map(|(_, f)| f.clone()).filter(|f| !f.is_empty()));
+            let footprints: BTreeMap<String, kicad_domain::FootprintInfo> = ids
+                .into_iter()
+                .filter_map(|id| Some((id.clone(), libs.get(&id)?)))
+                .collect();
+            Ok::<_, ToolError>(kicad_domain::plan_footprints(
+                &design,
+                &nets,
+                &library,
+                &footprints,
+                &assign,
+            ))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
+    }
+
+    #[tool(
+        name = "bom_export",
+        description = "Write the BOM as a CSV file inside the schematic's folder, through kicad-cli. Preset \
+generic: reference, value, footprint, datasheet, every custom field, quantity, DNP. Preset jlcpcb: Comment, \
+Designator, Footprint, LCSC Part # (from the field LCSC), do-not-populate parts left out. Nothing is \
+uploaded. Returns the path and the number of lines."
+    )]
+    pub async fn bom_export(&self, Parameters(args): Parameters<BomExportArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let output = PathBuf::from(&args.output_path);
+        let folder = session.document_path().parent().map(PathBuf::from).unwrap_or_default();
+        let inside = output.is_absolute() && std::path::absolute(&output).is_ok_and(|p| p.starts_with(&folder));
+        if !inside || output.extension().and_then(|e| e.to_str()) != Some("csv") {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("output_path must be an absolute .csv path inside {}", folder.display()),
+                ),
+            );
+        }
+        let Some(cli) = session.cli().cloned() else {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::FeatureUnavailable, "no matching kicad-cli install"),
+            );
+        };
+        let dir = match self.scratch_dir(session.id(), "bom", &cid) {
+            Ok(d) => d,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let design = session.design().await?;
+            let bom = kicad_domain::bom::build(&design, &Default::default());
+            let settings = bom_settings(args.preset, &bom, &design);
+            let copy = session.save_copy(&dir).await?;
+            kicad_cli_runner::export::export_bom(&cli, &copy, &output, &settings, std::time::Duration::from_secs(180))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
+            let lines = std::fs::read_to_string(&output)
+                .map(|t| t.lines().count().saturating_sub(1))
+                .unwrap_or(0);
+            Ok::<_, ToolError>((lines, bom.rows.len()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok((lines, rows)) => envelope::ok(
+                &cid,
+                serde_json::json!({ "path": output.display().to_string(), "lines": lines, "bom_lines": rows }),
+                from_cli(&session),
+                vec![],
+            ),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "sch_apply_plan",
         description = "Apply a plan from sch_plan_changes or sch_tidy_plan after the user has reviewed it \
 (confirm: true). Refused if the schematic changed since planning. Places or moves symbols, sets values, \
@@ -2049,4 +2421,55 @@ fn draw_items(args: &DrawArgs) -> Result<Vec<kicad_domain::DrawItem>, ToolError>
             })
         })
         .collect()
+}
+
+/// The columns of a BOM export.
+fn bom_settings(
+    preset: BomPreset,
+    bom: &kicad_domain::bom::Bom,
+    design: &kicad_domain::SchematicDesign,
+) -> kicad_cli_runner::export::BomSettings {
+    let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    match preset {
+        BomPreset::Generic => {
+            let mut fields = names(&["Reference", "Value", "Footprint", "Datasheet"]);
+            fields.extend(bom.custom_fields.iter().cloned());
+            fields.extend(names(&["${QUANTITY}", "${DNP}"]));
+            let mut labels = names(&["Refs", "Value", "Footprint", "Datasheet"]);
+            labels.extend(bom.custom_fields.iter().cloned());
+            labels.extend(names(&["Qty", "DNP"]));
+            let mut group_by = names(&["Value", "Footprint"]);
+            group_by.extend(bom.custom_fields.iter().cloned());
+            kicad_cli_runner::export::BomSettings {
+                fields,
+                labels,
+                group_by,
+                exclude_dnp: false,
+            }
+        }
+        BomPreset::Jlcpcb => {
+            // The field the part numbers are kept in; LCSC unless the parts use another spelling.
+            let field = ["LCSC", "LCSC Part", "LCSC Part #", "JLCPCB Part #"]
+                .into_iter()
+                .find(|f| {
+                    design
+                        .symbols
+                        .iter()
+                        .any(|s| s.properties.get(*f).is_some_and(|v| !v.is_empty()))
+                })
+                .unwrap_or("LCSC");
+            kicad_cli_runner::export::BomSettings {
+                fields: names(&["Value", "Reference", "Footprint"])
+                    .into_iter()
+                    .chain([field.to_owned()])
+                    .collect(),
+                labels: names(&["Comment", "Designator", "Footprint", "LCSC Part #"]),
+                group_by: names(&["Value", "Footprint"])
+                    .into_iter()
+                    .chain([field.to_owned()])
+                    .collect(),
+                exclude_dnp: true,
+            }
+        }
+    }
 }

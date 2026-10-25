@@ -134,6 +134,15 @@ pub struct DesignSymbol {
     pub unit: u32,
     /// The reference and value text as drawn.
     pub fields: Vec<DesignField>,
+    /// Every field with its text: Reference, Value, Footprint, Datasheet, Description, and any
+    /// custom field (manufacturer, part numbers, ...).
+    pub properties: BTreeMap<String, String>,
+    /// Marked do-not-populate.
+    pub dnp: bool,
+    /// Left out of the BOM.
+    pub exclude_from_bom: bool,
+    /// Left off the board.
+    pub exclude_from_board: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

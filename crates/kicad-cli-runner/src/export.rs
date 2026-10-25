@@ -46,3 +46,50 @@ pub async fn export_png(
     }
     Ok(pngs)
 }
+
+/// What `kicad-cli sch export bom` should write.
+#[derive(Debug, Clone, Default)]
+pub struct BomSettings {
+    /// Fields to export, in order (`Reference`, `Value`, custom fields, `QUANTITY`, `DNP`, ...).
+    pub fields: Vec<String>,
+    /// The column heading for each field.
+    pub labels: Vec<String>,
+    /// Fields that must match for parts to share a line.
+    pub group_by: Vec<String>,
+    pub exclude_dnp: bool,
+}
+
+/// Writes the BOM of `schematic` as CSV to `output`.
+pub async fn export_bom(
+    install: &KicadInstall,
+    schematic: &Path,
+    output: &Path,
+    settings: &BomSettings,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    let mut args: Vec<OsString> = vec!["sch".into(), "export".into(), "bom".into()];
+    for (flag, values) in [
+        ("--fields", &settings.fields),
+        ("--labels", &settings.labels),
+        ("--group-by", &settings.group_by),
+    ] {
+        if !values.is_empty() {
+            args.push(flag.into());
+            args.push(values.join(",").into());
+        }
+    }
+    if settings.exclude_dnp {
+        args.push("--exclude-dnp".into());
+    }
+    args.push("--output".into());
+    args.push(output.into());
+    args.push(schematic.into());
+    check(run(&install.cli, &args, timeout).await?, schematic)?;
+    if !output.is_file() {
+        return Err(CliError::BadReport {
+            path: output.to_owned(),
+            detail: "no BOM was written".into(),
+        });
+    }
+    Ok(())
+}

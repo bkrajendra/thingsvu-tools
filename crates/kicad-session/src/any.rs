@@ -178,6 +178,7 @@ impl AnySession {
         // Every position and turn the plan asked for is read back from the document.
         if !plan.moves.is_empty()
             || !plan.field_changes.is_empty()
+            || !plan.property_changes.is_empty()
             || plan.operations.iter().any(|op| {
                 matches!(
                     op,
@@ -190,6 +191,7 @@ impl AnySession {
                     let problems = placement_problems(plan, &design);
                     report.placements_checked = plan.moves.len()
                         + plan.field_changes.len()
+                        + plan.property_changes.len()
                         + plan
                             .operations
                             .iter()
@@ -278,6 +280,25 @@ fn placement_problems(plan: &OperationPlan, design: &kicad_domain::SchematicDesi
                     orientation
                 ));
             }
+        }
+    }
+    for c in &plan.property_changes {
+        let Some(symbol) = design.symbols.iter().find(|s| s.id.eq_ignore_ascii_case(&c.id)) else {
+            problems.push(format!("{} is missing after its fields were set", c.reference));
+            continue;
+        };
+        let flag = |on: bool| if on { "yes" } else { "no" };
+        let now = match c.name.as_str() {
+            "DNP" => Some(flag(symbol.dnp).to_owned()),
+            "Exclude from BOM" => Some(flag(symbol.exclude_from_bom).to_owned()),
+            "Exclude from board" => Some(flag(symbol.exclude_from_board).to_owned()),
+            other => symbol.properties.get(other).cloned(),
+        };
+        if now.as_deref() != Some(c.to.as_str()) {
+            problems.push(format!(
+                "{} field '{}' reads back as {:?}, not '{}' as planned",
+                c.reference, c.name, now, c.to
+            ));
         }
     }
     for c in &plan.field_changes {

@@ -137,3 +137,18 @@ Observed 25 Oct 2026 with `crates/kicad-session/tests/live_probe9.rs` (`KICAD_LI
 | Field text, API vs file | `reference_field` and `value_field` carry `text.position`, `attributes.angle`, `size`, `horizontal_alignment`, `vertical_alignment`, and `visible`; for parts with no rotation, position, size, justification, and angle match the file's `property` exactly |
 | Label direction | A new `LocalLabel` with no spin style is saved as angle 180, `justify right bottom` (text running left). The reader maps spin styles and file angles (0, 90, 180, 270) to the way the text runs |
 | Text size in a plan | KiCad's text height is 1.27 mm by default; `size` on text attributes is read as the larger of the two sides |
+
+## Parts, fields, BOM, and footprints (10.99 and 10.0.7, Phase 10 probe)
+
+Observed 25 Oct 2026 with `crates/kicad-session/tests/live_probe10.rs` (`KICAD_LIVE=1 cargo test -p kicad-session --test live_probe10 -- --nocapture`) and `kicad-cli sch export bom --help`.
+
+| Topic | Observation |
+|---|---|
+| Custom fields over the API | `SchematicSymbolInstance.user_fields` is a list of `SchematicField`. An update with `field_mask` `user_fields` that carries the **whole list** (the old fields plus a new one with `visible: false`) is accepted (`ISC_OK`) and read back; the file gets `(property "MPN" "…" (at x y 0) (hide yes) (show_name no) (do_not_autoplace no) (effects …))` at the symbol's own position. Sending only the new field would replace the others, so a symbol's changes are sent in one update |
+| Flags | `attributes` (`do_not_populate`, `exclude_from_bill_of_materials`, `exclude_from_board`, …) updates with field mask `attributes`; the file stores `(dnp yes)`, `(in_bom yes)`, `(on_board yes)` on the symbol (note the inversion for the exclude flags) |
+| Standard fields | `datasheet_field`, `description_field`, `footprint_field`, `value_field` update by their own field-mask paths |
+| Hidden property style | In the 10.99 files the hide flag sits on the property (`(hide yes)`); older files put `(hide yes)` inside `effects`. The writer copies the style of the symbol's own properties |
+| Simulator fields | KiCad's simulator keeps `Sim.Device`, `Sim.Pins`, … as custom fields; they come back from `user_fields` and are ignored for the BOM |
+| `kicad-cli sch export bom` | On 10.0.7 and 10.99: `--fields`, `--labels`, `--group-by`, `--sort-field`, `--exclude-dnp`, field and string delimiters, `--preset` / `--format-preset` (named presets saved in the editor). `${QUANTITY}` and `${DNP}` are generated fields. 10.99 adds `--variant` |
+| Footprint libraries | `share/kicad/footprints/<Library>.pretty/<Name>.kicad_mod` under the install (155 libraries on 10.99); read as files, not through the API. A project's `fp-lib-table` may add libraries (`${KIPRJMOD}` expands to the project folder). The user's global table is not read |
+

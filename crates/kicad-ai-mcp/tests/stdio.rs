@@ -104,6 +104,11 @@ async fn lists_tools_and_returns_envelopes() {
     assert_eq!(
         names,
         [
+            "bom_export",
+            "bom_get",
+            "bom_review",
+            "fp_get",
+            "fp_search",
             "sch_apply_plan",
             "sch_arrange_plan",
             "sch_create_demo_circuit",
@@ -112,6 +117,7 @@ async fn lists_tools_and_returns_envelopes() {
             "sch_draw_plan",
             "sch_edit_items_plan",
             "sch_export_netlist",
+            "sch_footprint_plan",
             "sch_get_netlist",
             "sch_get_symbol_pins",
             "sch_label_plan",
@@ -123,6 +129,7 @@ async fn lists_tools_and_returns_envelopes() {
             "sch_run_erc",
             "sch_save",
             "sch_set_field",
+            "sch_set_fields_plan",
             "sch_tidy_plan",
             "session_close",
             "session_list_documents",
@@ -1375,4 +1382,252 @@ async fn gui_text_demo() {
     let closed = mcp.call("session_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: look at the editor; Ctrl+Z undoes the steps");
+}
+
+/// Parts and BOM: review, set fields, check and assign footprints, export. Every plan leaves the
+/// nets as they were, and each field is read back.
+#[tokio::test]
+async fn live_bom_and_footprints_through_mcp() {
+    bom_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_bom_and_footprints_through_the_api() {
+    bom_flow("headless").await;
+}
+
+async fn bom_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-bom-{provider}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("regulator.kicad_sch");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/v11/regulator-with-notes/regulator.kicad_sch"),
+        &schematic,
+    )
+    .unwrap();
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": provider }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let n = std::process::id();
+    let mut step = 0;
+    let mut apply = |plan: serde_json::Value| {
+        step += 1;
+        json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true,
+                "idempotency_key": format!("bom-{provider}-{n}-{step}") })
+    };
+
+    // The BOM and its review, before any part data exists.
+    let bom = mcp.call("bom_get", json!({ "session_id": id })).await;
+    assert_eq!(bom["ok"], true, "{bom}");
+    let lines_before = bom["result"]["rows"].as_array().unwrap().len();
+    assert!(lines_before >= 5, "{bom}");
+    assert_eq!(bom["result"]["custom_fields"], json!([]), "{bom}");
+    let review = mcp.call("bom_review", json!({ "session_id": id })).await;
+    let codes = review["result"]["issues"].to_string();
+    assert!(
+        codes.contains("MISSING_MPN") && codes.contains("MISSING_SUPPLIER_PART"),
+        "{review}"
+    );
+    assert!(!review["result"]["lookups"].as_array().unwrap().is_empty(), "{review}");
+
+    // Fields: part numbers on the capacitors, and one resistor out of the BOM run.
+    let plan = mcp
+        .call(
+            "sch_set_fields_plan",
+            json!({ "session_id": id, "edits": [
+                { "reference": "C1", "fields": { "MPN": "GRM21BR61A106KE19", "Manufacturer": "Murata", "LCSC": "C440198" } },
+                { "reference": "C2", "fields": { "MPN": "CL10B104KB8NNNC", "Manufacturer": "Samsung", "LCSC": "C1591" } },
+                { "reference": "R3", "fields": { "DNP": "yes" } },
+            ] }),
+        )
+        .await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    assert_eq!(plan["result"]["counts"]["property_changes"], 7, "{plan}");
+    let applied = mcp.call("sch_apply_plan", apply(plan)).await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert!(
+        applied["result"]["placements_checked"].as_u64().unwrap() >= 7,
+        "{applied}"
+    );
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let bom = mcp.call("bom_get", json!({ "session_id": id })).await;
+    let fields = bom["result"]["custom_fields"].to_string();
+    assert!(
+        fields.contains("MPN") && fields.contains("LCSC") && fields.contains("Manufacturer"),
+        "{bom}"
+    );
+    assert!(
+        bom["result"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["dnp"] == true && r["references"] == json!(["R3"])),
+        "{bom}"
+    );
+    let reviewed = mcp.call("bom_review", json!({ "session_id": id })).await;
+    assert!(
+        !reviewed["result"]["lookups"].to_string().contains("\"C1\""),
+        "C1 is complete now: {reviewed}"
+    );
+
+    // A flag or field that makes no change, and bad requests, are refused or skipped.
+    let same = mcp
+        .call(
+            "sch_set_fields_plan",
+            json!({ "session_id": id, "edits": [{ "reference": "C1", "fields": { "MPN": "GRM21BR61A106KE19" } }] }),
+        )
+        .await;
+    assert!(
+        same["result"]["findings"].to_string().contains("NOTHING_TO_CHANGE"),
+        "{same}"
+    );
+    let bad = mcp
+        .call("sch_set_fields_plan", json!({ "session_id": id, "edits": [{ "reference": "C1", "fields": { "Reference": "C9", "DNP": "maybe" } }] }))
+        .await;
+    assert_eq!(bad["result"]["can_apply"], false, "{bad}");
+
+    // Footprints: search, read, check, assign.
+    let search = mcp
+        .call(
+            "fp_search",
+            json!({ "query": "r 0805", "library": "Resistor_SMD", "session_id": id }),
+        )
+        .await;
+    assert_eq!(search["ok"], true, "{search}");
+    assert!(
+        search["result"]["footprints"]
+            .to_string()
+            .contains("Resistor_SMD:R_0805_2012Metric"),
+        "{search}"
+    );
+    let footprint = mcp
+        .call("fp_get", json!({ "id": "Resistor_SMD:R_0805_2012Metric" }))
+        .await;
+    assert_eq!(footprint["result"]["pad_count"], 2, "{footprint}");
+    assert!(
+        footprint["result"]["courtyard"]["width"].as_f64().unwrap() > 2.0,
+        "{footprint}"
+    );
+    let missing = mcp.call("fp_get", json!({ "id": "Nope:Nothing" })).await;
+    assert_eq!(missing["ok"], false, "{missing}");
+
+    let check = mcp.call("sch_footprint_plan", json!({ "session_id": id })).await;
+    assert_eq!(check["ok"], true, "{check}");
+    println!("FOOTPRINT CHECK ({provider}): {}", check["result"]["findings"]);
+    let unknown = mcp
+        .call(
+            "sch_footprint_plan",
+            json!({ "session_id": id, "assign": [{ "reference": "R3", "footprint": "Nope:Nothing" }] }),
+        )
+        .await;
+    assert_eq!(unknown["result"]["can_apply"], false, "{unknown}");
+    let assign = mcp
+        .call(
+            "sch_footprint_plan",
+            json!({ "session_id": id, "assign": [{ "reference": "R3", "footprint": "Resistor_SMD:R_0805_2012Metric" }] }),
+        )
+        .await;
+    assert_eq!(assign["result"]["can_apply"], true, "{assign}");
+    assert_eq!(assign["result"]["counts"]["property_changes"], 1, "{assign}");
+    let applied = mcp.call("sch_apply_plan", apply(assign)).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    let r3 = symbols["result"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["reference"] == "R3")
+        .unwrap();
+    assert_eq!(r3["footprint"], "Resistor_SMD:R_0805_2012Metric", "{r3}");
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+
+    // Export: the generic CSV has the custom fields; the JLCPCB one leaves the DNP part out.
+    let generic = dir.join("bom.csv");
+    let exported = mcp
+        .call(
+            "bom_export",
+            json!({ "session_id": id, "output_path": generic, "preset": "generic" }),
+        )
+        .await;
+    assert_eq!(exported["ok"], true, "{exported}");
+    let text = std::fs::read_to_string(&generic).unwrap();
+    assert!(text.contains("MPN") && text.contains("GRM21BR61A106KE19"), "{text}");
+    let jlc = dir.join("jlc.csv");
+    let exported = mcp
+        .call(
+            "bom_export",
+            json!({ "session_id": id, "output_path": jlc, "preset": "jlcpcb" }),
+        )
+        .await;
+    assert_eq!(exported["ok"], true, "{exported}");
+    let text = std::fs::read_to_string(&jlc).unwrap();
+    assert!(
+        text.contains("Designator") && text.contains("LCSC Part #") && text.contains("C440198"),
+        "{text}"
+    );
+    assert!(!text.contains("R3"), "the DNP part is left out: {text}");
+    let outside = mcp
+        .call(
+            "bom_export",
+            json!({ "session_id": id, "output_path": std::env::temp_dir().join("elsewhere.csv") }),
+        )
+        .await;
+    assert_eq!(outside["error"]["code"], "INVALID_ARGUMENT", "{outside}");
+
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    println!("ERC after BOM tools ({provider}): {} errors", erc["result"]["errors"]);
+}
+
+/// Against a real KiCad 11 editor: review the BOM, set a part-number field on the first part and
+/// read it back, then check the footprints. Open a **copy**, press "KiCad AI: connect", then run
+/// with THINGSVU_GUI_BOM=1. Ctrl+Z in the editor undoes the field change.
+#[tokio::test]
+async fn gui_bom_demo() {
+    if std::env::var("THINGSVU_GUI_BOM").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_BOM=1 with a registered KiCad editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("session_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let review = mcp.call("bom_review", json!({ "session_id": id })).await;
+    println!("GUI BOM REVIEW {}", review["result"]["issues"]);
+    let bom = mcp.call("bom_get", json!({ "session_id": id })).await;
+    let first = bom["result"]["rows"][0]["references"][0].as_str().unwrap().to_owned();
+    println!("GUI BOM first part {first}");
+    let plan = mcp
+        .call(
+            "sch_set_fields_plan",
+            json!({ "session_id": id, "edits": [{ "reference": first, "fields": { "MPN": "TEST-PART-123" } }] }),
+        )
+        .await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("gui-bom-{}", std::process::id()) }),
+        )
+        .await;
+    println!("GUI BOM APPLY {applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let check = mcp.call("sch_footprint_plan", json!({ "session_id": id })).await;
+    println!("GUI FOOTPRINT CHECK {}", check["result"]["findings"]);
+    let closed = mcp.call("session_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: look at part {first} (field MPN is hidden); Ctrl+Z undoes it");
 }

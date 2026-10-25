@@ -1,6 +1,6 @@
 # Plan: parts, footprints, BOM, and PCB tools
 
-Status: **planned, not started** (written 25 Oct 2026, after Phase 9). The task lists are in [tasks.md](tasks.md), Phases 10 to 13. This page holds the reasoning: what we are building, what KiCad lets us do, what we will not do, and the decisions that need the project owner's review.
+Status: Phase 10 **done** (v0.5.0); Phases 11 to 13 planned, not started (written 25 Oct 2026, after Phase 9). The task lists are in [tasks.md](tasks.md), Phases 10 to 13. This page holds the reasoning: what we are building, what KiCad lets us do, what we will not do, and the decisions that need the project owner's review.
 
 ## Goal
 
@@ -50,7 +50,9 @@ flowchart LR
 | D6 | Manufacturer packages | A JLCPCB-style package (Gerbers, drill, BOM, placement file) is the first format because it is common and documented; others by request. Files are written into the project; **nothing is uploaded** |
 | D7 | Units and grids | Millimetres in the tools, a configurable placement grid (default 0.5 mm), clearances from the board's own rules and netclasses, never invented |
 
-## Phase 10: parts, footprints, and BOM (v0.5.0)
+## Phase 10: parts, footprints, and BOM (v0.5.0, done)
+
+Built as planned; the decisions D1 and D2 held (nothing is looked up by the server). Differences: the tools are `bom_get`, `bom_review`, `bom_export`, `sch_set_fields_plan`, `fp_search`, `fp_get`, and `sch_footprint_plan`; simulator fields (`Sim.*`) are ignored; details in tasks.md.
 
 Why first: a board needs a footprint for every part, and most schematics from the earlier phases only have values. A BOM review is also the first thing a person asks for before ordering.
 

@@ -156,6 +156,15 @@ impl Document {
                         .collect()
                 })
                 .unwrap_or_default();
+            let node = self.item("symbol", &s.uuid);
+            let properties: std::collections::BTreeMap<String, String> = node
+                .map(|n| {
+                    n.children("property")
+                        .filter_map(|p| Some((p.arg_text(0)?.to_owned(), p.arg_text(1).unwrap_or_default().to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let flag = |name: &str, on: &str| node.is_some_and(|n| n.child_text(name) == Some(on));
             design.symbols.push(DesignSymbol {
                 id: s.uuid,
                 reference: s.reference,
@@ -166,6 +175,10 @@ impl Document {
                 orientation: s.orientation,
                 unit: s.unit,
                 fields,
+                properties,
+                dnp: flag("dnp", "yes"),
+                exclude_from_bom: flag("in_bom", "no"),
+                exclude_from_board: flag("on_board", "no"),
             });
         }
         let point = |n: &Node| {

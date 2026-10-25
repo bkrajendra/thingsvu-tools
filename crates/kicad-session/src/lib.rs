@@ -10,6 +10,7 @@ mod capability_map;
 mod design;
 mod errors;
 mod file;
+pub mod footprints;
 mod headless;
 #[cfg(windows)]
 mod job;

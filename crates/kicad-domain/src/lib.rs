@@ -5,11 +5,13 @@
 //! these types and KiCad's own representations.
 
 pub mod arrange;
+pub mod bom;
 pub mod capability;
 pub mod circuit;
 pub mod connectivity;
 pub mod declutter;
 pub mod edits;
+pub mod footprint;
 pub mod geometry;
 pub mod ids;
 pub mod layout;
@@ -28,6 +30,7 @@ pub use circuit::{CircuitSpec, ComponentSpec, NetSpec, PinRef};
 pub use connectivity::attach_power_pins;
 pub use declutter::plan_declutter;
 pub use edits::{plan_draw, plan_edit_items, plan_labels, DrawItem, LabelAdd, LabelAt, LabelEdits};
+pub use footprint::{plan_footprints, FootprintInfo, FootprintPad};
 pub use geometry::{Dir, Nm, Orientation, Point, Rect, GRID};
 pub use ids::{IdError, Kiid, LibraryId, LogicalId};
 pub use layout::{is_ground_name, library_ids_for};

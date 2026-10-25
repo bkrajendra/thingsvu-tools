@@ -140,6 +140,12 @@ To steer it, or to arrange a small circuit yourself:
 >
 > Move the regulator to the top right, group R1 and R2 below it, then reconnect everything.
 
+To get a schematic ready to order parts:
+
+> Review the BOM for a JLCPCB order. Look up the parts you can, fill in the part numbers, assign the missing footprints, and export the BOM.
+
+The server looks nothing up and makes no network calls. `bom_review` lists what is missing, with a search hint for each line; the assistant finds the parts with whatever parts-lookup tool it has (a JLCPCB, Mouser, or DigiKey connector, for example) and records the answers with `sch_set_fields_plan` (fields `MPN`, `Manufacturer`, `LCSC`). With no such tool the fields stay empty and the review keeps saying so.
+
 After a tidy or a reconnect, KiCad decides where the text of each part lands, and it can run into a wire or another part's text. Ask for it to be cleaned up:
 
 > Check the schematic for text that overlaps, and move it.
@@ -180,6 +186,12 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `sch_label_plan` | Add, rename, turn, or delete net labels. Refuses a label that would give a net a second name or join two nets by accident |
 | `sch_draw_plan` | Draw rectangles, circles, lines, text notes, and a titled box around named parts (for example "Power supply") |
 | `sch_edit_items_plan` | Delete wires, labels, junctions, notes, and drawings by id, or move labels, notes, and drawings |
+| `bom_get` | The bill of materials as KiCad groups it, with every custom field. Read-only |
+| `bom_review` | What an order lacks: footprints, part numbers, supplier numbers, inconsistent values; plus a list of lookups to do. No network |
+| `sch_set_fields_plan` | Set fields on many parts at once: part numbers, manufacturer, datasheet, DNP, exclude from BOM (custom fields are added hidden) |
+| `fp_search` / `fp_get` | Search the footprint libraries and read a footprint's pads and courtyard |
+| `sch_footprint_plan` | Check every footprint (missing, not in the libraries, no pad for a pin, wrong package) and assign footprints |
+| `bom_export` | Write the BOM as CSV into the project folder (generic or JLCPCB columns) |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |
@@ -244,7 +256,8 @@ How releases are made: [releasing](docs/releasing.md).
 ## Roadmap
 
 - **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), reviewing and tidying existing schematics, ERC, netlist export, verified demo circuits, KiCad 10 through the schematic file, and a one-step installer
-- **Next (planned, see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)):** parts, footprints, and BOM review and export; then PCB tools (read and review, update from the schematic, outline, placement, routing); then manufacturing outputs
+- **Now (also):** parts, footprints, and BOM review and export
+- **Next (planned, see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)):** PCB tools (read and review, update from the schematic, outline, placement, routing); then manufacturing outputs
 - **Also open:** hierarchical schematics
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 

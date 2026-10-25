@@ -66,6 +66,92 @@ async fn remove_and_move(
             ));
         }
     }
+    // Fields and flags of existing parts: one update per part, carrying all its changes.
+    let mut by_symbol: std::collections::BTreeMap<&str, Vec<&kicad_domain::plan::PropertyChange>> =
+        std::collections::BTreeMap::new();
+    for change in &plan.property_changes {
+        by_symbol.entry(change.id.as_str()).or_default().push(change);
+    }
+    for (id, changes) in by_symbol {
+        let mut symbol = instances
+            .iter()
+            .find(|s| s.id.as_ref().is_some_and(|k| k.value.eq_ignore_ascii_case(id)))
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::new(
+                    ErrorCode::StalePlan,
+                    format!(
+                        "{} is no longer in the schematic; make a new plan",
+                        changes[0].reference
+                    ),
+                )
+            })?;
+        symbol.definition = None;
+        let mut paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for change in &changes {
+            let text_field = |field: &mut Option<SchematicField>| {
+                if let Some(t) = field.as_mut().and_then(|f| f.text.as_mut()) {
+                    t.text = change.to.clone();
+                }
+            };
+            let yes = change.to == "yes";
+            match change.name.as_str() {
+                "Value" => {
+                    text_field(&mut symbol.value_field);
+                    paths.insert("value_field");
+                }
+                "Footprint" => {
+                    text_field(&mut symbol.footprint_field);
+                    paths.insert("footprint_field");
+                }
+                "Datasheet" => {
+                    text_field(&mut symbol.datasheet_field);
+                    paths.insert("datasheet_field");
+                }
+                "Description" => {
+                    text_field(&mut symbol.description_field);
+                    paths.insert("description_field");
+                }
+                "DNP" | "Exclude from BOM" | "Exclude from board" => {
+                    let a = symbol.attributes.get_or_insert_with(Default::default);
+                    match change.name.as_str() {
+                        "DNP" => a.do_not_populate = yes,
+                        "Exclude from BOM" => a.exclude_from_bill_of_materials = yes,
+                        _ => a.exclude_from_board = yes,
+                    }
+                    paths.insert("attributes");
+                }
+                custom => {
+                    match symbol.user_fields.iter_mut().find(|f| f.name == custom) {
+                        Some(f) => {
+                            if let Some(t) = f.text.as_mut() {
+                                t.text = change.to.clone();
+                            }
+                        }
+                        None => symbol.user_fields.push(SchematicField {
+                            name: custom.to_owned(),
+                            text: Some(kicad_ipc::proto::kiapi::common::types::Text {
+                                position: symbol.position,
+                                text: change.to.clone(),
+                                ..Default::default()
+                            }),
+                            visible: false,
+                            show_name: false,
+                            allow_auto_place: true,
+                            ..Default::default()
+                        }),
+                    }
+                    paths.insert("user_fields");
+                }
+            }
+        }
+        send_symbol_update(client, header, symbol, paths.into_iter().map(str::to_owned).collect())
+            .await
+            .map_err(|mut e| {
+                e.message = format!("setting fields of {}: {}", changes[0].reference, e.message);
+                e
+            })?;
+    }
     for change in &plan.field_changes {
         let mut symbol = instances
             .iter()
