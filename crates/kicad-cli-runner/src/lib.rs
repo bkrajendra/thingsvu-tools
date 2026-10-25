@@ -4,11 +4,13 @@
 //! - [`install`]: find KiCad installs and their versions.
 //! - [`erc`]: electrical rules check with the JSON report parsed.
 //! - [`netlist`]: netlist export with the KiCad s-expression netlist parsed.
+//! - [`pcb`]: board DRC with the JSON report parsed, and 3D renders.
 
 pub mod erc;
 pub mod export;
 pub mod install;
 pub mod netlist;
+pub mod pcb;
 mod run;
 mod sexpr;
 

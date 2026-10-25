@@ -20,6 +20,9 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::envelope;
 use crate::plans::{plan_view, PlanStore, StoredPlan};
 
+#[path = "pcb_tools.rs"]
+mod pcb_tools;
+
 const INSTRUCTIONS: &str = "KiCad schematic tools. Start with session_status to see the KiCad installs \
 and what each session can do, then session_open on a .kicad_sch file (or create: true for a new one). \
 Use the headless or gui provider with KiCad 11; with KiCad 10 (or a file no editor has open) use the \
@@ -48,6 +51,10 @@ struct State {
     /// (moving or deleting parts leaves wires behind, so KiCad no longer reports them). Used by
     /// sch_reconnect_plan and dropped once that plan is applied.
     intended: Mutex<BTreeMap<String, Vec<kicad_domain::NetInfo>>>,
+    /// Open board sessions (the pcb_* tools).
+    boards: Mutex<BTreeMap<String, Arc<kicad_session::BoardSession>>>,
+    /// Updates of a board from its schematic that were planned and wait to be applied.
+    pending_updates: Mutex<BTreeMap<String, pcb_tools::PendingUpdate>>,
 }
 
 #[derive(Clone)]
@@ -633,8 +640,10 @@ impl KicadAiServer {
                 sessions: Mutex::new(BTreeMap::new()),
                 plans: Mutex::new(PlanStore::default()),
                 intended: Mutex::new(BTreeMap::new()),
+                boards: Mutex::new(BTreeMap::new()),
+                pending_updates: Mutex::new(BTreeMap::new()),
             }),
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router() + Self::pcb_router(),
         }
     }
 
@@ -826,6 +835,14 @@ impl KicadAiServer {
             self.installs().await,
             project.as_deref(),
         ))
+    }
+
+    /// The footprint libraries on this machine, with a project folder's own libraries.
+    async fn footprint_libraries_in(
+        &self,
+        project: Option<&std::path::Path>,
+    ) -> kicad_session::footprints::FootprintLibraries {
+        kicad_session::footprints::FootprintLibraries::discover(self.installs().await, project)
     }
 
     /// Stores a planner's result and answers with the plan.
@@ -1081,9 +1098,14 @@ liveness, unsaved changes, and the capability matrix (which features are availab
                 })
             })
             .collect();
+        let mut boards = Vec::new();
+        for b in self.state.boards.lock().await.values().cloned().collect::<Vec<_>>() {
+            boards.push(b.status().await);
+        }
         envelope::ok(
             &cid,
             serde_json::json!({
+                "boards": boards,
                 "server": { "name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION") },
                 "kicad_installs": installs,
                 "gui_editors": gui_editors,

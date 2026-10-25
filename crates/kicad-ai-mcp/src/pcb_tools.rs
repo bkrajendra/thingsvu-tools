@@ -1,0 +1,1012 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! The `pcb_*` tools: board sessions, reading, DRC, a render, a review, and updating the board from
+//! the schematic (Phase 11).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use kicad_domain::board::{place_rect, Board};
+use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
+use kicad_session::{BoardSession, Provider};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+use super::{envelope, provider_name, round2, KicadAiServer, ProviderArg};
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbOpenArgs {
+    /// Absolute path of the .kicad_pcb file. Required for headless and file; for gui it selects
+    /// the board when the PCB editor has more than one open.
+    #[serde(default)]
+    pub pcb_path: Option<String>,
+    /// headless: a private KiCad 11 server opens the board (reading, DRC, updating from the
+    /// schematic). file: the file itself is read, KiCad 10 or 11 (reading, DRC, render, exports).
+    /// gui: the PCB editor the user has open, after pressing "KiCad AI: connect" there.
+    #[serde(default)]
+    pub provider: ProviderArg,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbSessionArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbCloseArgs {
+    pub session_id: String,
+    /// Close even if the board has unsaved changes (they are lost).
+    #[serde(default)]
+    pub discard_unsaved: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbFootprintsArgs {
+    pub session_id: String,
+    /// Include every pad (number, kind, place, net) of each footprint.
+    #[serde(default)]
+    pub include_pads: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbFootprintArgs {
+    pub session_id: String,
+    /// The footprint's reference, e.g. U1.
+    pub reference: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbTracksArgs {
+    pub session_id: String,
+    /// Only items on this net.
+    #[serde(default)]
+    pub net: Option<String>,
+    /// How many tracks to return (default 200, at most 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbDrcArgs {
+    pub session_id: String,
+    /// Also compare the board with its schematic (parts, footprints, and nets that differ).
+    #[serde(default)]
+    pub schematic_parity: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbRenderArgs {
+    pub session_id: String,
+    /// top (default), bottom, left, right, front, or back.
+    #[serde(default)]
+    pub side: Option<String>,
+    /// Image size in pixels (default 1600 x 900, at most 3200 x 2400).
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbReviewArgs {
+    pub session_id: String,
+    /// The board's schematic, to compare the two. Defaults to the .kicad_sch with the board's name
+    /// next to it.
+    #[serde(default)]
+    pub schematic_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbUpdateArgs {
+    pub session_id: String,
+    /// The schematic to update from. Defaults to the .kicad_sch with the board's name next to it.
+    /// The file on disk is used, so save the schematic first.
+    #[serde(default)]
+    pub schematic_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbApplyArgs {
+    pub session_id: String,
+    pub plan_id: String,
+    /// Must be true: the user has reviewed the plan.
+    pub confirm: bool,
+    /// A new value per intended apply (8-128 characters).
+    pub idempotency_key: String,
+}
+
+/// An update of the board from the schematic, planned and waiting to be applied.
+pub struct PendingUpdate {
+    pub session_id: String,
+    pub netlist: PathBuf,
+    pub fingerprint: String,
+    pub applied_with: Option<String>,
+    pub schematic: PathBuf,
+}
+
+fn mm(v: i64) -> f64 {
+    round2(v as f64 / 1e6)
+}
+
+fn pt(p: Point) -> serde_json::Value {
+    serde_json::json!({ "x": mm(p.x.0), "y": mm(p.y.0) })
+}
+
+fn rect(r: Rect) -> serde_json::Value {
+    serde_json::json!({ "min": pt(r.min), "max": pt(r.max), "width": mm(r.width().0), "height": mm(r.height().0) })
+}
+
+fn board_provenance(board: &BoardSession) -> Vec<Provenance> {
+    vec![Provenance {
+        origin: match board.provider() {
+            Provider::File => Origin::ProjectFile,
+            _ => Origin::KicadIpc,
+        },
+        kicad_version: Some(board.kicad_version().to_owned()),
+        provider: Some(provider_name(board.provider()).into()),
+        document: Some(board.document_path().display().to_string()),
+        revision: None,
+    }]
+}
+
+/// A fingerprint of what is on the board, so a plan made earlier can be told from a stale one.
+fn fingerprint(board: &Board) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in &board.footprints {
+        (
+            &f.reference,
+            &f.lib_id,
+            f.position.x.0,
+            f.position.y.0,
+            f.layer.as_str(),
+        )
+            .hash(&mut h);
+        for p in &f.pads {
+            (&p.number, &p.net).hash(&mut h);
+        }
+    }
+    board.tracks.len().hash(&mut h);
+    board.vias.len().hash(&mut h);
+    board.zones.len().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// The schematic next to a board (same name), or the one given.
+fn schematic_for(board: &BoardSession, given: Option<&str>) -> Result<PathBuf, ToolError> {
+    if let Some(p) = given {
+        let p = PathBuf::from(p);
+        if !p.is_absolute() || p.extension().and_then(|e| e.to_str()) != Some("kicad_sch") || !p.is_file() {
+            return Err(ToolError::new(
+                ErrorCode::InvalidArgument,
+                "schematic_path must be the absolute path of an existing .kicad_sch file",
+            ));
+        }
+        return Ok(p);
+    }
+    let sibling = board.document_path().with_extension("kicad_sch");
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        Err(ToolError::new(
+            ErrorCode::InvalidArgument,
+            format!("no schematic found at {}; pass schematic_path", sibling.display()),
+        ))
+    }
+}
+
+/// Courtyards from the footprint libraries for footprints whose own shapes are not known.
+fn fill_courtyards(board: &mut Board, libs: &kicad_session::footprints::FootprintLibraries) {
+    let mut cache: BTreeMap<String, Option<Rect>> = BTreeMap::new();
+    for f in board.footprints.iter_mut().filter(|f| f.courtyard.is_none()) {
+        let local = cache
+            .entry(f.lib_id.clone())
+            .or_insert_with(|| libs.get(&f.lib_id).and_then(|fp| fp.courtyard))
+            .to_owned();
+        if let Some(mut local) = local {
+            if f.is_back() {
+                local = Rect {
+                    min: Point::new(kicad_domain::Nm(-local.max.x.0), local.min.y),
+                    max: Point::new(kicad_domain::Nm(-local.min.x.0), local.max.y),
+                };
+            }
+            f.courtyard = Some(place_rect(f.position, f.rotation_deg, local));
+        }
+    }
+}
+
+#[tool_router(router = pcb_router, vis = "pub(super)")]
+impl KicadAiServer {
+    #[tool(
+        name = "pcb_open",
+        description = "Open a board (.kicad_pcb) in a new board session. headless: a private KiCad 11 \nserver reads it and can update it from the schematic; file: the file itself is read (KiCad 10 or 11: \nreading, DRC, render); gui: the PCB editor the user has open, after they pressed \"KiCad AI: connect\" \nin it. Returns the session id. Board sessions use the pcb_* tools; schematic tools need a schematic \nsession from session_open."
+    )]
+    pub async fn pcb_open(&self, Parameters(args): Parameters<PcbOpenArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let path = args.pcb_path.as_ref().map(PathBuf::from);
+        if path.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::InvalidArgument, "pcb_path must be an absolute path"),
+            );
+        }
+        let installs = self.installs().await.to_vec();
+        let opened = match args.provider {
+            ProviderArg::Headless | ProviderArg::File => {
+                let Some(path) = path else {
+                    return envelope::error(
+                        &cid,
+                        &ToolError::new(
+                            ErrorCode::InvalidArgument,
+                            "pcb_path is required for headless and file sessions",
+                        ),
+                    );
+                };
+                if matches!(args.provider, ProviderArg::File) {
+                    BoardSession::open_file(&installs, &path).await
+                } else {
+                    BoardSession::open_headless(&self.state.options.session, &installs, &path).await
+                }
+            }
+            ProviderArg::Gui => match self.pick_pcb_registration(path.as_deref()).await {
+                Ok(registration) => {
+                    BoardSession::open_gui(&self.state.options.session, &installs, &registration, path.as_deref()).await
+                }
+                Err(e) => Err(e),
+            },
+        };
+        match opened {
+            Ok(board) => {
+                let board = Arc::new(board);
+                let status = board.status().await;
+                let prov = board_provenance(&board);
+                self.state.boards.lock().await.insert(board.id().to_owned(), board);
+                envelope::ok(&cid, status, prov, vec![])
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_close",
+        description = "Close a board session and stop its KiCad server. Refuses while the board has \nunsaved changes unless discard_unsaved is true. A gui session only disconnects."
+    )]
+    pub async fn pcb_close(&self, Parameters(args): Parameters<PcbCloseArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.close(args.discard_unsaved).await {
+            Ok(discarded) => {
+                self.state.boards.lock().await.remove(&args.session_id);
+                self.state
+                    .pending_updates
+                    .lock()
+                    .await
+                    .retain(|_, p| p.session_id != args.session_id);
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({ "session_id": args.session_id, "closed": true, "discarded_unsaved_changes": discarded }),
+                    vec![],
+                    vec![],
+                )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(name = "pcb_save", description = "Save the board of a live session to its file.")]
+    pub async fn pcb_save(&self, Parameters(args): Parameters<PcbSessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.save().await {
+            Ok(()) => envelope::ok(
+                &cid,
+                serde_json::json!({ "saved": board.document_path().display().to_string() }),
+                board_provenance(&board),
+                vec![],
+            ),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_info",
+        description = "The board at a glance: counts of footprints, pads, tracks, vias, zones, and nets; \\nthe copper layers; the outline's box and size in mm (none if the board has no outline yet); and the \\nsession's status. Read-only."
+    )]
+    pub async fn pcb_info(&self, Parameters(args): Parameters<PcbSessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.read().await {
+            Ok(data) => envelope::ok(
+                &cid,
+                serde_json::json!({
+                    "status": board.status().await,
+                    "counts": data.counts(),
+                    "copper_layers": data.copper_layers,
+                    "outline": data.outline.map(rect),
+                    "units": "mm; x grows right, y grows down",
+                }),
+                board_provenance(&board),
+                vec![],
+            ),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_list_footprints",
+        description = "Every footprint on the board: reference, value, library id, side, position (mm), \\nrotation, locked, do-not-populate, pad count, and courtyard size; optionally every pad with its place \\nand net. Read-only."
+    )]
+    pub async fn pcb_list_footprints(&self, Parameters(args): Parameters<PcbFootprintsArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let mut data = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut data, &libs);
+            Ok::<_, ToolError>(data)
+        }
+        .await;
+        match result {
+            Ok(data) => {
+                let mut footprints: Vec<_> = data.footprints.iter().collect();
+                footprints.sort_by_key(|f| kicad_domain::bom::natural(&f.reference));
+                let rows: Vec<_> = footprints
+                    .iter()
+                    .map(|f| footprint_json(f, args.include_pads))
+                    .collect();
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({ "count": rows.len(), "footprints": rows }),
+                    board_provenance(&board),
+                    vec![],
+                )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_get_footprint",
+        description = "One footprint with all its pads (number, kind, place in mm, net) and its courtyard. Read-only."
+    )]
+    pub async fn pcb_get_footprint(&self, Parameters(args): Parameters<PcbFootprintArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let mut data = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut data, &libs);
+            Ok::<_, ToolError>(data)
+        }
+        .await;
+        match result {
+            Ok(data) => match data.footprints.iter().find(|f| f.reference == args.reference) {
+                Some(f) => envelope::ok(&cid, footprint_json(f, true), board_provenance(&board), vec![]),
+                None => envelope::error(
+                    &cid,
+                    &ToolError::new(
+                        ErrorCode::SymbolNotFound,
+                        format!("no footprint {} on the board (use pcb_list_footprints)", args.reference),
+                    ),
+                ),
+            },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_list_nets",
+        description = "Every net with the pads on it (REF.PAD), and how many tracks, vias, and zones \\ncarry it. Read-only."
+    )]
+    pub async fn pcb_list_nets(&self, Parameters(args): Parameters<PcbSessionArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.read().await {
+            Ok(data) => {
+                let mut nets: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+                for name in &data.nets {
+                    let pads: Vec<String> = data
+                        .footprints
+                        .iter()
+                        .flat_map(|f| {
+                            f.pads
+                                .iter()
+                                .filter(|p| &p.net == name)
+                                .map(move |p| format!("{}.{}", f.reference, p.number))
+                        })
+                        .collect();
+                    nets.insert(
+                        name,
+                        serde_json::json!({
+                            "pads": pads,
+                            "tracks": data.tracks.iter().filter(|t| &t.net == name).count(),
+                            "vias": data.vias.iter().filter(|v| &v.net == name).count(),
+                            "zones": data.zones.iter().filter(|z| &z.net == name).count(),
+                        }),
+                    );
+                }
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({ "count": nets.len(), "nets": nets }),
+                    board_provenance(&board),
+                    vec![],
+                )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_list_tracks",
+        description = "Tracks (start, end, width, layer, net), vias, and zones of the board, optionally \\nfor one net. Read-only."
+    )]
+    pub async fn pcb_list_tracks(&self, Parameters(args): Parameters<PcbTracksArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.read().await {
+            Ok(data) => {
+                let limit = args.limit.unwrap_or(200).clamp(1, 1000);
+                let keep = |net: &str| args.net.as_deref().is_none_or(|n| n == net);
+                let tracks: Vec<_> = data.tracks.iter().filter(|t| keep(&t.net)).collect();
+                let rows: Vec<_> = tracks
+                    .iter()
+                    .take(limit)
+                    .map(|t| {
+                        serde_json::json!({
+                            "id": t.id, "from": pt(t.start), "to": pt(t.end), "width": mm(t.width.0),
+                            "layer": t.layer, "net": t.net, "locked": t.locked,
+                        })
+                    })
+                    .collect();
+                let vias: Vec<_> = data
+                    .vias
+                    .iter()
+                    .filter(|v| keep(&v.net))
+                    .map(|v| {
+                        serde_json::json!({
+                            "id": v.id, "at": pt(v.at), "diameter": mm(v.diameter.0), "drill": mm(v.drill.0), "net": v.net,
+                        })
+                    })
+                    .collect();
+                let zones: Vec<_> = data
+                    .zones
+                    .iter()
+                    .filter(|z| keep(&z.net))
+                    .map(|z| {
+                        serde_json::json!({
+                            "id": z.id, "name": z.name, "layers": z.layers, "net": z.net, "priority": z.priority, "locked": z.locked,
+                        })
+                    })
+                    .collect();
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({
+                        "track_count": tracks.len(), "tracks": rows, "vias": vias, "zones": zones,
+                        "truncated": tracks.len() > limit,
+                    }),
+                    board_provenance(&board),
+                    vec![],
+                )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_run_drc",
+        description = "Run the design rules check on the board as it is now (through kicad-cli, on a \\nsnapshot of a live board) and return the counts by type and severity, the violations, and the missing \\nconnections (unrouted). With schematic_parity, also the differences from the schematic. The board's own \\nrules are used. Read-only."
+    )]
+    pub async fn pcb_run_drc(&self, Parameters(args): Parameters<PcbDrcArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match self.run_drc(&cid, &board, args.schematic_parity).await {
+            Ok(report) => envelope::ok(&cid, drc_json(&report), board_provenance(&board), vec![]),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_render",
+        description = "Render the board as it is now in 3D to a PNG and return the image, so placement can \\nbe checked visually. Needs a KiCad 11 kicad-cli."
+    )]
+    pub async fn pcb_render(&self, Parameters(args): Parameters<PcbRenderArgs>) -> CallToolResult {
+        use base64::Engine;
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let side = args.side.clone().unwrap_or_else(|| "top".into());
+        if !["top", "bottom", "left", "right", "front", "back"].contains(&side.as_str()) {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "side is top, bottom, left, right, front, or back",
+                ),
+            );
+        }
+        let (width, height) = (args.width.unwrap_or(1600), args.height.unwrap_or(900));
+        if !(200..=3200).contains(&width) || !(200..=2400).contains(&height) {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::InvalidArgument, "width is 200-3200 and height 200-2400"),
+            );
+        }
+        let Some(cli) = board.render_cli().cloned() else {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "no kicad-cli that can render a board (KiCad 10's cannot); install KiCad 11 or the 10.99 nightly",
+                ),
+            );
+        };
+        let dir = match self.scratch_dir(board.id(), "pcb-render", &cid) {
+            Ok(d) => d,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let copy = board.save_copy(&dir).await?;
+            let png = dir.join("board.png");
+            kicad_cli_runner::pcb::render_png(&cli, &copy, &png, &side, width, height, Duration::from_secs(180))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
+            std::fs::read(&png).map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(bytes) => {
+                let mut r = envelope::ok(
+                    &cid,
+                    serde_json::json!({ "format": "png", "side": side, "width": width, "height": height, "bytes": bytes.len() }),
+                    board_provenance(&board),
+                    vec![],
+                );
+                r.content.push(rmcp::model::ContentBlock::image(
+                    base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "image/png",
+                ));
+                r
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_review",
+        description = "Review the board: DRC results and unrouted connections, footprints that overlap or \\nreach outside the outline, a missing outline, parts and footprints that the schematic and the board do not \\nshare (the schematic next to the board, or schematic_path), connectors far from the edge, decoupling \\ncapacitors far from the IC they serve, and pads on no net. Courtyards come from the footprints \\n(estimated when unknown). Findings are warnings to look at, not proof a board is wrong. Read-only."
+    )]
+    pub async fn pcb_review(&self, Parameters(args): Parameters<PcbReviewArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let mut data = board.read().await?;
+            let libs = self.footprint_libraries_in(board.document_path().parent()).await;
+            fill_courtyards(&mut data, &libs);
+            let schematic = match schematic_for(&board, args.schematic_path.as_deref()) {
+                Ok(path) => {
+                    let text = std::fs::read_to_string(&path).map_err(|e| {
+                        ToolError::new(ErrorCode::KicadError, format!("cannot read {}: {e}", path.display()))
+                    })?;
+                    kicad_sexpr::Document::parse(text).ok().map(|d| (path, d.design()))
+                }
+                Err(e) if args.schematic_path.is_some() => return Err(e),
+                Err(_) => None,
+            };
+            let issues = kicad_domain::board::review(&data, schematic.as_ref().map(|(_, d)| d));
+            let drc = self.run_drc(&cid, &board, false).await.ok();
+            Ok::<_, ToolError>((data, issues, drc, schematic.map(|(p, _)| p)))
+        }
+        .await;
+        match result {
+            Ok((data, issues, drc, schematic)) => envelope::ok(
+                &cid,
+                serde_json::json!({
+                    "footprints": data.footprints.len(),
+                    "outline": data.outline.map(rect),
+                    "schematic_compared": schematic.map(|p| p.display().to_string()),
+                    "issues": issues,
+                    "drc": drc.as_ref().map(drc_json),
+                    "drc_note": if drc.is_none() { Some("DRC could not be run on this board") } else { None },
+                }),
+                board_provenance(&board),
+                vec![],
+            ),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_update_from_schematic_plan",
+        description = "Plan updating the board from its schematic: KiCad's own netlist import is run as a \\ndry run, so nothing changes, and its report says which footprints would be added, which fields and nets \\nwould change. New footprints arrive stacked near the origin, as in KiCad; placing them is a later step. \\nThe schematic file on disk is used (save it first). Needs a live KiCad 11 session (headless or gui). \\nReturns a plan_id for pcb_apply_plan."
+    )]
+    pub async fn pcb_update_from_schematic_plan(&self, Parameters(args): Parameters<PcbUpdateArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            if !board.is_live() {
+                return Err(ToolError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "updating from the schematic needs a live KiCad 11 session; open the board with provider headless or gui",
+                ));
+            }
+            let schematic = schematic_for(&board, args.schematic_path.as_deref())?;
+            let cli = self
+                .installs()
+                .await
+                .iter()
+                .filter(|i| i.version.series() >= 11)
+                .max_by_key(|i| (i.version.major, i.version.minor, i.version.patch))
+                .cloned()
+                .ok_or_else(|| ToolError::new(ErrorCode::KicadNotFound, "no KiCad 11 kicad-cli was found"))?;
+            let dir = self.scratch_dir(board.id(), "pcb-update", &cid)?;
+            let netlist = dir.join("update.net");
+            kicad_cli_runner::netlist::export_netlist(&cli, &schematic, &netlist, Duration::from_secs(180))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot export the netlist: {e}")))?;
+            let dry = board.import_netlist(&netlist, true).await?;
+            let fp = fingerprint(&board.read().await?);
+            Ok((schematic, netlist, dry, fp))
+        }
+        .await;
+        match result {
+            Ok((schematic, netlist, dry, fp)) => {
+                let plan_id = self.next_pcb_plan_id();
+                self.state.pending_updates.lock().await.insert(
+                    plan_id.clone(),
+                    PendingUpdate {
+                        session_id: board.id().to_owned(),
+                        netlist,
+                        fingerprint: fp,
+                        applied_with: None,
+                        schematic: schematic.clone(),
+                    },
+                );
+                let can_apply = dry.errors == 0;
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({
+                        "plan_id": plan_id,
+                        "circuit": "update-from-schematic",
+                        "can_apply": can_apply,
+                        "schematic": schematic.display().to_string(),
+                        "new_footprints": dry.new_footprints,
+                        "errors": dry.errors,
+                        "warnings": dry.warnings,
+                        "report": dry.report,
+                        "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
+                    }),
+                    board_provenance(&board),
+                    vec![],
+                )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_apply_plan",
+        description = "Apply a plan from pcb_update_from_schematic_plan after the user has reviewed it \\n(confirm: true). Refused if the board changed since planning. Runs the netlist import, then reads the board \\nback and checks that every footprint of the schematic is there and every pad is on the net the netlist \\ngives it. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+    )]
+    pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        if !args.confirm {
+            return envelope::error(
+                &cid,
+                &ToolError::new(
+                    ErrorCode::InvalidArgument,
+                    "confirm must be true; show the plan to the user first",
+                ),
+            );
+        }
+        if !(8..=128).contains(&args.idempotency_key.len()) {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::InvalidArgument, "idempotency_key must be 8-128 characters"),
+            );
+        }
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let (netlist, fp, schematic) = {
+            let mut pending = self.state.pending_updates.lock().await;
+            let Some(plan) = pending.get_mut(&args.plan_id) else {
+                return envelope::error(
+                    &cid,
+                    &ToolError::new(
+                        ErrorCode::StalePlan,
+                        format!("no plan '{}'; make a new plan", args.plan_id),
+                    ),
+                );
+            };
+            if plan.session_id != board.id() {
+                return envelope::error(
+                    &cid,
+                    &ToolError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("{} belongs to another session", args.plan_id),
+                    ),
+                );
+            }
+            if let Some(key) = &plan.applied_with {
+                return envelope::error(
+                    &cid,
+                    &ToolError::new(
+                        ErrorCode::StalePlan,
+                        format!("{} was already applied (key {key}); make a new plan", args.plan_id),
+                    ),
+                );
+            }
+            (plan.netlist.clone(), plan.fingerprint.clone(), plan.schematic.clone())
+        };
+        let result = async {
+            let before = board.read().await?;
+            if fingerprint(&before) != fp {
+                return Err(ToolError::new(
+                    ErrorCode::StalePlan,
+                    "the board changed since the plan was made; make a new plan",
+                ));
+            }
+            let report = board.import_netlist(&netlist, false).await?;
+            let after = board.read().await?;
+            // The netlist the import used, to check the board against.
+            let text = std::fs::read_to_string(&netlist)
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the netlist: {e}")))?;
+            let expected = kicad_cli_runner::netlist::Netlist::parse(&text)
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the netlist: {e}")))?;
+            Ok::<_, ToolError>((report, after, expected))
+        }
+        .await;
+        match result {
+            Ok((report, after, expected)) => {
+                let mut problems: Vec<String> = Vec::new();
+                for c in &expected.components {
+                    if !after.footprints.iter().any(|f| f.reference == c.reference) {
+                        problems.push(format!("{} has no footprint on the board", c.reference));
+                    }
+                }
+                for net in &expected.nets {
+                    for node in &net.nodes {
+                        let pad = after
+                            .footprints
+                            .iter()
+                            .find(|f| f.reference == node.reference)
+                            .and_then(|f| f.pads.iter().find(|p| p.number == node.pin));
+                        match pad {
+                            Some(p) if p.net == net.name => {}
+                            Some(p) => problems.push(format!(
+                                "{}.{} is on net '{}', the netlist says '{}'",
+                                node.reference, node.pin, p.net, net.name
+                            )),
+                            None => problems.push(format!("{}.{} has no pad on the board", node.reference, node.pin)),
+                        }
+                    }
+                }
+                if let Some(p) = self.state.pending_updates.lock().await.get_mut(&args.plan_id) {
+                    p.applied_with = Some(args.idempotency_key.clone());
+                }
+                let verified = problems.is_empty() && report.errors == 0;
+                let mut r = envelope::ok(
+                    &cid,
+                    serde_json::json!({
+                        "applied": true,
+                        "verified": verified,
+                        "schematic": schematic.display().to_string(),
+                        "new_footprints": report.new_footprints,
+                        "errors": report.errors,
+                        "warnings": report.warnings,
+                        "report": report.report,
+                        "footprints_on_board": after.footprints.len(),
+                        "problems": problems,
+                        "next": "Place the footprints, then save with pcb_save.",
+                    }),
+                    board_provenance(&board),
+                    if verified {
+                        vec![]
+                    } else {
+                        vec!["applied, but the board differs from the netlist; see problems".to_owned()]
+                    },
+                );
+                if !verified {
+                    r = envelope::ok_with_state(
+                        &cid,
+                        kicad_domain::ResultState::Partial,
+                        serde_json::json!({ "applied": true, "verified": false, "problems": problems, "report": report.report }),
+                        board_provenance(&board),
+                        vec!["applied, but the board differs from the netlist; see problems".to_owned()],
+                    );
+                }
+                r
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+}
+
+impl KicadAiServer {
+    pub(super) async fn board(&self, id: &str) -> Result<Arc<BoardSession>, ToolError> {
+        self.state.boards.lock().await.get(id).cloned().ok_or_else(|| {
+            ToolError::new(
+                ErrorCode::NoSession,
+                format!("no board session '{id}'; open one with pcb_open (session_status lists sessions)"),
+            )
+        })
+    }
+
+    fn next_pcb_plan_id(&self) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        format!(
+            "pcbplan-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// The registered PCB editor to use: the one with `path` open, or the only one.
+    async fn pick_pcb_registration(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<kicad_session::registry::Registration, ToolError> {
+        let live = self.live_registrations().await;
+        let with_boards: Vec<_> = live
+            .into_iter()
+            .filter(|r| r.documents.iter().any(|d| d.kind == "pcb"))
+            .collect();
+        if with_boards.is_empty() {
+            return Err(ToolError::new(
+                ErrorCode::NoSession,
+                "no KiCad PCB editor is registered: open the board in KiCad 11 and press the \"KiCad AI\" toolbar button in the PCB Editor",
+            ));
+        }
+        if let Some(path) = path {
+            let folder = path.parent().map(|p| p.to_string_lossy().to_lowercase());
+            let stem = path.file_stem().map(|s| s.to_string_lossy().to_lowercase());
+            if let Some(r) = with_boards.iter().find(|r| {
+                r.documents.iter().any(|d| {
+                    d.kind == "pcb"
+                        && d.project.as_ref().map(|p| p.to_lowercase()) == stem
+                        && d.project_path
+                            .as_ref()
+                            .map(|p| p.trim_end_matches(['\\', '/']).to_lowercase())
+                            == folder
+                })
+            }) {
+                return Ok(r.clone());
+            }
+        }
+        match with_boards.as_slice() {
+            [only] => Ok(only.clone()),
+            _ => Err(ToolError::new(
+                ErrorCode::InvalidArgument,
+                "several KiCad PCB editors are registered; pass pcb_path to choose one",
+            )),
+        }
+    }
+
+    /// DRC on a snapshot of the board.
+    async fn run_drc(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        parity: bool,
+    ) -> Result<kicad_cli_runner::pcb::DrcReport, ToolError> {
+        let cli = board
+            .cli()
+            .cloned()
+            .ok_or_else(|| ToolError::new(ErrorCode::FeatureUnavailable, "no matching kicad-cli install"))?;
+        let dir = self.scratch_dir(board.id(), "pcb-drc", cid)?;
+        let result = async {
+            let copy = board.save_copy(&dir).await?;
+            // The schematic next to the board lets parity checks compare the two.
+            if parity {
+                if let Ok(s) = schematic_for(board, None) {
+                    if let Some(name) = s.file_name() {
+                        let _ = std::fs::copy(&s, dir.join(name));
+                    }
+                }
+            }
+            kicad_cli_runner::pcb::run_drc(&cli, &copy, &dir.join("drc.json"), parity, Duration::from_secs(300))
+                .await
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+}
+
+fn footprint_json(f: &kicad_domain::board::BoardFootprint, pads: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "reference": f.reference, "value": f.value, "library_id": f.lib_id, "side": if f.is_back() { "back" } else { "front" },
+        "at": pt(f.position), "rotation_deg": round2(f.rotation_deg), "locked": f.locked, "dnp": f.dnp,
+        "pad_count": f.pads.len(),
+        "courtyard": f.courtyard.map(rect),
+    });
+    if pads {
+        v["pads"] = f
+            .pads
+            .iter()
+            .map(|p| serde_json::json!({ "number": p.number, "kind": p.kind, "at": pt(p.at), "net": p.net }))
+            .collect();
+    }
+    v
+}
+
+fn drc_json(report: &kicad_cli_runner::pcb::DrcReport) -> serde_json::Value {
+    let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+    for v in &report.violations {
+        *by_type.entry(v.kind.as_str()).or_default() += 1;
+    }
+    let show = |v: &kicad_cli_runner::pcb::DrcViolation| {
+        serde_json::json!({
+            "type": v.kind, "severity": v.severity, "description": v.description,
+            "items": v.items.iter().map(|i| serde_json::json!({
+                "what": i.description, "at": i.pos.as_ref().map(|p| serde_json::json!({ "x": p.x, "y": p.y })) })).collect::<Vec<_>>(),
+        })
+    };
+    serde_json::json!({
+        "kicad_version": report.kicad_version,
+        "errors": report.count("error"),
+        "warnings": report.count("warning"),
+        "by_type": by_type,
+        "violations": report.violations.iter().take(100).map(show).collect::<Vec<_>>(),
+        "unrouted": report.unconnected_items.len(),
+        "unrouted_items": report.unconnected_items.iter().take(50).map(show).collect::<Vec<_>>(),
+        "schematic_parity": report.schematic_parity.iter().take(50).map(show).collect::<Vec<_>>(),
+    })
+}

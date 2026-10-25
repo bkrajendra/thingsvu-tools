@@ -36,3 +36,18 @@ These need no capability of their own: `sch_review`, `sch_describe_layout`, `sch
 | Netlist used for a tidy | ipc (includes power symbols and flags) | ipc | kicad_cli, plus power symbols and flags attached from the drawing |
 | Applying a tidy | Two commits; reloads the saved file if it fails, so unsaved changes must be saved first | Two commits (two undo steps); a failure after the first says how many undo steps to take | Verified copy, then atomic replace |
 | `sch_set_field` | One commit | One commit (one undo step) | Verified copy, then atomic replace |
+
+## Board sessions (Phase 11)
+
+Board sessions (`pcb_open`) are separate from schematic sessions. They have no probed capability set of their own yet: what each provider can do is fixed, as for the file provider.
+
+| | Headless | GUI | File |
+|---|---|---|---|
+| Needs | KiCad 11 (or the 10.99 nightly) `kicad-cli` | KiCad 11 PCB editor with the plugin button pressed | any `kicad-cli` (KiCad 10 or 11) |
+| Read the board (`pcb_info`, `pcb_list_*`, `pcb_get_footprint`) | ipc | ipc | project_file (`kicad-sexpr`) |
+| DRC (`pcb_run_drc`) | kicad_cli on a snapshot | kicad_cli on a snapshot | kicad_cli on the file |
+| Render (`pcb_render`) | kicad_cli (KiCad 11 only) | kicad_cli (KiCad 11 only) | kicad_cli (KiCad 11 only) |
+| Review (`pcb_review`) | ipc + kicad_cli | ipc + kicad_cli | project_file + kicad_cli |
+| Update from the schematic (`pcb_update_from_schematic_plan`, `pcb_apply_plan`) | ipc (`ImportNetlist`); the board stays unsaved until `pcb_save` | ipc; live in the editor | not available |
+| Save (`pcb_save`) | ipc | ipc | not applicable |
+

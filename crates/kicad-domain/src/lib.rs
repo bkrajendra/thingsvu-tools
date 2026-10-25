@@ -5,6 +5,7 @@
 //! these types and KiCad's own representations.
 
 pub mod arrange;
+pub mod board;
 pub mod bom;
 pub mod capability;
 pub mod circuit;

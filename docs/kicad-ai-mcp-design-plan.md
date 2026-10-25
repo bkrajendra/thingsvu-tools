@@ -714,6 +714,8 @@ Exit: all Tier 2 acceptance criteria.
 
 **Phase 10 (v0.5.0).** Parts, footprints, and BOM: `bom_get`, `bom_review` (with a list of lookups for the assistant; the server makes no network calls), `sch_set_fields_plan` (custom fields added hidden, DNP and exclude flags), `fp_search`, `fp_get`, `sch_footprint_plan` (pads against pins, package against footprint), and `bom_export` (generic and JLCPCB CSV). Details: docs/tasks.md, Phase 10, and [pcb-and-bom-plan.md](pcb-and-bom-plan.md).
 
+**Phase 11 (v0.6.0).** Board sessions (`pcb_open` for headless, gui, and file), `pcb_info`, `pcb_list_footprints`, `pcb_get_footprint`, `pcb_list_nets`, `pcb_list_tracks`, `pcb_run_drc`, `pcb_render`, `pcb_review`, and `pcb_update_from_schematic_plan` with `pcb_apply_plan` (KiCad's netlist import, dry run first, read back and checked against the netlist). Details: docs/tasks.md, Phase 11.
+
 ### Later
 PCB tools and BOM/part tooling are planned in [pcb-and-bom-plan.md](pcb-and-bom-plan.md) (Phases 10 to 13). Also later: hierarchical sheets, multi-unit symbols, design-review checks, simulation hand-off, MCP prompts/resources and a bundled skill with KiCad conventions, on-demand tool groups, enclosure integration (§16.1).
 

@@ -6,6 +6,7 @@
 pub mod emit;
 pub mod fp;
 pub mod node;
+pub mod pcb;
 pub mod sch;
 pub mod sym;
 

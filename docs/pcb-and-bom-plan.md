@@ -1,6 +1,6 @@
 # Plan: parts, footprints, BOM, and PCB tools
 
-Status: Phase 10 **done** (v0.5.0); Phases 11 to 13 planned, not started (written 25 Oct 2026, after Phase 9). The task lists are in [tasks.md](tasks.md), Phases 10 to 13. This page holds the reasoning: what we are building, what KiCad lets us do, what we will not do, and the decisions that need the project owner's review.
+Status: Phases 10 (v0.5.0) and 11 (v0.6.0) **done**; Phases 12 and 13 planned, not started (written 25 Oct 2026, after Phase 9). The task lists are in [tasks.md](tasks.md), Phases 10 to 13. This page holds the reasoning: what we are building, what KiCad lets us do, what we will not do, and the decisions that need the project owner's review.
 
 ## Goal
 
@@ -69,7 +69,9 @@ Tools (names are provisional):
 
 Exit: on the 555 blinker and the 3.3 V regulator, an assistant assigns every footprint, fills the manufacturer and supplier fields from a parts lookup, and the review is clean; the BOM export matches what KiCad's own BOM tool produces.
 
-## Phase 11: PCB basics: sessions, read, review, update from schematic (v0.6.0)
+## Phase 11: PCB basics: sessions, read, review, update from schematic (v0.6.0, done)
+
+Built as planned. Differences: boards have their own session type and tools (`pcb_open`, not `session_open`), and `pcb_apply_plan` is the apply tool for board plans (Phase 12 will reuse it). The API facts in the table above were probed and recorded in docs/kicad-api-compatibility.md; the main surprises were that pad positions come back already placed and that the 10.0 CLI cannot open the 10.99 board format.
 
 Tools: `session_open` learns about boards (`document: pcb`), then `pcb_info` (outline box, layers, stackup, rules, netclasses), `pcb_list_footprints` and `pcb_get_footprint` (position, layer, rotation, pads with nets, courtyard), `pcb_list_nets`, `pcb_list_tracks` (tracks, vias, zones), `pcb_render` (image for the assistant), `pcb_run_drc`, `pcb_review`, and `pcb_update_from_schematic_plan`.
 

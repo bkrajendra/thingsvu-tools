@@ -140,6 +140,12 @@ To steer it, or to arrange a small circuit yourself:
 >
 > Move the regulator to the top right, group R1 and R2 below it, then reconnect everything.
 
+To look at a board:
+
+> Open D:/projects/mydesign/mydesign.kicad_pcb, review it, and tell me what the schematic has that the board lacks.
+
+Boards are opened with `pcb_open` (headless needs KiCad 11 or the 10.99 nightly; the file provider also reads KiCad 10 boards for reading, DRC, and render). A board can be brought up to date from its schematic: the assistant shows what KiCad's own netlist import would add, and applies it only after you confirm. New footprints arrive stacked near the origin; placing them comes with the next phase.
+
 To get a schematic ready to order parts:
 
 > Review the BOM for a JLCPCB order. Look up the parts you can, fill in the part numbers, assign the missing footprints, and export the BOM.
@@ -192,6 +198,11 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `fp_search` / `fp_get` | Search the footprint libraries and read a footprint's pads and courtyard |
 | `sch_footprint_plan` | Check every footprint (missing, not in the libraries, no pad for a pin, wrong package) and assign footprints |
 | `bom_export` | Write the BOM as CSV into the project folder (generic or JLCPCB columns) |
+| `pcb_open` / `pcb_close` / `pcb_save` | Open a board (headless, file, or the PCB editor), close it, save it |
+| `pcb_info` / `pcb_list_footprints` / `pcb_get_footprint` / `pcb_list_nets` / `pcb_list_tracks` | Read the board: counts, outline, footprints with pads and courtyards, nets, tracks, vias, zones |
+| `pcb_run_drc` / `pcb_render` | Design rules check (with unrouted connections) and a 3D picture of the board |
+| `pcb_review` | What stands out: overlaps, parts outside the outline, no outline, schematic and board that disagree, far connectors and decoupling capacitors, DRC |
+| `pcb_update_from_schematic_plan` / `pcb_apply_plan` | Update the board from its schematic: a dry run first, then apply after you confirm; every footprint and pad net is checked afterwards |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
 | `sch_run_erc` | Electrical rules check |
@@ -257,7 +268,8 @@ How releases are made: [releasing](docs/releasing.md).
 
 - **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), reviewing and tidying existing schematics, ERC, netlist export, verified demo circuits, KiCad 10 through the schematic file, and a one-step installer
 - **Now (also):** parts, footprints, and BOM review and export
-- **Next (planned, see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)):** PCB tools (read and review, update from the schematic, outline, placement, routing); then manufacturing outputs
+- **Now (also):** reading, DRC, rendering, and reviewing boards, and updating a board from its schematic
+- **Next (planned, see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)):** board outline, placement, and routing; then manufacturing outputs
 - **Also open:** hierarchical schematics
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 

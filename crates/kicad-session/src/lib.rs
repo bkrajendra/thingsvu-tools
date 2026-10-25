@@ -6,6 +6,7 @@
 //! a `kicad-cli api-server` child owned by this process.
 
 mod any;
+pub mod board;
 mod capability_map;
 mod design;
 mod errors;
@@ -20,6 +21,7 @@ mod schematic;
 mod session;
 
 pub use any::AnySession;
+pub use board::{BoardSession, BoardStatus, ImportReport};
 pub use capability_map::capabilities_from_probe;
 pub use errors::from_ipc_error;
 pub use file::FileSession;

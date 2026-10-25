@@ -243,6 +243,24 @@ flowchart LR
     APPLY --> EXPORT["bom_export<br/>CSV via kicad-cli<br/>generic or JLCPCB"]
 ```
 
+### Boards (Phase 11)
+
+A board is a second kind of session, with its own tools (`pcb_*`) and its own model. One board model (footprints with placed pads, tracks, vias, zones, outline, nets) is filled from a live KiCad (the headless server or the PCB editor, through the API) or from the `.kicad_pcb` file (KiCad 10 or 11). DRC and the 3D render run through `kicad-cli` on a snapshot of the live board. The review compares the board with the schematic next to it. Updating the board uses KiCad's own netlist import: a dry run is the plan, and applying it is read back and compared with the netlist.
+
+```mermaid
+flowchart LR
+    LIVE["Live board<br/>headless server or<br/>PCB editor (API)"] --> MODEL["Board model<br/>footprints + pads,<br/>tracks, vias, zones, outline"]
+    FILE[".kicad_pcb file<br/>KiCad 10 or 11<br/>(kicad-sexpr)"] --> MODEL
+    MODEL --> READ["pcb_info, pcb_list_*,<br/>pcb_get_footprint"]
+    MODEL --> REVIEW["pcb_review<br/>overlaps, outline, edge and<br/>decoupling rules, vs schematic"]
+    LIVE -->|"snapshot"| CLI["kicad-cli<br/>pcb drc, pcb render"]
+    FILE --> CLI
+    CLI --> REVIEW
+    SCH["Schematic file<br/>next to the board"] -->|"netlist export"| PLAN["pcb_update_from_schematic_plan<br/>ImportNetlist dry run"]
+    PLAN --> APPLY["pcb_apply_plan<br/>real import, read back,<br/>every pad net checked"]
+    APPLY --> LIVE
+```
+
 How the three providers apply it:
 
 | Provider | Applying | If it fails |

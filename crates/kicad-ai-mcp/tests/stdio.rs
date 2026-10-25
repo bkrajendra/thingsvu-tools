@@ -109,6 +109,19 @@ async fn lists_tools_and_returns_envelopes() {
             "bom_review",
             "fp_get",
             "fp_search",
+            "pcb_apply_plan",
+            "pcb_close",
+            "pcb_get_footprint",
+            "pcb_info",
+            "pcb_list_footprints",
+            "pcb_list_nets",
+            "pcb_list_tracks",
+            "pcb_open",
+            "pcb_render",
+            "pcb_review",
+            "pcb_run_drc",
+            "pcb_save",
+            "pcb_update_from_schematic_plan",
             "sch_apply_plan",
             "sch_arrange_plan",
             "sch_create_demo_circuit",
@@ -1630,4 +1643,250 @@ async fn gui_bom_demo() {
     let closed = mcp.call("session_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: look at part {first} (field MPN is hidden); Ctrl+Z undoes it");
+}
+
+fn board_fixture(name: &str, empty_board: bool) -> std::path::PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/v11/regulator-board");
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-board-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(source.join("regulator.kicad_sch"), dir.join("regulator.kicad_sch")).unwrap();
+    if empty_board {
+        std::fs::write(
+            dir.join("regulator.kicad_pcb"),
+            "(kicad_pcb (version 20261018) (generator \"pcbnew\") (generator_version \"10.99\")\n)\n",
+        )
+        .unwrap();
+    } else {
+        std::fs::copy(source.join("regulator.kicad_pcb"), dir.join("regulator.kicad_pcb")).unwrap();
+    }
+    dir.join("regulator.kicad_pcb")
+}
+
+/// Read a board, run DRC, render it, and review it.
+#[tokio::test]
+async fn live_board_read_drc_render_and_review_through_mcp() {
+    board_read_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_board_read_drc_render_and_review_through_the_api() {
+    board_read_flow("headless").await;
+}
+
+async fn board_read_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture(&format!("read-{provider}"), false);
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": provider }))
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(info["ok"], true, "{info}");
+    assert_eq!(info["result"]["counts"]["footprints"], 11, "{info}");
+    assert!(info["result"]["counts"]["pads"].as_u64().unwrap() >= 20, "{info}");
+    assert!(info["result"]["counts"]["nets"].as_u64().unwrap() >= 6, "{info}");
+    assert!(info["result"]["outline"].is_null(), "{info}");
+    assert_eq!(info["result"]["copper_layers"], json!(["F.Cu", "B.Cu"]), "{info}");
+
+    let list = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
+    assert_eq!(list["result"]["count"], 11, "{list}");
+    let j1 = list["result"]["footprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["reference"] == "J1")
+        .unwrap();
+    assert_eq!(j1["side"], "front");
+    assert!((j1["at"]["x"].as_f64().unwrap() - 15.66).abs() < 0.02, "{j1}");
+    assert!(
+        j1["courtyard"]["width"].as_f64().unwrap() > 2.0,
+        "courtyards come from the libraries: {j1}"
+    );
+
+    let u1 = mcp
+        .call("pcb_get_footprint", json!({ "session_id": id, "reference": "U1" }))
+        .await;
+    assert_eq!(u1["result"]["pad_count"], 4, "{u1}");
+    assert!(u1["result"]["pads"].to_string().contains("+3V3"), "{u1}");
+    let missing = mcp
+        .call("pcb_get_footprint", json!({ "session_id": id, "reference": "U9" }))
+        .await;
+    assert_eq!(missing["ok"], false, "{missing}");
+
+    let nets = mcp.call("pcb_list_nets", json!({ "session_id": id })).await;
+    let gnd = nets["result"]["nets"]["GND"]["pads"].as_array().unwrap();
+    assert!(gnd.len() >= 6, "{nets}");
+    let tracks = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    assert_eq!(tracks["result"]["track_count"], 0, "{tracks}");
+
+    let drc = mcp.call("pcb_run_drc", json!({ "session_id": id })).await;
+    assert_eq!(drc["ok"], true, "{drc}");
+    assert_eq!(drc["result"]["errors"], 1, "the missing outline: {drc}");
+    assert!(drc["result"]["by_type"]["invalid_outline"] == 1, "{drc}");
+    assert!(
+        drc["result"]["unrouted"].as_u64().unwrap() >= 10,
+        "nothing is routed yet: {drc}"
+    );
+
+    let render = mcp
+        .call("pcb_render", json!({ "session_id": id, "width": 800, "height": 500 }))
+        .await;
+    assert_eq!(render["ok"], true, "{render}");
+
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    assert_eq!(review["ok"], true, "{review}");
+    let codes = review["result"]["issues"].to_string();
+    assert!(codes.contains("NO_OUTLINE"), "{review}");
+    assert!(
+        !codes.contains("NO_FOOTPRINT_FOR_PART"),
+        "every part has its footprint: {review}"
+    );
+    assert!(review["result"]["schematic_compared"].is_string(), "{review}");
+    assert_eq!(review["result"]["drc"]["errors"], 1, "{review}");
+    println!("BOARD REVIEW ({provider}): {}", review["result"]["issues"]);
+
+    // A file session cannot update from the schematic.
+    let update = mcp
+        .call("pcb_update_from_schematic_plan", json!({ "session_id": id }))
+        .await;
+    if provider == "file" {
+        assert_eq!(update["ok"], false, "{update}");
+    } else {
+        assert_eq!(
+            update["result"]["new_footprints"], 0,
+            "the board already has everything: {update}"
+        );
+    }
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+}
+
+/// An empty board is updated from its schematic: planned (nothing changes), applied, verified
+/// against the netlist, saved, and read back.
+#[tokio::test]
+async fn live_board_is_updated_from_the_schematic() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("update", true);
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let before = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(before["result"]["counts"]["footprints"], 0, "{before}");
+    let early = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    assert!(
+        early["result"]["issues"].to_string().contains("NO_FOOTPRINTS"),
+        "{early}"
+    );
+
+    let plan = mcp
+        .call("pcb_update_from_schematic_plan", json!({ "session_id": id }))
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    assert_eq!(plan["result"]["new_footprints"], 11, "{plan}");
+    assert!(plan["result"]["report"].as_str().unwrap().contains("Add R3"), "{plan}");
+    // Planning changed nothing.
+    let still = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(still["result"]["counts"]["footprints"], 0, "{still}");
+
+    let key = format!("pcb-update-{}", std::process::id());
+    let refused = mcp
+        .call(
+            "pcb_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": false, "idempotency_key": key }),
+        )
+        .await;
+    assert_eq!(refused["error"]["code"], "INVALID_ARGUMENT", "{refused}");
+    let applied = mcp
+        .call(
+            "pcb_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true, "idempotency_key": key }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(applied["result"]["footprints_on_board"], 11, "{applied}");
+    let again = mcp
+        .call(
+            "pcb_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true, "idempotency_key": format!("{key}-2") }),
+        )
+        .await;
+    assert_eq!(again["ok"], false, "a plan is applied once: {again}");
+
+    // The live board has them; the file does not until it is saved.
+    let after = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(after["result"]["counts"]["footprints"], 11, "{after}");
+    assert_eq!(after["result"]["status"]["unsaved_changes"], true, "{after}");
+    let close = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(close["ok"], false, "unsaved changes refuse a close: {close}");
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let replanned = mcp
+        .call("pcb_update_from_schematic_plan", json!({ "session_id": id }))
+        .await;
+    assert_eq!(
+        replanned["result"]["new_footprints"], 0,
+        "nothing is left to add: {replanned}"
+    );
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+
+    // Read back from the file by a second session.
+    let file = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    let fid = file["result"]["session_id"].clone();
+    let info = mcp.call("pcb_info", json!({ "session_id": fid })).await;
+    assert_eq!(info["result"]["counts"]["footprints"], 11, "{info}");
+    let review = mcp.call("pcb_review", json!({ "session_id": fid })).await;
+    assert!(
+        !review["result"]["issues"].to_string().contains("NO_FOOTPRINT_FOR_PART"),
+        "{review}"
+    );
+    assert!(
+        !review["result"]["issues"].to_string().contains("FOOTPRINT_DIFFERS"),
+        "{review}"
+    );
+}
+
+/// Against a real KiCad 11 PCB editor: read the board, run DRC, review it, and plan an update from
+/// the schematic (a dry run). Open a **copy** of a project in the PCB Editor, press "KiCad AI:
+/// connect" there, then run with THINGSVU_GUI_PCB=1.
+#[tokio::test]
+async fn gui_pcb_demo() {
+    if std::env::var("THINGSVU_GUI_PCB").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_PCB=1 with a registered KiCad PCB editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    println!("GUI PCB {}", opened["result"]["document"]);
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    println!("GUI PCB INFO {}", info["result"]);
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    println!("GUI PCB REVIEW {}", review["result"]["issues"]);
+    println!("GUI PCB DRC {}", review["result"]["drc"]);
+    let plan = mcp
+        .call("pcb_update_from_schematic_plan", json!({ "session_id": id }))
+        .await;
+    println!("GUI PCB UPDATE PLAN {plan}");
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    println!("GUI DONE: nothing was changed");
 }
