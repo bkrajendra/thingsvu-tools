@@ -233,3 +233,8 @@ Exit criteria: a user can install everything with one script and connect an assi
 - [~] **7.11 One s-expression parser** — `kicad-cli-runner` still has its own small text parser for netlists next to `kicad-sexpr`. Merging them is a cleanup with no user-visible effect.
 - [~] **7.12 Layout hints and editing tools (task 5.9)** — still not done.
   - **Review:** the README roadmap lists them under *Next*. Decision for you: make them Phase 8, or fold them into PCM / PCB work?
+
+Phase 7 verification (25 Oct 2026):
+- Push `0ed6f5d` produced release **v0.1.0** (pre-release) on that commit, with the Windows zip, PCM zip, Linux archive, `install.ps1`, and `SHA256SUMS.txt`. CI and Release both passed.
+- The published `install.ps1`, run from an empty folder against sandbox directories, downloaded the release, verified its checksum, and installed a working `kicad-ai-mcp 0.1.0` and the plugin.
+- Not verified: the PCM package through KiCad itself, and the plugin button in a KiCad 11 editor after an installer-made install (it is the same plugin folder layout the Phase 4 test used).
