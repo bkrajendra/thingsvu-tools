@@ -2716,11 +2716,13 @@ async fn gui_pcb_zone_demo() {
 
 /// The placed regulator board routed by Freerouting: planned (export, route, summary; nothing
 /// changes), imported, read back, and checked with DRC. Needs KICAD_LIVE=1 and
-/// THINGSVU_FREEROUTING_JAR (and THINGSVU_JAVA unless java is on the PATH).
+/// THINGSVU_FREEROUTING (and THINGSVU_JAVA unless java is on the PATH).
 #[tokio::test]
 async fn live_board_is_autorouted() {
-    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") || std::env::var("THINGSVU_FREEROUTING_JAR").is_err() {
-        eprintln!("skipped: set KICAD_LIVE=1 and THINGSVU_FREEROUTING_JAR");
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1")
+        || (std::env::var("THINGSVU_FREEROUTING").is_err() && std::env::var("THINGSVU_CONFIG").is_err())
+    {
+        eprintln!("skipped: set KICAD_LIVE=1 and THINGSVU_FREEROUTING (or THINGSVU_CONFIG naming a config.json)");
         return;
     }
     let pcb = board_fixture("autoroute", false);
@@ -2813,12 +2815,12 @@ async fn live_board_is_autorouted() {
 
 /// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows
 /// the router's result. Open a **copy** of a placed board in the PCB Editor, press "KiCad AI:
-/// connect" there, then run with THINGSVU_GUI_PCB_AUTOROUTE=1 and THINGSVU_FREEROUTING_JAR.
+/// connect" there, then run with THINGSVU_GUI_PCB_AUTOROUTE=1 and THINGSVU_FREEROUTING.
 #[tokio::test]
 async fn gui_pcb_autoroute_demo() {
     if std::env::var("THINGSVU_GUI_PCB_AUTOROUTE").as_deref() != Ok("1") {
         eprintln!(
-            "skipped: set THINGSVU_GUI_PCB_AUTOROUTE=1 and THINGSVU_FREEROUTING_JAR with a registered KiCad PCB editor"
+            "skipped: set THINGSVU_GUI_PCB_AUTOROUTE=1 and THINGSVU_FREEROUTING with a registered KiCad PCB editor"
         );
         return;
     }
@@ -2854,4 +2856,103 @@ async fn gui_pcb_autoroute_demo() {
     let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
     assert_eq!(closed["ok"], true, "{closed}");
     println!("GUI DONE: the board is routed; Ctrl+Z undoes KiCad's import");
+}
+
+/// A change that makes DRC worse is rolled back, and the board read again is as it was; with
+/// keep_if_unverified it stays. Also: a track that would pass inside the board's hole clearance is
+/// refused at plan time.
+#[tokio::test]
+async fn live_board_change_that_fails_drc_is_rolled_back() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("rollback", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-rollback-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    // An outline fitted around the parts, with a hole beside them.
+    let fitted = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "margin_mm": 8, "hole_positions": [{ "x_mm": -4.5, "y_mm": 7 }] }),
+        )
+        .await;
+    assert_eq!(fitted["ok"], true, "{fitted}");
+    let applied = apply_board(&mut mcp, &id, &fitted, &key("fitted")).await;
+    assert_eq!(applied["result"]["verified"], true, "{}", applied["result"]["problems"]);
+
+    // 0.21 mm from the hole's edge: clear of the 0.2 mm net class, inside the 0.25 mm hole clearance.
+    let list = mcp
+        .call("pcb_list_footprints", json!({ "session_id": id, "include_pads": true }))
+        .await;
+    let edge = footprint(&list, "H1")["pads"][0]["copper"]["max"]["y"]
+        .as_f64()
+        .unwrap();
+    let y = ((edge + 0.21 + 0.1) * 1000.0).round() / 1000.0;
+    let near_hole = mcp
+        .call(
+            "pcb_route_plan",
+            json!({ "session_id": id, "routes": [{ "net": "GND", "points": [{ "x_mm": -6.5, "y_mm": y, "layer": "B.Cu" }, { "x_mm": -2.5, "y_mm": y }] }] }),
+        )
+        .await;
+    assert_eq!(near_hole["ok"], false, "{near_hole}");
+    assert!(
+        near_hole["error"]["message"].as_str().unwrap().contains("H1 (hole)"),
+        "{near_hole}"
+    );
+
+    // An outline far too small: its plan warns, DRC after it is worse, so it is rolled back.
+    let before = mcp.call("pcb_info", json!({ "session_id": id })).await["result"]["outline"].clone();
+    let small = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "replace": true, "width_mm": 8, "height_mm": 6 }),
+        )
+        .await;
+    assert_eq!(small["ok"], true, "{small}");
+    assert!(
+        small["result"]["warnings"]
+            .to_string()
+            .contains("outside the new outline"),
+        "{small}"
+    );
+    let applied = apply_board(&mut mcp, &id, &small, &key("small")).await;
+    println!("ROLLBACK {} {}", applied["result_state"], applied["result"]["rollback"]);
+    println!("ROLLBACK PROBLEMS {}", applied["result"]["problems"]);
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result_state"], "rejected", "{applied}");
+    assert!(applied["result"]["problems"].to_string().contains("DRC:"), "{applied}");
+    assert_eq!(applied["result"]["rollback"]["restored"], true, "{applied}");
+    assert_eq!(
+        applied["result"]["rollback"]["restore"]["recreated"], 1,
+        "the old outline: {applied}"
+    );
+    assert_eq!(applied["result"]["applied"], false, "{applied}");
+    let after = mcp.call("pcb_info", json!({ "session_id": id })).await["result"]["outline"].clone();
+    assert_eq!(after, before, "the fitted outline is back");
+
+    // Kept on request.
+    let small = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "replace": true, "width_mm": 8, "height_mm": 6 }),
+        )
+        .await;
+    let kept = mcp
+        .call(
+            "pcb_apply_plan",
+            json!({ "session_id": id, "plan_id": small["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": key("keep"), "keep_if_unverified": true }),
+        )
+        .await;
+    assert_eq!(kept["result_state"], "partial", "{kept}");
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert!(
+        (info["result"]["outline"]["width"].as_f64().unwrap() - 8.05).abs() < 0.02,
+        "{info}"
+    );
 }

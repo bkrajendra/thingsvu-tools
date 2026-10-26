@@ -47,6 +47,8 @@ pub struct BoardRules {
     pub default: NetRules,
     pub copper_edge_clearance: Nm,
     pub min_track_width: Nm,
+    /// Copper to a hole that has none of its own (a mounting hole).
+    pub hole_clearance: Nm,
 }
 
 impl BoardRules {
@@ -222,11 +224,16 @@ fn obstacles(board: &Board, rules: &BoardRules) -> Vec<Obstacle> {
                 None => Shape::Disc(p.at, 500_000.0),
             };
             let through = p.kind == "thru_hole" || p.kind == "np_thru_hole";
+            let clearance = if p.kind == "np_thru_hole" {
+                Nm(rules.of(&p.net).clearance.0.max(rules.hole_clearance.0))
+            } else {
+                rules.of(&p.net).clearance
+            };
             out.push(Obstacle {
                 net: p.net.clone(),
                 layers: if through { vec![] } else { p.layers.clone() },
                 shape,
-                clearance: rules.of(&p.net).clearance,
+                clearance,
                 what: if p.number.is_empty() {
                     format!("{} (hole)", f.reference)
                 } else {
@@ -977,6 +984,41 @@ mod tests {
         let mut b2 = b_route;
         b2.points[0].layer = Some("B.Cu".into());
         assert!(plan_routes(&board(), &rules(), &[a, b2]).is_ok());
+    }
+
+    #[test]
+    fn a_mounting_hole_keeps_the_board_hole_clearance() {
+        let mut b = board();
+        let mut hole = pad("", p(20.0, 20.0), "", "F.Cu");
+        hole.kind = "np_thru_hole".into();
+        hole.size = Some((Nm(3_200_000), Nm(3_200_000)));
+        b.footprints.push(fp("H1", vec![hole]));
+        let mut r = rules();
+        r.hole_clearance = Nm(250_000);
+        // Track edge 0.21 mm below the hole: clear of 0.2, inside 0.25.
+        let y = 20.0 + 1.6 + 0.21 + 0.1;
+        let req = RouteRequest {
+            net: Some("A".into()),
+            points: vec![
+                RoutePoint {
+                    at: RouteEnd::At(p(15.0, y)),
+                    layer: Some("F.Cu".into()),
+                },
+                RoutePoint {
+                    at: RouteEnd::At(p(25.0, y)),
+                    layer: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let err = plan_routes(&b, &r, std::slice::from_ref(&req)).unwrap_err();
+        assert!(
+            err.message.contains("H1 (hole)") && err.message.contains("0.25"),
+            "{}",
+            err.message
+        );
+        r.hole_clearance = Nm(0);
+        assert!(plan_routes(&b, &r, &[req]).is_ok());
     }
 
     #[test]

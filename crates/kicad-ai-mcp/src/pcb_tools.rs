@@ -131,6 +131,10 @@ pub struct PcbApplyArgs {
     pub confirm: bool,
     /// A new value per intended apply (8-128 characters).
     pub idempotency_key: String,
+    /// Keep a board change that fails its read-back or makes DRC worse, to look at it. By default
+    /// such a change is rolled back. (Not used for an update from the schematic.)
+    #[serde(default)]
+    pub keep_if_unverified: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1317,7 +1321,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_autoroute_plan",
-        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when the server is started with --freerouting-jar or THINGSVU_FREEROUTING_JAR; never downloaded). \\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nNothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move."
+        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nNothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move."
     )]
     pub async fn pcb_autoroute_plan(&self, Parameters(args): Parameters<PcbAutorouteArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1330,8 +1334,8 @@ impl KicadAiServer {
             let router = self.state.options.freerouting.clone().ok_or_else(|| {
                 ToolError::new(
                     ErrorCode::FeatureUnavailable,
-                    "no autorouter is configured: start the server with --freerouting-jar <path> (or set \
-                     THINGSVU_FREEROUTING_JAR); route with pcb_route_plan meanwhile",
+                    "no autorouter is configured: run the installer with -WithFreerouting (it sets one up), \
+                     or start the server with --freerouting <path>; route with pcb_route_plan meanwhile",
                 )
             })?;
             let passes = args.passes.unwrap_or(20);
@@ -1450,7 +1454,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, or a placement is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move). A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1988,8 +1992,10 @@ impl KicadAiServer {
                     "the board changed since the plan was made; make a new plan",
                 ));
             }
-            // A route is judged by DRC too: run before and after.
-            let judged_by_drc = matches!(plan.kind, "route" | "zone");
+            let snapshot = board.snapshot().await?;
+            // DRC before and after, except for a move the user asked for by name: its plan already
+            // shows the overlaps it makes.
+            let judged_by_drc = plan.kind != "move";
             let drc_before = if judged_by_drc {
                 self.run_drc(cid, board, false).await.ok()
             } else {
@@ -2004,10 +2010,10 @@ impl KicadAiServer {
             let mut after = board.read().await?;
             let libs = self.footprint_libraries_in(board.document_path().parent()).await;
             fill_courtyards(&mut after, &libs);
-            Ok::<_, ToolError>((report, after, drc_before, drc_after))
+            Ok::<_, ToolError>((before, snapshot, report, after, drc_before, drc_after))
         }
         .await;
-        let (report, after, drc_before, drc_after) = match result {
+        let (before, snapshot, report, after, drc_before, drc_after) = match result {
             Ok(r) => r,
             Err(e) => return envelope::error(cid, &e),
         };
@@ -2026,7 +2032,7 @@ impl KicadAiServer {
                     "after": drc_json(a),
                 }))
             }
-            _ if matches!(plan.kind, "route" | "zone") => {
+            _ if plan.kind != "move" => {
                 problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
                 None
             }
@@ -2037,7 +2043,7 @@ impl KicadAiServer {
             Provider::Gui => "one undo step in the PCB editor (Ctrl+Z)",
             _ => "not saved yet; pcb_save writes it, closing with discard_unsaved drops it",
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "applied": true,
             "verified": verified,
             "kind": plan.kind,
@@ -2049,16 +2055,63 @@ impl KicadAiServer {
             "next": "Check with pcb_review or pcb_render, then save with pcb_save.",
         });
         if verified {
-            envelope::ok(cid, body, board_provenance(board), plan.warnings.clone())
-        } else {
-            envelope::ok_with_state(
-                cid,
-                kicad_domain::ResultState::Partial,
-                body,
-                board_provenance(board),
-                vec!["applied, but the board read back differs from the plan; see problems".to_owned()],
-            )
+            return envelope::ok(cid, body, board_provenance(board), plan.warnings.clone());
         }
+        self.finish_unverified(cid, board, args, &snapshot, &before, &mut body)
+            .await
+    }
+
+    /// A change that failed its checks: rolled back (unless the caller keeps it), and the board
+    /// read again to confirm it is as it was.
+    async fn finish_unverified(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        args: &PcbApplyArgs,
+        snapshot: &kicad_session::BoardSnapshot,
+        before: &Board,
+        body: &mut serde_json::Value,
+    ) -> CallToolResult {
+        use kicad_domain::ResultState;
+        if args.keep_if_unverified {
+            return envelope::ok_with_state(
+                cid,
+                ResultState::Partial,
+                body.clone(),
+                board_provenance(board),
+                vec!["applied and kept, but it failed its checks; see problems".to_owned()],
+            );
+        }
+        let rollback = match board.restore(snapshot).await {
+            Ok(report) => {
+                let restored = board.read().await.is_ok_and(|now| same_board(&now, before));
+                serde_json::json!({ "rolled_back": true, "restored": restored, "restore": report })
+            }
+            Err(e) => serde_json::json!({ "rolled_back": false, "restored": false, "error": e.message }),
+        };
+        let restored = rollback["restored"] == true;
+        body["applied"] = serde_json::json!(!restored);
+        body["rollback"] = rollback;
+        body["undo"] = serde_json::json!(if restored {
+            "nothing to undo: the change was rolled back"
+        } else {
+            "the rollback did not complete; read the board (pcb_list_footprints, pcb_list_tracks) and undo in KiCad"
+        });
+        envelope::ok_with_state(
+            cid,
+            if restored {
+                ResultState::Rejected
+            } else {
+                ResultState::Unknown
+            },
+            body.clone(),
+            board_provenance(board),
+            vec![if restored {
+                "the change failed its checks and was rolled back; the board is as it was (see problems)".to_owned()
+            } else {
+                "the change failed its checks and the rollback did not complete; see rollback".to_owned()
+            }],
+        )
     }
 }
 
@@ -2102,14 +2155,15 @@ impl KicadAiServer {
                     "the board changed since the plan was made; make a new plan",
                 ));
             }
+            let snapshot = board.snapshot().await?;
             let drc_before = self.run_drc(cid, board, false).await.ok();
             let imported = board.import_session(&ses).await?;
             let drc_after = self.run_drc(cid, board, false).await.ok();
             let after = board.read().await?;
-            Ok::<_, ToolError>((before, imported, after, drc_before, drc_after))
+            Ok::<_, ToolError>((before, snapshot, imported, after, drc_before, drc_after))
         }
         .await;
-        let (before, imported, after, drc_before, drc_after) = match result {
+        let (before, snapshot, imported, after, drc_before, drc_after) = match result {
             Ok(r) => r,
             Err(e) => return envelope::error(cid, &e),
         };
@@ -2150,7 +2204,7 @@ impl KicadAiServer {
             }
         };
         let verified = problems.is_empty();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "applied": true,
             "verified": verified,
             "kind": "autoroute",
@@ -2167,15 +2221,53 @@ impl KicadAiServer {
             "next": "Check with pcb_review or pcb_render, then save with pcb_save.",
         });
         if verified {
-            envelope::ok(cid, body, board_provenance(board), vec![])
-        } else {
-            envelope::ok_with_state(
-                cid,
-                kicad_domain::ResultState::Partial,
-                body,
-                board_provenance(board),
-                vec!["applied, but the board read back is not as clean as before; see problems".to_owned()],
-            )
+            return envelope::ok(cid, body, board_provenance(board), vec![]);
         }
+        self.finish_unverified(cid, board, args, &snapshot, &before, &mut body)
+            .await
     }
+}
+
+/// The same board by content: every footprint's place, turn, side, lock, and pads, and the
+/// tracks, vias, zones, and outline (items recreated by a rollback get new ids).
+fn same_board(a: &Board, b: &Board) -> bool {
+    let fps = |x: &Board| {
+        let mut v: Vec<String> = x
+            .footprints
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} {:?} {:.3} {} {} {:?}",
+                    f.reference,
+                    f.position,
+                    f.rotation_deg,
+                    f.layer,
+                    f.locked,
+                    f.pads.iter().map(|p| (&p.number, p.at, &p.net)).collect::<Vec<_>>()
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let tracks = |x: &Board| {
+        let mut v: Vec<String> = x
+            .tracks
+            .iter()
+            .map(|t| format!("{:?} {:?} {} {} {}", t.start, t.end, t.width.0, t.layer, t.net))
+            .chain(
+                x.vias
+                    .iter()
+                    .map(|v| format!("via {:?} {} {}", v.at, v.diameter.0, v.net)),
+            )
+            .chain(
+                x.zones
+                    .iter()
+                    .map(|z| format!("zone {} {} {:?}", z.name, z.net, z.layers)),
+            )
+            .collect();
+        v.sort();
+        v
+    };
+    fps(a) == fps(b) && tracks(a) == tracks(b) && a.outline == b.outline && a.edges.len() == b.edges.len()
 }

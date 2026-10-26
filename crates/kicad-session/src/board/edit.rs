@@ -1057,6 +1057,7 @@ impl BoardSession {
         if let Some(c) = rules.rules.and_then(|r| r.constraints) {
             out.copper_edge_clearance = Nm(c.copper_edge_clearance.map(|d| d.value_nm).unwrap_or(500_000));
             out.min_track_width = Nm(c.min_track_width.map(|d| d.value_nm).unwrap_or(0));
+            out.hole_clearance = Nm(c.hole_clearance.map(|d| d.value_nm).unwrap_or(0));
             // A board minimum clearance above a class's wins.
             let min = c.min_clearance.map(|d| d.value_nm).unwrap_or(0);
             for r in out.nets.values_mut() {
@@ -1102,4 +1103,245 @@ impl BoardSession {
             report: r.report,
         })
     }
+}
+
+/// The board's items as KiCad sent them, to put the board back after a change that failed its
+/// checks (Phase 12.8). The API has no undo, so a rollback is a change of its own: what was added
+/// is deleted, what was removed is created again from these copies, and every footprint that moved,
+/// turned, or flipped is flipped back and sent as it was (with all its items at their old places).
+pub struct BoardSnapshot {
+    footprints: Vec<FootprintInstance>,
+    /// Tracks, arcs, vias, zones, and drawings, by id.
+    others: Vec<(String, Any)>,
+}
+
+/// What a rollback did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RestoreReport {
+    pub deleted: usize,
+    pub recreated: usize,
+    pub footprints_restored: usize,
+}
+
+fn any_id(a: &Any) -> Option<String> {
+    let url = a.type_url.as_str();
+    let id = if url == Track::type_url() {
+        a.to_msg::<Track>().ok()?.id
+    } else if url == kicad_ipc::proto::kiapi::board::types::Arc::type_url() {
+        a.to_msg::<kicad_ipc::proto::kiapi::board::types::Arc>().ok()?.id
+    } else if url == Via::type_url() {
+        a.to_msg::<Via>().ok()?.id
+    } else if url == Zone::type_url() {
+        a.to_msg::<Zone>().ok()?.id
+    } else if url == BoardGraphicShape::type_url() {
+        a.to_msg::<BoardGraphicShape>().ok()?.id
+    } else if url == BoardText::type_url() {
+        a.to_msg::<BoardText>().ok()?.id
+    } else {
+        None
+    };
+    id.map(|k| k.value)
+}
+
+async fn other_items(
+    client: &mut Client,
+    header: &impl Fn() -> Option<ItemHeader>,
+) -> Result<Vec<(String, Any)>, ToolError> {
+    let r: GetItemsResponse = client
+        .call(&GetItems {
+            header: header(),
+            types: [
+                KiCadObjectType::KotPcbTrace,
+                KiCadObjectType::KotPcbArc,
+                KiCadObjectType::KotPcbVia,
+                KiCadObjectType::KotPcbZone,
+                KiCadObjectType::KotPcbShape,
+                KiCadObjectType::KotPcbText,
+            ]
+            .map(|t| t as i32)
+            .to_vec(),
+        })
+        .await
+        .map_err(|e| from_ipc_error(&e, false))?;
+    Ok(r.items
+        .into_iter()
+        .filter_map(|a| any_id(&a).map(|id| (id, a)))
+        .collect())
+}
+
+impl BoardSession {
+    /// Records the board's items before a change.
+    pub async fn snapshot(&self) -> Result<BoardSnapshot, ToolError> {
+        let ipc = self
+            .ipc
+            .as_ref()
+            .ok_or_else(|| ToolError::new(ErrorCode::FeatureUnavailable, "a snapshot needs a live session"))?;
+        let mut ipc = ipc.lock().await;
+        let document = ipc.document.clone();
+        let header = || {
+            Some(ItemHeader {
+                document: Some(document.clone()),
+                ..Default::default()
+            })
+        };
+        let client = &mut ipc.client;
+        Ok(BoardSnapshot {
+            footprints: footprints(client, &header).await?,
+            others: other_items(client, &header).await?,
+        })
+    }
+
+    /// Puts the board back as `snap` recorded it, in one change, and refills the zones.
+    pub async fn restore(&self, snap: &BoardSnapshot) -> Result<RestoreReport, ToolError> {
+        let ipc = self
+            .ipc
+            .as_ref()
+            .ok_or_else(|| ToolError::new(ErrorCode::FeatureUnavailable, "a rollback needs a live session"))?;
+        let mut ipc = ipc.lock().await;
+        let document = ipc.document.clone();
+        let header = || {
+            Some(ItemHeader {
+                document: Some(document.clone()),
+                ..Default::default()
+            })
+        };
+        let client = &mut ipc.client;
+        let commit: BeginCommitResponse = client
+            .call(&BeginCommit { header: header() })
+            .await
+            .map_err(|e| from_ipc_error(&e, false))?;
+        let result = restore_steps(client, &header, snap).await;
+        let action = if result.is_ok() {
+            CommitAction::CmaCommit
+        } else {
+            CommitAction::CmaDrop
+        };
+        let ended = client
+            .call_any(&EndCommit {
+                id: commit.id,
+                action: action as i32,
+                message: "AI: roll back".into(),
+                header: header(),
+            })
+            .await;
+        let report = result?;
+        ended.map_err(|e| from_ipc_error(&e, true))?;
+        if snap.others.iter().any(|(_, a)| a.type_url == Zone::type_url()) {
+            let _ = client
+                .call_any(&kicad_ipc::proto::kiapi::board::commands::RefillZones {
+                    board: Some(document.clone()),
+                    zones: vec![],
+                })
+                .await;
+        }
+        Ok(report)
+    }
+}
+
+async fn restore_steps(
+    client: &mut Client,
+    header: &impl Fn() -> Option<ItemHeader>,
+    snap: &BoardSnapshot,
+) -> Result<RestoreReport, ToolError> {
+    let mut report = RestoreReport::default();
+    let now_fps = footprints(client, header).await?;
+    let now_others = other_items(client, header).await?;
+    let fp_id = |f: &FootprintInstance| f.id.as_ref().map(|k| k.value.clone()).unwrap_or_default();
+    let was_fp: std::collections::BTreeSet<String> = snap.footprints.iter().map(fp_id).collect();
+    let was_other: std::collections::BTreeSet<&str> = snap.others.iter().map(|(id, _)| id.as_str()).collect();
+    let now_other: std::collections::BTreeSet<&str> = now_others.iter().map(|(id, _)| id.as_str()).collect();
+
+    // Added since: delete.
+    let mut delete: Vec<ProtoKiid> = now_fps
+        .iter()
+        .map(fp_id)
+        .filter(|id| !was_fp.contains(id))
+        .map(|value| ProtoKiid { value })
+        .collect();
+    delete.extend(
+        now_others
+            .iter()
+            .filter(|(id, _)| !was_other.contains(id.as_str()))
+            .map(|(id, _)| ProtoKiid { value: id.clone() }),
+    );
+    if !delete.is_empty() {
+        report.deleted = delete.len();
+        let r: kicad_ipc::proto::kiapi::common::commands::DeleteItemsResponse = client
+            .call(&DeleteItems {
+                header: header(),
+                item_ids: delete,
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        if r.deleted_items
+            .iter()
+            .any(|d| d.status != ItemDeletionStatus::IdsOk as i32)
+        {
+            return Err(kerr("KiCad did not delete everything the change added"));
+        }
+    }
+    // Removed since: create again from the copies.
+    let recreate: Vec<Any> = snap
+        .others
+        .iter()
+        .filter(|(id, _)| !now_other.contains(id.as_str()))
+        .map(|(_, a)| a.clone())
+        .collect();
+    if !recreate.is_empty() {
+        report.recreated = recreate.len();
+        let n = recreate.len();
+        let r: CreateItemsResponse = client
+            .call(&CreateItems {
+                header: header(),
+                items: recreate,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        let failed: Vec<String> = r
+            .created_items
+            .iter()
+            .filter_map(|c| status_ok(&c.status).err())
+            .collect();
+        if !failed.is_empty() || r.created_items.len() != n {
+            return Err(kerr(format!(
+                "KiCad did not recreate the removed items: {}",
+                failed.join("; ")
+            )));
+        }
+    }
+    // Footprints that changed: flipped back first, then sent as they were.
+    let changed: Vec<&FootprintInstance> = snap
+        .footprints
+        .iter()
+        .filter(|was| {
+            now_fps.iter().find(|n| fp_id(n) == fp_id(was)).is_some_and(|now| {
+                now.position != was.position
+                    || now.layer != was.layer
+                    || now.locked != was.locked
+                    || now.orientation.map(|a| a.value_degrees) != was.orientation.map(|a| a.value_degrees)
+            })
+        })
+        .collect();
+    let flip: Vec<ProtoKiid> = changed
+        .iter()
+        .filter(|was| now_fps.iter().any(|n| fp_id(n) == fp_id(was) && n.layer != was.layer))
+        .map(|was| ProtoKiid { value: fp_id(was) })
+        .collect();
+    if !flip.is_empty() {
+        let r: FlipItemsResponse = client
+            .call(&FlipItems {
+                header: header(),
+                items: flip,
+                direction: BoardFlipDirection::BfdTopBottom as i32,
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        if r.flipped_items.iter().any(|f| status_ok(&f.status).is_err()) {
+            return Err(kerr("KiCad did not flip a footprint back"));
+        }
+    }
+    report.footprints_restored = changed.len();
+    update(client, header, changed.into_iter().cloned().collect()).await?;
+    Ok(report)
 }

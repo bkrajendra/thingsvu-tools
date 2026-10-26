@@ -57,6 +57,15 @@ pub fn log_dir() -> PathBuf {
     registry_dir().with_file_name("logs")
 }
 
+/// The server's settings file (`config.json`, written by the installer). `THINGSVU_CONFIG`
+/// overrides it.
+pub fn config_file() -> PathBuf {
+    if let Some(file) = std::env::var_os("THINGSVU_CONFIG") {
+        return PathBuf::from(file);
+    }
+    registry_dir().with_file_name("config.json")
+}
+
 /// KiCad passes sockets as `ipc://<path>`.
 pub fn socket_path_from_env(value: &str) -> PathBuf {
     PathBuf::from(value.strip_prefix("ipc://").unwrap_or(value))

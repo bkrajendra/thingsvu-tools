@@ -24,6 +24,9 @@ thingsvu-tools lets an AI assistant work alongside you in KiCad. You describe th
 
 It connects to any assistant that speaks the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), such as Claude Desktop, Claude Code, or VS Code.
 
+> [!NOTE]
+> **Third-party tools.** Whole-board autorouting (`pcb_autoroute_plan`) is done by [Freerouting](https://github.com/freerouting/freerouting), a separate open-source project (GPL-3.0) by its own authors; thingsvu-tools is not affiliated with it. It is optional: it is only used after you set it up (see [Optional: the autorouter](#optional-the-autorouter)), runs on your machine with its network features turned off, and its results are checked by KiCad's own DRC before they are kept. Everything else, including explicit routing, pours, and placement, is done by thingsvu-tools and KiCad itself.
+
 ## Why it's different
 
 - **You stay in control.** Changes are proposed as a plan first. Nothing touches your design until you confirm it, and a stale plan is never applied to a document that has changed.
@@ -112,13 +115,22 @@ Add to `.vscode/mcp.json` in your workspace:
 
 Add `"--read-only"` to the arguments to let the assistant look but never change anything.
 
-**Optional autorouter.** If you have [Freerouting](https://github.com/freerouting/freerouting) (2.x) and Java installed, point the server at them to let the assistant route a whole board:
+### Optional: the autorouter
 
-```json
-"args": ["--freerouting-jar", "D:/tools/freerouter/freerouting-2.5.0.jar", "--java", "D:/jdk/bin/java.exe"]
-```
+To let the assistant route a whole board at once, set up [Freerouting](https://github.com/freerouting/freerouting) (a separate open-source program; see the note at the top). One step:
 
-(or set `THINGSVU_FREEROUTING_JAR` and `THINGSVU_JAVA`). Without it, autorouting is simply unavailable; the installer never downloads it. Freerouting runs as a separate process for each plan, with its GUI, API server, and usage reporting turned off, so nothing leaves your machine.
+- **Installing now:** answer **y** when the installer asks *"Also set up whole-board autorouting?"*, or run it with `-WithFreerouting`.
+- **Already installed:** run this one line in PowerShell:
+
+  ```powershell
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/bkrajendra/thingsvu-tools/main/scripts/install.ps1))) -FreeroutingOnly
+  ```
+
+It uses a Freerouting already on your machine if it finds one that works (a running one, or Freerouting's own Windows install). Otherwise it downloads Freerouting from its official GitHub release: its native command-line build if that works, else its Java build together with a Java 25 runtime (Eclipse Temurin, from Adoptium) when you have none. Every download is checked against its published checksum, and whatever it settles on must route a small test board first. (Freerouting 2.5.0's native Windows build hangs on KiCad boards, so today it ends up with the Java build: about 120 MB with the runtime, a few minutes.) Everything goes under `%LOCALAPPDATA%\thingsvu\kicad-ai`, with a `config.json` there so the server finds it. Restart your assistant afterwards. The uninstaller removes it with everything else.
+
+**Already have Freerouting?** Add `-FreeroutingPath <path to its .exe or .jar>` (and `-JavaPath <java.exe>` for a jar) to the line above; nothing is downloaded. You can also start the server with `--freerouting <path>` (and `--java <path>`), or set `THINGSVU_FREEROUTING`.
+
+Without it, autorouting is simply unavailable and everything else works. Freerouting runs as a separate process for each plan, with its GUI, API server, and usage reporting turned off, so nothing leaves your machine.
 
 ### 4. Try it
 
@@ -158,7 +170,7 @@ An assistant can then give the board an outline and move parts, through a live s
 
 > Put a 50 x 40 mm outline with 2 mm rounded corners and an M3 hole in each corner around the parts, then turn U1 by 90 degrees and move C1 to the back.
 
-Each change is shown as a plan first, applied as one step (one Ctrl+Z in the editor), and read back: the outline, and every moved footprint's place, turn, side, lock, pads, and nets. Locked footprints stay where they are unless you say otherwise.
+Each change is shown as a plan first, applied as one step (one Ctrl+Z in the editor), and read back: the outline, and every moved footprint's place, turn, side, lock, pads, and nets, with KiCad's DRC run before and after. A change that fails those checks, or makes DRC worse, is undone automatically and the board is read again to confirm it is as it was. Locked footprints stay where they are unless you say otherwise.
 
 Once the board has an outline, the assistant can place every part:
 
@@ -176,7 +188,7 @@ Between two pads the assistant finds a simple path (straight, 45°, or an L) on 
 
 The pour covers the board (or an area you give) at your net class's clearance; the plan lists the pads it should connect, applying refills it and runs DRC before and after.
 
-With Freerouting configured (see the setup above), the whole board can be routed at once:
+With Freerouting set up ([one step](#optional-the-autorouter)), the whole board can be routed at once:
 
 > Autoroute the board and tell me if anything is left.
 

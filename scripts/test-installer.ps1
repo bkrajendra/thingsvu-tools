@@ -51,6 +51,7 @@ try {
     Check ($cfg.mcpServers.'kicad-ai'.command -eq $exe) 'Claude Desktop starts the installed server'
     Check ($cfg.mcpServers.other.command -eq 'C:\other.exe' -and $cfg.theme -eq 'dark') "the user's other settings are kept"
     Check (@(Get-ChildItem (Split-Path $desktop) -Filter '*.bak-*').Count -eq 1) 'the old settings are backed up'
+    Check (-not (Test-Path "$data\freerouting") -and -not (Test-Path "$data\config.json")) '-Yes alone never downloads the autorouter'
 
     Write-Host 'Install again'
     Run-Script (Join-Path $package 'install.ps1') $installArgs | Out-Null
@@ -78,8 +79,23 @@ try {
         @{ tag_name = 'v0.0.1'; draft = $false; prerelease = $true; assets = @() }
     )
     $listing = ConvertTo-Json -InputObject $releases -Depth 6
-    $job = Start-Job -ArgumentList $port, $listing, $served -ScriptBlock {
-        param($port, $listing, $served)
+    # A stand-in for Freerouting's release: its native command-line build and its checksums.
+    $frStage = Join-Path $sandbox 'frstage'
+    New-Item -ItemType Directory "$frStage\freerouting-cli" | Out-Null
+    Set-Content "$frStage\freerouting-cli\freerouting.exe" 'not a real program' -Encoding ascii
+    $frZip = 'freerouting-cli-9.9.9-windows-x64.zip'
+    Compress-Archive "$frStage\freerouting-cli" (Join-Path $served $frZip)
+    $frHash = (Get-FileHash (Join-Path $served $frZip) -Algorithm SHA256).Hash.ToLower()
+    [IO.File]::WriteAllText((Join-Path $served 'freerouting-cli-9.9.9-checksums.txt'), "$frHash  $frZip`n")
+    $frRelease = ConvertTo-Json -Depth 6 -InputObject @{
+        tag_name = 'v9.9.9'
+        assets = @(
+            @{ name = $frZip; size = 1024; browser_download_url = "$base/files/$frZip" },
+            @{ name = 'freerouting-cli-9.9.9-checksums.txt'; size = 100; browser_download_url = "$base/files/freerouting-cli-9.9.9-checksums.txt" }
+        )
+    }
+    $job = Start-Job -ArgumentList $port, $listing, $served, $frRelease -ScriptBlock {
+        param($port, $listing, $served, $frRelease)
         $listener = New-Object System.Net.HttpListener
         $listener.Prefixes.Add("http://localhost:$port/")
         $listener.Start()
@@ -89,6 +105,10 @@ try {
                 $path = $context.Request.Url.AbsolutePath
                 if ($path -like '*/releases') {
                     $bytes = [Text.Encoding]::UTF8.GetBytes($listing)
+                    $context.Response.ContentType = 'application/json'
+                }
+                elseif ($path -like '*/releases/latest') {
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($frRelease)
                     $context.Response.ContentType = 'application/json'
                 }
                 elseif ($path -like '/files/*') {
@@ -123,6 +143,25 @@ try {
         catch { $failed = $_.Exception.Message -match 'checksum' }
         Check $failed 'a download that does not match its checksum is refused'
         Check (-not (Test-Path "$remote\other\bin\kicad-ai-mcp.exe")) 'and nothing is installed'
+
+        Write-Host "The autorouter, on its own (a stand-in for Freerouting's release)"
+        # The stand-in executable cannot route; the routing check is tested against the real Freerouting.
+        $frArgs = @('-FreeroutingOnly', '-SkipFreeroutingCheck', '-DownloadFreerouting', '-InstallDir', "$remote\fr\bin", '-ApiBase', $base, '-FreeroutingRepository', 'fr/fr')
+        $text = Run-Script (Join-Path $remote 'install.ps1') $frArgs
+        Check ($text -match 'Downloading freerouting-cli-9.9.9-windows-x64.zip') 'it downloads the native command-line build'
+        Check ($text -match 'checksum verified') 'and checks it against the published checksums'
+        $frConfig = Get-Content "$remote\fr\config.json" -Raw | ConvertFrom-Json
+        Check ($frConfig.freerouting -like '*\freerouting\freerouting-cli\freerouting.exe' -and (Test-Path $frConfig.freerouting)) 'config.json names the unpacked executable'
+        Check (-not $frConfig.java) 'and no Java, which the native build does not need'
+        Check (-not (Test-Path "$remote\fr\bin\kicad-ai-mcp.exe")) '-FreeroutingOnly installs nothing else'
+        [IO.File]::WriteAllText((Join-Path $served 'freerouting-cli-9.9.9-checksums.txt'), ('0' * 64) + "  $frZip`n")
+        $failed = $false
+        try { Run-Script (Join-Path $remote 'install.ps1') @('-FreeroutingOnly', '-SkipFreeroutingCheck', '-DownloadFreerouting', '-InstallDir', "$remote\fr2\bin", '-ApiBase', $base, '-FreeroutingRepository', 'fr/fr') | Out-Null }
+        catch { $failed = $_.Exception.Message -match 'checksum' }
+        Check $failed 'a Freerouting download that does not match its checksum is refused'
+        Check (-not (Test-Path "$remote\fr2\config.json")) 'and autorouting is not set up'
+        $text = Run-Script (Join-Path $remote 'install.ps1') @('-FreeroutingOnly', '-SkipFreeroutingCheck', '-InstallDir', "$remote\fr3\bin", '-FreeroutingPath', "$frStage\freerouting-cli\freerouting.exe")
+        Check ((Get-Content "$remote\fr3\config.json" -Raw | ConvertFrom-Json).freerouting -like '*freerouting.exe') '-FreeroutingPath uses a copy the user has, without downloading'
     }
     finally { Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
 

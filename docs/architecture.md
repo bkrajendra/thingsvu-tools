@@ -249,6 +249,8 @@ A board is a second kind of session, with its own tools (`pcb_*`) and its own mo
 
 Board edits (Phase 12: outline, mounting holes, moves) are planned in `kicad-domain::board_edit` from the board model: the plan lists the operations and the board it should leave, measured (overlaps, parts outside the outline) before and after. `pcb_apply_plan` applies a plan in one API commit (dropped on any failure, so nothing stays half done) and `verify_edit` compares the board read back with the plan, down to every pad's place and net. Because KiCad moves only a footprint's anchor when its position changes, the session turns and shifts every item inside the footprint itself (`kicad-session::board::edit`). The placement engine (`kicad-domain::placement`) produces the same kind of plan: a constructive pass and a deterministic improvement loop over one cost (wire length, overlaps, outline, decoupling, connector edges, hints), with blocks taken from rectangles drawn on the schematic. Routing (`kicad-domain::routing`) checks each planned track and via against every other net's copper (pads by their turned copper box and layers, tracks, vias, holes) and the board edge, with clearances and sizes read from the board's net classes and minimums (`BoardSession::routing_rules`); applying a route plan runs DRC before and after. Copper pours (`kicad-domain::zones`) are created in the same commit with every setting given, refilled right after it (a refill inside the commit does not see the new zone), and judged by DRC the same way. The optional autorouter (`kicad-cli-runner::freerouting`) runs Freerouting headless in its own process on a DSN exported by `kicad-cli` from a snapshot of the live board (KiCad's own export job reads the file on disk); `pcb_apply_plan` imports the session through the API and checks that no part moved and DRC is no worse.
 
+Every board change is recorded before it is applied (`BoardSession::snapshot`: footprints, tracks, vias, zones, drawings as KiCad sends them). The KiCad API has no undo, so a change that fails its read-back or makes DRC worse is put back by a change of its own (`restore`: delete what was added, recreate what was removed, flip and re-send what moved), and the board is read again to confirm it is as it was.
+
 ```mermaid
 flowchart LR
     LIVE["Live board<br/>headless server or<br/>PCB editor (API)"] --> MODEL["Board model<br/>footprints + pads,<br/>tracks, vias, zones, outline"]
@@ -275,7 +277,8 @@ flowchart LR
     DSN --> FR["Freerouting (optional,<br/>own process, no network)"]
     FR -->|"session (.ses)"| AUTO["pcb_autoroute_plan<br/>summary per net"]
     AUTO -->|"ImportSpecctraSession"| LIVE
-    APPLYE -->|"route and zone plans"| DRCBA["DRC before and after<br/>unrouted count, no new errors"]
+    APPLYE -->|"every plan but a move"| DRCBA
+    DRCBA -->|"problems"| ROLL["Rollback<br/>snapshot restored,<br/>board read again"]["DRC before and after<br/>unrouted count, no new errors"]
     EDIT --> APPLYE["pcb_apply_plan<br/>one commit: shapes, holes,<br/>flips, footprints moved<br/>with every item"]
     APPLYE --> LIVE
     APPLYE -->|"read back"| VERIFY["verify_edit<br/>outline, places, turns,<br/>sides, locks, pads, nets"]
