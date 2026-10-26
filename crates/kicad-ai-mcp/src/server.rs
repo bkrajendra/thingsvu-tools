@@ -20,6 +20,8 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::envelope;
 use crate::plans::{plan_view, PlanStore, StoredPlan};
 
+#[path = "fab_tools.rs"]
+mod fab_tools;
 #[path = "pcb_tools.rs"]
 mod pcb_tools;
 
@@ -645,7 +647,7 @@ impl KicadAiServer {
                 boards: Mutex::new(BTreeMap::new()),
                 pending_updates: Mutex::new(BTreeMap::new()),
             }),
-            tool_router: Self::tool_router() + Self::pcb_router(),
+            tool_router: Self::tool_router() + Self::pcb_router() + Self::fab_router(),
         }
     }
 

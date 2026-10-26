@@ -91,8 +91,6 @@ pub async fn run_drc(
     })
 }
 
-/// Renders the board in 3D to a PNG at `output`. Needs a KiCad 11-series CLI. `side` is one of
-/// `top`, `bottom`, `left`, `right`, `front`, `back`.
 /// Writes `board` as a Specctra DSN file for an autorouter (KiCad 10.99 and later).
 pub async fn export_specctra(
     install: &KicadInstall,
@@ -118,6 +116,8 @@ pub async fn export_specctra(
     Ok(())
 }
 
+/// Renders the board in 3D to a PNG at `output`. Needs a KiCad 11-series CLI. `side` is one of
+/// `top`, `bottom`, `left`, `right`, `front`, `back`.
 pub async fn render_png(
     install: &KicadInstall,
     board: &Path,

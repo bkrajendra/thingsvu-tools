@@ -112,11 +112,14 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_apply_plan",
             "pcb_autoroute_plan",
             "pcb_close",
+            "pcb_export",
+            "pcb_fab_package",
             "pcb_get_footprint",
             "pcb_info",
             "pcb_list_footprints",
             "pcb_list_nets",
             "pcb_list_tracks",
+            "pcb_mechanical_info",
             "pcb_move_plan",
             "pcb_open",
             "pcb_outline_plan",
@@ -2955,4 +2958,187 @@ async fn live_board_change_that_fails_drc_is_rolled_back() {
         (info["result"]["outline"]["width"].as_f64().unwrap() - 8.05).abs() < 0.02,
         "{info}"
     );
+}
+
+/// Whether an autorouter is set up for the server (an environment variable or the installer's
+/// settings file).
+fn freerouting_configured() -> bool {
+    std::env::var_os("THINGSVU_FREEROUTING").is_some()
+        || std::env::var_os("THINGSVU_CONFIG").is_some()
+        || kicad_session::registry::config_file().is_file()
+}
+
+/// Phase 13: an outlined, placed board is refused for export while it is unrouted, exported when
+/// the user accepts that, read as a mechanical model, and, once autorouted (when Freerouting is
+/// set up), packaged for JLCPCB with every check passing.
+#[tokio::test]
+async fn live_board_is_exported() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("export", false);
+    let fab = pcb.parent().unwrap().join("fab");
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-export-{n}-{}", std::process::id());
+
+    // The file as it is (no outline, nothing routed), through the file provider: refused.
+    let file = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    let refused = mcp
+        .call("pcb_export", json!({ "session_id": file["result"]["session_id"] }))
+        .await;
+    assert_eq!(refused["result_state"], "rejected", "{refused}");
+    assert_eq!(
+        refused["result"]["blocking"],
+        json!(["outline_closed", "drc"]),
+        "{refused}"
+    );
+    mcp.call("pcb_close", json!({ "session_id": file["result"]["session_id"] }))
+        .await;
+
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 44, "height_mm": 34, "origin": { "x_mm": 100, "y_mm": 80 },
+                    "mounting_holes": "corners", "hole_inset_mm": 3.5 }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+
+    // Unrouted: refused, nothing written.
+    let refused = mcp.call("pcb_export", json!({ "session_id": id })).await;
+    println!("EXPORT REFUSED {}", refused["result"]["checks"]);
+    assert_eq!(refused["result_state"], "rejected", "{refused}");
+    assert_eq!(refused["result"]["blocking"], json!(["drc"]), "{refused}");
+    let checks = refused["result"]["checks"].as_array().unwrap();
+    let status = |id: &str| checks.iter().find(|c| c["id"] == id).unwrap()["status"].clone();
+    assert_eq!(status("outline_closed"), "pass");
+    assert_eq!(status("bom_lines"), "pass", "the holes need no BOM line: {refused}");
+    assert!(!fab.exists());
+
+    // Accepted by the user: everything written and read back.
+    let all = json!(["gerbers", "drill", "positions", "step", "pdf", "svg", "mechanical"]);
+    let exported = mcp
+        .call(
+            "pcb_export",
+            json!({ "session_id": id, "outputs": all, "accept_problems": true,
+                    "acceptance_note": "test: exporting before routing to look at the plots" }),
+        )
+        .await;
+    println!("EXPORT {}", exported["result"]["verification"]);
+    assert_eq!(exported["result_state"], "done", "{exported}");
+    assert_eq!(exported["result"]["accepted_problems"], true);
+    let verification = exported["result"]["verification"].as_array().unwrap();
+    assert!(verification.iter().all(|v| v["ok"] == true), "{exported}");
+    let drill = verification.iter().find(|v| v["what"] == "drill holes").unwrap();
+    assert!(
+        drill["detail"].as_str().unwrap().starts_with("6 holes"),
+        "J1's two pins and four mounting holes: {drill}"
+    );
+    let positions = verification.iter().find(|v| v["what"] == "positions").unwrap();
+    assert!(
+        positions["detail"].as_str().unwrap().starts_with("11 parts"),
+        "the mounting holes are not placed by the assembler: {positions}"
+    );
+    let gerbers: Vec<String> = std::fs::read_dir(fab.join("gerbers"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        gerbers.len(),
+        12,
+        "nine layers, the job file, two drill files: {gerbers:?}"
+    );
+    for f in [
+        "assembly/regulator-pos.csv",
+        "3d/regulator.step",
+        "3d/regulator-mechanical.json",
+        "plots/regulator.pdf",
+    ] {
+        assert!(fab.join(f).is_file(), "{f}");
+    }
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(fab.join("regulator-checks.json")).unwrap()).unwrap();
+    assert_eq!(
+        report["accepted_by_user"]["note"],
+        "test: exporting before routing to look at the plots"
+    );
+
+    let mech = mcp.call("pcb_mechanical_info", json!({ "session_id": id })).await;
+    println!("MECHANICAL {}", mech["result"]["connectors"]);
+    assert_eq!(mech["ok"], true, "{mech}");
+    let m = &mech["result"];
+    assert_eq!(m["format"], "thingsvu.mechanical/1");
+    assert_eq!(m["board"]["thickness_mm"], 1.6);
+    assert_eq!(m["board"]["outline_closed"], true);
+    assert_eq!(m["mounting_holes"].as_array().unwrap().len(), 4, "{m}");
+    assert_eq!(m["connectors"][0]["reference"], "J1");
+    assert_eq!(m["connectors"][0]["edge"], "left", "{m}");
+    assert!(
+        m["step_path"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("fab/3d/regulator.step"),
+        "{m}"
+    );
+    assert_eq!(m["components"].as_array().unwrap().len(), 11);
+
+    if !freerouting_configured() {
+        eprintln!("the package part needs Freerouting (install.ps1 -FreeroutingOnly)");
+        return;
+    }
+    let plan = mcp
+        .call(
+            "pcb_autoroute_plan",
+            json!({ "session_id": id, "passes": 20, "time_limit_s": 180 }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    let routed = apply_board(&mut mcp, &id, &plan, &key("route")).await;
+    assert_eq!(routed["result"]["drc"]["unrouted_after"], 0, "{routed}");
+
+    // Routed: every blocking check passes, and the JLCPCB package is made without accepting anything.
+    let package = mcp.call("pcb_fab_package", json!({ "session_id": id })).await;
+    println!(
+        "PACKAGE {} {}",
+        package["result"]["checks"], package["result"]["verification"]
+    );
+    assert_eq!(package["result_state"], "done", "{package}");
+    assert_eq!(package["result"]["accepted_problems"], false);
+    let zip = fab.join("regulator-fab.zip");
+    assert!(zip.is_file());
+    let cpl = std::fs::read_to_string(fab.join("regulator-cpl.csv")).unwrap();
+    assert!(
+        cpl.starts_with("Designator,Val,Package,Mid X,Mid Y,Rotation,Layer"),
+        "{cpl}"
+    );
+    let bom = std::fs::read_to_string(fab.join("regulator-bom.csv")).unwrap();
+    assert!(
+        bom.starts_with("\"Comment\",\"Designator\",\"Footprint\",\"LCSC Part #\""),
+        "{bom}"
+    );
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(fab.join("regulator-checks.json")).unwrap()).unwrap();
+    assert_eq!(report["accepted_by_user"], Value::Null);
 }

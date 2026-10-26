@@ -21,15 +21,15 @@ pub enum BoardError {
     NotABoard,
 }
 
-fn nm(v: f64) -> Nm {
+pub(crate) fn nm(v: f64) -> Nm {
     Nm((v * 1e6).round() as i64)
 }
 
-fn point(n: &Node) -> Option<Point> {
+pub(crate) fn point(n: &Node) -> Option<Point> {
     Some(Point::new(nm(n.arg_f64(0)?), nm(n.arg_f64(1)?)))
 }
 
-fn layer_of(n: &Node) -> String {
+pub(crate) fn layer_of(n: &Node) -> String {
     n.child("layer")
         .and_then(|l| l.arg_text(0))
         .unwrap_or_default()
@@ -37,7 +37,7 @@ fn layer_of(n: &Node) -> String {
 }
 
 /// A net named on an item: `(net "GND")`, or `(net 3 "GND")` / `(net 3)` with a table.
-fn net_of(n: &Node, table: &BTreeMap<i64, String>) -> String {
+pub(crate) fn net_of(n: &Node, table: &BTreeMap<i64, String>) -> String {
     let Some(net) = n.child("net") else {
         return n.child_text("net_name").unwrap_or_default().to_owned();
     };
@@ -53,12 +53,12 @@ fn net_of(n: &Node, table: &BTreeMap<i64, String>) -> String {
     }
 }
 
-fn is_yes(n: &Node, name: &str) -> bool {
+pub(crate) fn is_yes(n: &Node, name: &str) -> bool {
     n.child_text(name) == Some("yes") || n.items().iter().any(|i| i.text() == Some(name))
 }
 
 /// Position and rotation of a footprint, in either layout.
-fn placement(fp: &Node) -> (Point, f64) {
+pub(crate) fn placement(fp: &Node) -> (Point, f64) {
     if let Some(at) = fp.child("at") {
         return (point(at).unwrap_or_default(), at.arg_f64(2).unwrap_or(0.0));
     }
@@ -74,7 +74,7 @@ fn bounds(points: impl IntoIterator<Item = Point>) -> Option<Rect> {
 }
 
 /// Every point of a drawing item (lines, rectangles, arcs, circles, polygons).
-fn shape_points(item: &Node) -> Vec<Point> {
+pub(crate) fn shape_points(item: &Node) -> Vec<Point> {
     let mut out = Vec::new();
     for key in ["start", "mid", "end", "center"] {
         out.extend(item.child(key).and_then(point));

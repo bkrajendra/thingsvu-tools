@@ -447,7 +447,7 @@ fn rect(r: Rect) -> serde_json::Value {
     serde_json::json!({ "min": pt(r.min), "max": pt(r.max), "width": mm(r.width().0), "height": mm(r.height().0) })
 }
 
-fn board_provenance(board: &BoardSession) -> Vec<Provenance> {
+pub(super) fn board_provenance(board: &BoardSession) -> Vec<Provenance> {
     vec![Provenance {
         origin: match board.provider() {
             Provider::File => Origin::ProjectFile,
@@ -489,7 +489,7 @@ fn fingerprint(board: &Board) -> String {
 }
 
 /// The schematic next to a board (same name), or the one given.
-fn schematic_for(board: &BoardSession, given: Option<&str>) -> Result<PathBuf, ToolError> {
+pub(super) fn schematic_for(board: &BoardSession, given: Option<&str>) -> Result<PathBuf, ToolError> {
     if let Some(p) = given {
         let p = PathBuf::from(p);
         if !p.is_absolute() || p.extension().and_then(|e| e.to_str()) != Some("kicad_sch") || !p.is_file() {

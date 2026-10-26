@@ -4,6 +4,7 @@
 //! `.kicad_sch` text without touching anything else in it.
 
 pub mod emit;
+pub mod fab;
 pub mod fp;
 pub mod node;
 pub mod pcb;

@@ -194,6 +194,18 @@ With Freerouting set up ([one step](#optional-the-autorouter)), the whole board 
 
 The plan runs Freerouting on a snapshot of the board and shows its result (unrouted connections, tracks per net, the unlocked tracks it would replace) before anything changes; applying imports it into KiCad and checks that no part moved and DRC is no worse. Lock the tracks you want to keep.
 
+When the board is done, the assistant makes the files to order it:
+
+> Check the board and make a JLCPCB package.
+
+Before anything is written, the board is checked: the outline is closed, DRC has no errors and nothing is unrouted, every footprint has a BOM line, and the silkscreen stays on the board. If a check fails, you see why and nothing is written, unless you say to go ahead anyway; that decision is recorded in a checks report beside the files. `pcb_fab_package` then writes, into a `fab` folder next to the board, the Gerbers and drill files as one zip (what you upload for the bare board), the BOM and placement (CPL) files in JLCPCB's columns, and one `<board>-fab.zip` with all of it. `pcb_export` writes the pieces separately (Gerbers, drill, positions, STEP, PDF or SVG plots). Every file is read back before it is kept: the copper layer count, the outline, every drill hole against the board's holes, the placement rows against the parts, and, with KiCad 11, every Gerber through the same reader KiCad's Gerber viewer uses. Nothing is uploaded.
+
+For an enclosure, ask for the board's mechanical summary:
+
+> What are the board's size and mounting holes, which edge does the USB connector face, and how tall is the tallest part?
+
+`pcb_mechanical_info` returns the outline and thickness, mounting holes, keep-out areas, connectors and the edge each one faces, and each part's height. A height comes from the part's `Height` field, or else from a typical height for its package, marked as an estimate.
+
 To get a schematic ready to order parts:
 
 > Review the BOM for a JLCPCB order. Look up the parts you can, fill in the part numbers, assign the missing footprints, and export the BOM.
@@ -256,6 +268,9 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_route_plan` | Tracks and vias for named nets, pad to pad or through given points, at the net class width; checked against other nets' copper and the edge; DRC before and after applying |
 | `pcb_zone_plan` | Copper pours (ground first) over the board or an area, with clearance, minimum width, and thermal reliefs; refilled after applying, DRC before and after |
 | `pcb_autoroute_plan` | Route the whole board with Freerouting (optional, when configured): the router's result first, then KiCad's import, checked with DRC before and after |
+| `pcb_export` | Gerbers, drill, positions, STEP, PDF/SVG plots, and the mechanical model, into the project, after the pre-export checks; every file read back |
+| `pcb_fab_package` | The files a board house needs (Gerber zip, BOM, CPL; JLCPCB or generic columns) and one zip with all of them and the checks report |
+| `pcb_mechanical_info` | Outline, thickness, mounting holes, keep-outs, connectors and the edge each faces, and part heights, for enclosure design. Read-only |
 | `pcb_place_plan` | Place the footprints inside the outline (main IC central, connectors on edges, decoupling beside its pins, no overlaps), with hints keep, place, near, edge, groups, side, only; measured before and after; applied with `pcb_apply_plan` |
 | `sch_set_field` | Change one part's value or footprint |
 | `sch_save` | Save the schematic |
@@ -291,6 +306,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | **kicad-ai-plugin** | A KiCad plugin that makes your open editor available to the assistant |
 | **kicad-domain** | The shared circuit model: plans, validation, layout, and readability checks |
 | **kicad-session**, **kicad-ipc**, **kicad-sexpr**, **kicad-cli-runner** | Sessions over KiCad's API or a schematic file; the API client; KiCad file reading and writing; `kicad-cli` jobs |
+| **mech-model** | A neutral description of the board for mechanical design (no KiCad types), the start of the enclosure tools |
 
 ```mermaid
 flowchart LR
@@ -299,7 +315,7 @@ flowchart LR
     S -->|"KiCad 11 API"| H["private headless KiCad"]
     S -->|"verified file edits"| F[("schematic file<br/>KiCad 10 or 11")]
     P["kicad-ai-plugin<br/>toolbar button"] -.->|"registers the editor"| S
-    S -->|"ERC, netlist, render"| C["kicad-cli"]
+    S -->|"ERC, DRC, netlist, render,<br/>Gerbers, drill, STEP"| C["kicad-cli"]
 ```
 
 More detail: [architecture](docs/architecture.md).
@@ -323,7 +339,9 @@ How releases are made: [releasing](docs/releasing.md).
 - **Now:** schematic inspection and editing, readable generated schematics (signal flow left to right, power symbols, wires), reviewing and tidying existing schematics, ERC, netlist export, verified demo circuits, KiCad 10 through the schematic file, and a one-step installer
 - **Now (also):** parts, footprints, and BOM review and export
 - **Now (also):** reading, DRC, rendering, and reviewing boards, and updating a board from its schematic
-- **Next (planned, see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)):** board outline, placement, and routing; then manufacturing outputs
+- **Now (also):** board outline, placement, routing, pours, and autorouting (optional, with Freerouting)
+- **Now (also):** manufacturing outputs (Gerbers, drill, BOM and placement files, STEP) with checks before export, and a mechanical summary of the board
+- **Next:** see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)
 - **Also open:** hierarchical schematics
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 

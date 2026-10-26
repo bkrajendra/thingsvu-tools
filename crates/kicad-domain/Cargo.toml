@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mech-model = { path = "../mech-model" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

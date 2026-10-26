@@ -16,7 +16,8 @@ use kicad_domain::{ErrorCode, MutationState, Nm, Point, Rect, ToolError};
 use kicad_ipc::proto::kiapi::board::commands::{BoardFlipDirection, FlipItems, FlipItemsResponse};
 use kicad_ipc::proto::kiapi::board::types::{
     BoardGraphicShape, BoardLayer, BoardText, BoardTextBox, DrillProperties, Field, FieldId, Footprint,
-    FootprintInstance, Net, Pad, PadStack, PadStackLayer, PadStackShape, PadStackType, Track, Via, ViaType, Zone,
+    FootprintAttributes, FootprintInstance, Net, Pad, PadStack, PadStackLayer, PadStackShape, PadStackType, Track, Via,
+    ViaType, Zone,
 };
 use kicad_ipc::proto::kiapi::common::commands::{
     BeginCommit, BeginCommitResponse, CommitAction, CreateItems, CreateItemsResponse, DeleteItems, EndCommit, GetItems,
@@ -506,6 +507,14 @@ fn new_instance(definition: Footprint, reference: &str, value: &str, reference_b
             BoardLayer::BlFFab,
         ),
         definition: Some(definition),
+        // As the library marks a mounting hole: no position file or BOM line, and no part in the
+        // schematic (so an update from the schematic keeps it).
+        attributes: Some(FootprintAttributes {
+            not_in_schematic: true,
+            exclude_from_position_files: true,
+            exclude_from_bill_of_materials: true,
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }

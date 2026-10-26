@@ -72,6 +72,8 @@ flowchart LR
     session --> runner
     session --> domain
     sexpr["kicad-sexpr"] --> domain
+    mcp --> sexpr
+    domain --> mech["mech-model"]
     ipc["kicad-ipc"]
     runner["kicad-cli-runner"]
     domain["kicad-domain"]
@@ -84,11 +86,12 @@ flowchart LR
 |---|---|---|
 | `kicad-domain` | Circuit spec, validation, geometry, plans and their operations, the layout engine and its readability checks, the tidy planner, the arrange planner, and the router for existing designs, capability and result types | Depend on a transport, KiCad, or the file system |
 | `kicad-ipc` | KiCad's protobuf API (vendored protos), the NNG `ipc` transport written in Rust, request deadlines, status mapping | Leak protobuf types upward |
-| `kicad-cli-runner` | Finds KiCad installs; runs `kicad-cli` with fixed argument arrays (ERC, netlist, PNG); parses reports | Use a shell, or treat exit code 0 as proof of correctness |
+| `kicad-cli-runner` | Finds KiCad installs; runs `kicad-cli` with fixed argument arrays (ERC, DRC, netlist, PNG, Gerbers, drill, positions, STEP, plots, Gerber read-back) and Freerouting; parses reports | Use a shell, or treat exit code 0 as proof of correctness |
 | `kicad-sexpr` | Parses KiCad files keeping source positions; reads symbol libraries and schematics; writes a plan into a schematic by editing only the text the plan names (inserting new items, deleting old ones, changing a symbol's numbers) | Re-print a file; change its format version |
 | `kicad-session` | `Session` (headless or gui, over the API), `FileSession`, and `AnySession` over both; capability probing; applying a plan and verifying it; the editor registry | Fall back to another backend after KiCad rejected a request |
 | `kicad-ai-mcp` | The MCP tools, plan store, idempotency, result envelopes, logging | Write anything but MCP messages to stdout |
 | `kicad-ai-plugin` | Runs when the user presses the toolbar button; registers the editor | Serve requests; stay running |
+| `mech-model` | The board as a neutral mechanical model (outline, holes, keep-outs, connectors, heights), millimetres, versioned | Depend on KiCad or any other crate here |
 
 ## Sessions
 
@@ -243,7 +246,7 @@ flowchart LR
     APPLY --> EXPORT["bom_export<br/>CSV via kicad-cli<br/>generic or JLCPCB"]
 ```
 
-### Boards (Phases 11 and 12)
+### Boards (Phases 11 to 13)
 
 A board is a second kind of session, with its own tools (`pcb_*`) and its own model. One board model (footprints with placed pads, tracks, vias, zones, outline, nets) is filled from a live KiCad (the headless server or the PCB editor, through the API) or from the `.kicad_pcb` file (KiCad 10 or 11). DRC and the 3D render run through `kicad-cli` on a snapshot of the live board. The review compares the board with the schematic next to it. Updating the board uses KiCad's own netlist import: a dry run is the plan, and applying it is read back and compared with the netlist.
 
@@ -277,11 +280,31 @@ flowchart LR
     DSN --> FR["Freerouting (optional,<br/>own process, no network)"]
     FR -->|"session (.ses)"| AUTO["pcb_autoroute_plan<br/>summary per net"]
     AUTO -->|"ImportSpecctraSession"| LIVE
-    APPLYE -->|"every plan but a move"| DRCBA
-    DRCBA -->|"problems"| ROLL["Rollback<br/>snapshot restored,<br/>board read again"]["DRC before and after<br/>unrouted count, no new errors"]
+    APPLYE -->|"every plan but a move"| DRCBA["DRC before and after<br/>unrouted count, no new errors"]
+    DRCBA -->|"problems"| ROLL["Rollback<br/>snapshot restored,<br/>board read again"]
     EDIT --> APPLYE["pcb_apply_plan<br/>one commit: shapes, holes,<br/>flips, footprints moved<br/>with every item"]
     APPLYE --> LIVE
     APPLYE -->|"read back"| VERIFY["verify_edit<br/>outline, places, turns,<br/>sides, locks, pads, nets"]
+```
+
+### Manufacturing outputs (Phase 13)
+
+`pcb_export` and `pcb_fab_package` work on one snapshot of the board (the live board saved as a copy, or the file itself), so the checks, the outputs, and their read-back all see the same board. What the board model leaves out (the `Edge.Cuts` shapes, silkscreen extents, drilled holes, rule areas, footprint attributes, fields, and 3D models, the board thickness) is read from that copy by `kicad-sexpr::fab`. The checks (`kicad-domain::fab`) come first; a failed one stops the export unless the user accepts it, and the acceptance is written to the checks report. The outputs are made by `kicad-cli` into a scratch folder, read back (the Gerber job file for the layer count and outline, `kicad-cli gerber info --strict` for every Gerber and drill file, the drill hits against the board's holes, the placement rows against the parts, the zips reopened) and only then copied into the project. `pcb_mechanical_info` turns the same facts into the neutral `mech-model`, which has no KiCad types, for the enclosure tools to come.
+
+```mermaid
+flowchart LR
+    BOARD["Board session<br/>live or file"] -->|"snapshot"| COPY[".kicad_pcb copy"]
+    COPY --> FACTS["kicad-sexpr::fab<br/>edges, silkscreen, holes,<br/>rule areas, attributes"]
+    COPY -->|"kicad-cli pcb drc"| DRC["DRC summary"]
+    SCH["Schematic file"] -->|"BOM"| CHECKS
+    FACTS --> CHECKS["Pre-export checks<br/>outline closed, DRC,<br/>BOM lines, silkscreen"]
+    DRC --> CHECKS
+    CHECKS -->|"a failure, not accepted"| STOP["Nothing written;<br/>failures returned"]
+    CHECKS -->|"pass, or accepted"| OUT["kicad-cli pcb export<br/>gerbers, drill, pos, step,<br/>pdf, svg; sch export bom"]
+    OUT --> BACK["Read back<br/>job file, gerber info --strict,<br/>holes, parts, zips"]
+    BACK -->|"all as expected"| PROJ[("fab folder<br/>files, zips,<br/>checks report")]
+    FACTS --> MECH["kicad-domain::mechanical"]
+    MECH --> MODEL["mech-model<br/>outline, holes, keep-outs,<br/>connectors, heights"]
 ```
 
 How the three providers apply it:

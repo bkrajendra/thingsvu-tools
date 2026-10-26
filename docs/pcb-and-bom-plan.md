@@ -1,6 +1,6 @@
 # Plan: parts, footprints, BOM, and PCB tools
 
-Status: Phases 10 (v0.5.0) and 11 (v0.6.0) **done**; Phase 12 (v0.7.0) **done** (12.9, KiCad 10 board editing, left out as decided in D3); Phase 13 planned, not started (written 25 Oct 2026, after Phase 9). The task lists are in [tasks.md](tasks.md), Phases 10 to 13. This page holds the reasoning: what we are building, what KiCad lets us do, what we will not do, and the decisions that need the project owner's review.
+Status: Phases 10 (v0.5.0) and 11 (v0.6.0) **done**; Phase 12 (v0.7.0) **done** (12.9, KiCad 10 board editing, left out as decided in D3); Phase 13 (v0.8.0) **done** (written 25 Oct 2026, after Phase 9). The task lists are in [tasks.md](tasks.md), Phases 10 to 13. This page holds the reasoning: what we are building, what KiCad lets us do, what we will not do, and the decisions that need the project owner's review.
 
 ## Goal
 
@@ -97,11 +97,11 @@ Optional, only if asked: KiCad 10 board editing through `kicad-sexpr` (D3).
 
 ## Phase 13: manufacturing outputs and the mechanical exchange (v0.8.0)
 
-Tools: `pcb_export` (Gerbers, drill, position file, STEP, SVG and PDF plots, with the board's layer set), `fab_package` (a JLCPCB-style zip: Gerbers, drill, BOM, placement; written into the project, not uploaded), and `pcb_mechanical_info`, the neutral exchange model from the design plan (§16.1): board outline, mounting holes, keep-outs, connector positions and facing, component heights, and the STEP path. That model lives in its own crate so a later enclosure tool can consume it without depending on KiCad types.
+Tools: `pcb_export` (Gerbers, drill, position file, STEP, SVG and PDF plots, with the board's layer set), `pcb_fab_package` (a JLCPCB-style zip: Gerbers, drill, BOM, placement; written into the project, not uploaded), and `pcb_mechanical_info`, the neutral exchange model from the design plan (§16.1): board outline, mounting holes, keep-outs, connector positions and facing, component heights, and the STEP path. That model lives in its own crate so a later enclosure tool can consume it without depending on KiCad types.
 
 Checks before export: DRC clean (or the failures listed and the user's confirmation recorded), every footprint has a BOM line, silkscreen text inside the board, and the outline closed.
 
-Exit: from the 555 board, produce a package that KiCad's own Gerber viewer opens, with the right layer count and drill file, and a mechanical summary that matches the board.
+Exit: from the 555 board, produce a package that KiCad's own Gerber viewer opens, with the right layer count and drill file, and a mechanical summary that matches the board. (Done on the regulator board, the project's board fixture: see tasks.md 13.5.)
 
 ## Risks
 
