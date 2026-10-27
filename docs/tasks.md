@@ -439,3 +439,85 @@ Known limits (Phase 13): exports were tried live on the headless provider only (
 ### Carried over, not scheduled
 
 - 9.9 Text angle after a part is turned; boxes that follow their parts; the two unexplained tidy removals; 7.10 re-pin to KiCad 11.0 when released; 7.11 one s-expression parser; hierarchical sheets, global labels, and multi-unit symbols for the schematic tools.
+
+## Phases 14 to 16 — Closing the gaps found in a full board session (planned)
+
+Plan and reasoning, including what already covers some gaps and the decisions W1 to W5 for review: [workflow-gaps-plan.md](workflow-gaps-plan.md). The gap numbers (#1 to #31) are from that page.
+
+### Phase 14 — Fix what broke, and edit without touching files (v0.9.0)
+
+Exit criteria: each step of the ESP32-S3 session that edited a `.kicad_*` file by hand (rip-up, locking, net classes, no-connects, a pin swap, reloading, backups) can be done with a tool, and the assistant opens no KiCad file itself.
+
+- [ ] **14.0 API probe** — on the pinned build, live: `SetNetClasses`, `SetNetClassAssignments`, `SetBoardDesignRules`, `SetCustomDesignRules`, `GetBoardStackup`, `GetDocumentModifiedState`, `RevertDocument`, `RefreshEditor`, `GetConnectedItems`, `GetTextExtents`, `GetPadShapeAsPolygon`, `SetPageSettings`, `SetTitleBlockInfo`; deleting, re-widening, and locking tracks and vias through `DeleteItems` and `UpdateItems`. Record each in the API notes as handled, unhandled, or different.
+- [ ] **14.1 Bug fixes and limits** —
+  - `sch_plan_changes` writes a component's `fields` to the placed symbol (hidden), and the read-back checks them (#11). A field it cannot write is refused, never dropped.
+  - DRC results are summaries:
+    - `pcb_run_drc` takes `summary_only`, `severity`, `types`, and `limit`.
+    - Every `pcb_apply_plan` returns counts by type, before and after, and lists only the violations that are new (#17).
+  - The DRC after an apply refills zones first (`kicad-cli pcb drc --refill-zones` on the snapshot) (#21).
+  - Autorouting keeps the board's minimum track width: it is written into the DSN rules, and a plan with narrower tracks is refused or widened and checked again. Dangling vias are removed after the import (#20).
+  - Circuit plans and the tidy take up to 150 parts, after measuring run time and readability on a 150-part circuit (W2). Power flags are not counted as parts, and the tidy keeps no-connect flags instead of refusing the sheet (#13, #14).
+- [ ] **14.2 `pcb_track_edit_plan`** (#1) —
+  - Delete tracks and vias by net, area, layer, or id. Locked items are deleted only when named.
+  - Change track width.
+  - Lock and unlock.
+  - Clean up: dangling vias, zero-length and duplicate tracks.
+  - `pcb_route_plan` gains `locked`.
+  - The plan lists every item touched, per net. Applied in one commit, read back, with DRC before and after.
+- [ ] **14.3 `pcb_rules_plan`** (#3) —
+  - Net classes: width, clearance, via size and drill, diff pair width and gap.
+  - Net-to-class assignments, by name or pattern.
+  - Board minimums: track, via, hole, hole-to-hole, edge clearance.
+  - Solder mask and paste margins.
+  - `pcb_rules` reads all of the above, plus the stackup.
+  - Through the API in live sessions. The file provider edits only these keys of `.kicad_pro`, checked with `kicad-cli` DRC before the file is replaced (W4).
+- [ ] **14.4 Board geometry** (#6) —
+  - `pcb_list_footprints` gains `detail: full`: pad size, shape, drill, angle; the courtyard outline; fields and text with layer, size, place, and visibility.
+  - New `pcb_list_drawings`: board drawings and text.
+- [ ] **14.5 Session freshness** (#24, #25) —
+  - `session_status` and `pcb_info` report whether the editor has unsaved changes and whether the file on disk changed since the session read it.
+  - `pcb_reload` / `session_reload`: a headless session reopens; a gui session reverts only with `discard_unsaved: true`, after reporting what would be lost (W3).
+  - `read_only: true` on the file provider opens a file an editor has locked, for reading only.
+- [ ] **14.6 Checkpoints** (#26) — `checkpoint_create`, `checkpoint_list`, `checkpoint_diff`, and `checkpoint_restore`.
+  - They cover the project's `.kicad_pcb`, `.kicad_sch`, and `.kicad_pro`, kept in `.thingsvu/checkpoints/` in the project.
+  - The diff is semantic: parts, nets, tracks, zones, rules.
+  - Restore refuses while an editor has unsaved changes, and takes a checkpoint first.
+  - Board edits that may delete things (14.2) offer a checkpoint in their plan.
+- [ ] **14.7 Schematic gaps** —
+  - Circuit plans take `no_connects` (pins) and power flags on a named net, placed at that net (#7, #8).
+  - `sch_pin_net_plan` moves one pin to another net, or swaps two pins' nets, redrawing only those pins' wires and labels (#9).
+  - `sym_search` / `sym_get` find symbols by name, keyword, or description, and return a symbol's pins, units, default footprint, and footprint filters without placing it (#12).
+- [ ] **14.8 Tests, docs, release** — domain tests for each planner; live tests on the headless provider that replay the ESP32-S3 session's steps on a fixture board; tool descriptions that say when to use which tool (so `pcb_route_plan`, `sch_set_fields_plan`, `bom_review`, and `pcb_fab_package` are found); README, architecture, capability matrix; v0.9.0.
+
+### Phase 15 — Finishing a board (v0.10.0)
+
+Exit criteria: a board with a ground pour on both layers, stitching vias, a silkscreen with no overlaps, and its USB connector updated from the library, made and checked with tools only.
+
+- [ ] **15.1 `sch_page_plan`** — page size (A4 to A0, or custom) and title block fields (#10).
+- [ ] **15.2 `pcb_footprint_edit_plan`** — a pad's drill, size, and zone connection; reference and value text layer, size, place, and visibility (#2, #4).
+- [ ] **15.3 `pcb_footprint_update_plan`** — replace footprints from the library: one, or every `lib_footprint_mismatch`. Place, side, fields, and pad nets are kept, and every pad is read back (#2).
+- [ ] **15.4 Silkscreen** —
+  - `pcb_silk_plan` adds board text (pin labels, version) on silkscreen or copper.
+  - A silkscreen tidy moves overlapping or off-board references, using KiCad's real text extents (`GetTextExtents`) in place of the Phase 13 estimate (#5).
+- [ ] **15.5 Zones and stitching** (#4) —
+  - Per-pad connection overrides in `pcb_zone_plan`.
+  - Islands reported after every refill, and removable.
+  - `pcb_stitch_plan` places a grid, or a row along the edge, of ground vias clear of pads, tracks, and the edge.
+- [ ] **15.6 `pcb_connectivity`** — for each net, its isolated pockets and the pads, tracks, vias, and zone pieces in each (#27).
+- [ ] **15.7 Autoroute control** —
+  - `nets` and `exclude_nets`, and per-net widths through net classes in the DSN (#19).
+  - The time limit always ends the whole process tree, and the hang is reported (#22).
+- [ ] **15.8 Renders and exports** —
+  - `pcb_render` gains a perspective view, `rotate`, and `zoom`.
+  - `sch_render` crops to the parts, takes a size or zoom, and works from a snapshot when the file is locked (#16).
+  - `pcb_export` gains `ipc2581`, `odb`, and `netlist` (IPC-D-356); `pcb_fab_package` gains a `pcbway` preset (#15, #18).
+- [ ] **15.9 Tests, docs, release** — v0.10.0.
+
+### Phase 16 — Signal integrity and layout checks (later; each planned on its own)
+
+- [ ] **16.1 Differential pairs** — route a pair together at its class's gap and report the length mismatch; length matching with meanders (#28).
+- [ ] **16.2 Impedance** — trace width and gap from the stackup (microstrip and stripline formulas, labelled approximate), checked against a target per net class (#28, W5).
+- [ ] **16.3 Layout checks in `pcb_review`** — the return path under signals (gaps in the ground plane), stitching density, and power track width against a current the user gives (IPC-2152) (#29).
+- [ ] **16.4 Whole-BOM recipe** — `bom_review` lookups in one batch, answered by the assistant's parts tool and recorded with one `sch_set_fields_plan`. Documented as a workflow; no network in the server (#30, W1).
+
+Not planned: #23 (the separate Freerouting MCP server is another project) and #31 (a third-party parts-search server's unit bug; report it to its maintainers).

@@ -341,7 +341,7 @@ How releases are made: [releasing](docs/releasing.md).
 - **Now (also):** reading, DRC, rendering, and reviewing boards, and updating a board from its schematic
 - **Now (also):** board outline, placement, routing, pours, and autorouting (optional, with Freerouting)
 - **Now (also):** manufacturing outputs (Gerbers, drill, BOM and placement files, STEP) with checks before export, and a mechanical summary of the board
-- **Next:** see [docs/pcb-and-bom-plan.md](docs/pcb-and-bom-plan.md)
+- **Next (Phases 14 to 16, see [docs/workflow-gaps-plan.md](docs/workflow-gaps-plan.md)):** track editing and rip-up, net classes and design rules, reloading and checkpoints, schematic no-connects and pin swaps, footprint and silkscreen edits, stitching and connectivity checks
 - **Also open:** hierarchical schematics
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow
 
