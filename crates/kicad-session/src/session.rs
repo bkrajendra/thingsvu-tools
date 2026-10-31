@@ -72,6 +72,13 @@ pub struct SessionStatus {
     pub server_pid: Option<u32>,
     pub connected: bool,
     pub unsaved_changes: Option<bool>,
+    /// Has the file on disk changed since this session read or saved it? If so, the document this
+    /// session holds is not the file's; `session_reload` takes the file's.
+    pub file_changed_on_disk: Option<bool>,
+    /// Opened for reading only (a file session on a file an editor may have open).
+    pub read_only: bool,
+    /// What to do about it, when something is stale.
+    pub freshness_note: Option<String>,
     pub cli: Option<String>,
     pub capabilities: CapabilitySet,
 }
@@ -86,6 +93,8 @@ pub struct Session {
     capabilities: CapabilitySet,
     cli: Option<KicadInstall>,
     pub(crate) inner: Mutex<Inner>,
+    /// When the file was last read or written by this session.
+    pub(crate) freshness: crate::freshness::Freshness,
 }
 
 /// Everything that talks to KiCad sits behind one lock, so requests are strictly serialized.
@@ -123,6 +132,11 @@ pub(crate) fn lock_file(path: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn check_target(target: &OpenTarget) -> Result<PathBuf, ToolError> {
+    check_target_with(target, false)
+}
+
+/// As `check_target`; with `allow_locked` a file an editor has open may be opened (for reading).
+pub(crate) fn check_target_with(target: &OpenTarget, allow_locked: bool) -> Result<PathBuf, ToolError> {
     let (OpenTarget::Existing(path) | OpenTarget::New(path)) = target;
     let path = std::path::absolute(path).map_err(|e| ToolError::new(ErrorCode::InvalidArgument, e.to_string()))?;
     if path.extension().and_then(|e| e.to_str()) != Some("kicad_sch") {
@@ -139,11 +153,11 @@ pub(crate) fn check_target(target: &OpenTarget) -> Result<PathBuf, ToolError> {
                     format!("{} does not exist", path.display()),
                 ));
             }
-            if lock_file(&path).is_some_and(|l| l.exists()) {
+            if !allow_locked && lock_file(&path).is_some_and(|l| l.exists()) {
                 return Err(ToolError::new(
                     ErrorCode::DocumentOpenElsewhere,
                     format!(
-                        "{} is open in a KiCad editor (lock file present); close it there first",
+                        "{} is open in a KiCad editor (lock file present); close it there first, or open it with read_only: true",
                         path.display()
                     ),
                 ));
@@ -257,6 +271,7 @@ impl Session {
             provider: Provider::Headless,
             kicad_version: report.kicad_version,
             fingerprint: report.instance_token.as_deref().map(fingerprint),
+            freshness: crate::freshness::Freshness::new(&document_path),
             document_path,
             document,
             capabilities,
@@ -364,6 +379,7 @@ impl Session {
             provider: Provider::Gui,
             kicad_version: report.kicad_version,
             fingerprint: Some(fingerprint(&registration.token)),
+            freshness: crate::freshness::Freshness::new(&document_path),
             document_path,
             document,
             capabilities,
@@ -441,6 +457,7 @@ impl Session {
         } else {
             None
         };
+        let changed = self.freshness.changed(&self.document_path);
         SessionStatus {
             session_id: self.id.clone(),
             provider: self.provider,
@@ -450,9 +467,91 @@ impl Session {
             server_pid: inner.server.as_ref().and_then(|s| s.pid()),
             connected,
             unsaved_changes: unsaved,
+            file_changed_on_disk: changed,
+            read_only: false,
+            freshness_note: match (changed, unsaved) {
+                (Some(true), Some(true)) => Some(
+                    "the file on disk changed and the open document has unsaved changes too; session_reload with \
+                     discard_unsaved: true takes the file's and drops the unsaved changes"
+                        .to_owned(),
+                ),
+                (Some(true), _) if self.provider == Provider::Gui => Some(
+                    "the file on disk changed (the editor saved it, or another program wrote it); the editor's document is what this session reads"
+                        .to_owned(),
+                ),
+                (Some(true), _) => Some(
+                    "the file on disk changed after this session loaded the document, so what it reads is not the file's; \
+                     session_reload takes the file's"
+                        .to_owned(),
+                ),
+                _ => None,
+            },
             cli: self.cli.as_ref().map(|c| c.cli.display().to_string()),
             capabilities: self.capabilities.clone(),
         }
+    }
+
+    /// Reads the document from its file again. With unsaved changes it refuses unless
+    /// `discard_unsaved`, and says what would be lost.
+    pub async fn reload(&self, discard_unsaved: bool) -> Result<crate::freshness::ReloadReport, ToolError> {
+        use kicad_ipc::proto::kiapi::common::commands::RevertDocument;
+        if !self.capabilities.is_available(Capability::DocumentLifecycle) {
+            return Err(ToolError::new(
+                ErrorCode::FeatureUnavailable,
+                "this session cannot reload the document",
+            ));
+        }
+        let changed = self.freshness.changed(&self.document_path);
+        let live = self.design().await?;
+        let on_disk = std::fs::read_to_string(&self.document_path)
+            .ok()
+            .and_then(|t| kicad_sexpr::Document::parse(t).ok())
+            .map(|d| d.design());
+        let dropped = on_disk
+            .as_ref()
+            .map(|disk| kicad_domain::changes::describe_design_changes(disk, &live))
+            .unwrap_or_default();
+        let mut inner = self.inner.lock().await;
+        let unsaved = Self::unsaved_changes(&mut inner, &self.document).await;
+        if unsaved != Some(false) && !discard_unsaved {
+            let what = if dropped.is_empty() {
+                "the editor reports unsaved changes".to_owned()
+            } else {
+                dropped.join("; ")
+            };
+            return Err(ToolError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "reloading would drop the document's unsaved changes ({what}); save first (sch_save), or pass discard_unsaved: true"
+                ),
+            ));
+        }
+        inner
+            .client
+            .call_any(&RevertDocument {
+                document: Some(self.document.clone()),
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        let after = Self::unsaved_changes(&mut inner, &self.document).await;
+        drop(inner);
+        if after == Some(true) {
+            return Err(ToolError::new(
+                ErrorCode::KicadError,
+                "KiCad still reports unsaved changes after the reload",
+            ));
+        }
+        self.freshness.reset(&self.document_path);
+        let design = self.design().await?;
+        Ok(crate::freshness::ReloadReport {
+            reloaded: true,
+            provider: self.provider,
+            had_unsaved_changes: unsaved,
+            file_changed_on_disk: changed,
+            dropped: if unsaved == Some(true) { dropped } else { vec![] },
+            counts_after: design_counts(&design),
+            note: "the document is the file's now; plans made before the reload are stale".into(),
+        })
     }
 
     /// Ends the session. A headless session stops its server and refuses while there are unsaved
@@ -481,6 +580,16 @@ impl Session {
         tracing::info!(session = %self.id, discarded = unsaved == Some(true), "session closed");
         Ok(unsaved == Some(true))
     }
+}
+
+/// What a schematic holds, in a few counts.
+pub(crate) fn design_counts(d: &kicad_domain::SchematicDesign) -> std::collections::BTreeMap<&'static str, usize> {
+    std::collections::BTreeMap::from([
+        ("symbols", d.symbols.len()),
+        ("wires", d.wires.len()),
+        ("labels", d.labels.len()),
+        ("junctions", d.junctions.len()),
+    ])
 }
 
 /// Compares paths the way the file system does (case-insensitively on Windows).

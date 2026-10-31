@@ -126,6 +126,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_open",
             "pcb_outline_plan",
             "pcb_place_plan",
+            "pcb_reload",
             "pcb_render",
             "pcb_review",
             "pcb_route_plan",
@@ -161,6 +162,7 @@ async fn lists_tools_and_returns_envelopes() {
             "session_close",
             "session_list_documents",
             "session_open",
+            "session_reload",
             "session_status"
         ]
     );
@@ -3310,6 +3312,318 @@ async fn live_design_rules_are_planned_applied_and_read_back() {
     assert_eq!(blocked["error"]["code"], "DOCUMENT_OPEN_ELSEWHERE", "{blocked}");
     std::fs::remove_file(&lock).unwrap();
     mcp.call("pcb_close", json!({ "session_id": fid })).await;
+}
+
+/// Phase 14.5: a session says when the file on disk changed under it and when it holds unsaved
+/// changes; a reload takes the file's version, refusing to drop changes unless told, and listing
+/// them; a file session can be opened read-only on a file an editor has open.
+#[tokio::test]
+async fn live_board_freshness_and_reload() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("fresh", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-fresh-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    assert_eq!(opened["result"]["file_changed_on_disk"], false, "{opened}");
+    assert_eq!(opened["result"]["unsaved_changes"], false, "{opened}");
+    assert_eq!(opened["result"]["read_only"], false);
+
+    // Another program changes the file: a line on Edge.Cuts.
+    let text = std::fs::read_to_string(&pcb).unwrap();
+    let cut = text.rfind(')').unwrap();
+    let edited = format!(
+        "{}\t(gr_line (start 1 1) (end 9 9) (stroke (width 0.1) (type solid)) (layer \"Edge.Cuts\") (uuid \"11111111-1111-4111-8111-111111111111\"))\n)\n",
+        &text[..cut]
+    );
+    std::fs::write(&pcb, edited).unwrap();
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(info["result"]["status"]["file_changed_on_disk"], true, "{info}");
+    assert!(
+        info["result"]["status"]["freshness_note"]
+            .as_str()
+            .unwrap()
+            .contains("pcb_reload"),
+        "{info}"
+    );
+    let status = mcp.call("session_status", json!({})).await;
+    assert_eq!(status["result"]["boards"][0]["file_changed_on_disk"], true, "{status}");
+    let stale = mcp.call("pcb_list_drawings", json!({ "session_id": id })).await;
+    assert_eq!(
+        stale["result"]["shapes_matching"], 0,
+        "the session still has the old board: {stale}"
+    );
+
+    // A plan made now is dropped by the reload.
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 30, "height_mm": 20, "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(outline["ok"], true, "{outline}");
+    let reloaded = mcp.call("pcb_reload", json!({ "session_id": id })).await;
+    assert_eq!(reloaded["ok"], true, "{reloaded}");
+    assert_eq!(reloaded["result"]["file_changed_on_disk"], true, "{reloaded}");
+    assert_eq!(reloaded["result"]["had_unsaved_changes"], false, "{reloaded}");
+    assert_eq!(reloaded["result"]["counts_after"]["drawings"], 1, "{reloaded}");
+    let fresh = mcp.call("pcb_list_drawings", json!({ "session_id": id })).await;
+    assert_eq!(fresh["result"]["shapes_matching"], 1, "the file's board: {fresh}");
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(info["result"]["status"]["file_changed_on_disk"], false, "{info}");
+    let gone = apply_board(&mut mcp, &id, &outline, &key("old-plan")).await;
+    assert_eq!(gone["ok"], false, "a plan from before the reload is gone: {gone}");
+
+    // An unsaved change: the reload refuses and says what it would lose.
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 30, "height_mm": 20, "origin": { "x_mm": 100, "y_mm": 80 },
+                    "replace": true, "mounting_holes": "corners" }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(info["result"]["status"]["unsaved_changes"], true, "{info}");
+    let refused = mcp.call("pcb_reload", json!({ "session_id": id })).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    println!("RELOAD REFUSED: {message}");
+    assert!(
+        message.contains("footprint") && message.contains("discard_unsaved"),
+        "{refused}"
+    );
+    let drawings_before =
+        mcp.call("pcb_list_drawings", json!({ "session_id": id })).await["result"]["shapes_matching"].clone();
+    let dropped = mcp
+        .call("pcb_reload", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
+    assert_eq!(dropped["ok"], true, "{dropped}");
+    assert_eq!(dropped["result"]["had_unsaved_changes"], true, "{dropped}");
+    assert!(
+        !dropped["result"]["dropped"].as_array().unwrap().is_empty(),
+        "{dropped}"
+    );
+    let after = mcp.call("pcb_list_drawings", json!({ "session_id": id })).await;
+    assert_eq!(
+        drawings_before, 1,
+        "the outline replaced the file's line: {drawings_before}"
+    );
+    assert_eq!(
+        after["result"]["shapes"][0]["kind"], "line",
+        "the file's line is back, the unsaved outline is gone: {after}"
+    );
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(info["result"]["status"]["unsaved_changes"], false, "{info}");
+    mcp.call("pcb_close", json!({ "session_id": id })).await;
+
+    // A file session opened read-only works while an editor has the board open, and writes nothing.
+    let lock = std::path::Path::new(&pcb).with_file_name(format!(
+        "~{}.lck",
+        std::path::Path::new(&pcb).file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&lock, "{}").unwrap();
+    // A project file for the rules plan below to refuse to change.
+    std::fs::write(
+        std::path::Path::new(&pcb).with_extension("kicad_pro"),
+        r#"{"board":{"design_settings":{"rules":{"min_clearance":0.0}}},"net_settings":{"classes":[{"name":"Default","clearance":0.2,"track_width":0.2,"priority":2147483647}],"meta":{"version":5},"netclass_assignments":{},"netclass_patterns":[]}}"#,
+    )
+    .unwrap();
+    let bad = mcp
+        .call(
+            "pcb_open",
+            json!({ "pcb_path": pcb, "provider": "headless", "read_only": true }),
+        )
+        .await;
+    assert_eq!(bad["ok"], false, "read_only is for the file provider: {bad}");
+    let ro = mcp
+        .call(
+            "pcb_open",
+            json!({ "pcb_path": pcb, "provider": "file", "read_only": true }),
+        )
+        .await;
+    assert_eq!(ro["ok"], true, "{ro}");
+    assert_eq!(ro["result"]["read_only"], true, "{ro}");
+    let rid = ro["result"]["session_id"].clone();
+    let read = mcp.call("pcb_list_footprints", json!({ "session_id": rid })).await;
+    assert_eq!(read["result"]["count"], 11, "{read}");
+    let plan = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": rid, "minimums": { "copper_edge_mm": 0.3 } }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    std::fs::remove_file(&lock).unwrap();
+    let blocked = apply_board(&mut mcp, &rid, &plan, &key("ro")).await;
+    assert_eq!(blocked["error"]["code"], "READ_ONLY_MODE", "{blocked}");
+    let reload = mcp.call("pcb_reload", json!({ "session_id": rid })).await;
+    assert_eq!(reload["ok"], true, "a file session reloads trivially: {reload}");
+    mcp.call("pcb_close", json!({ "session_id": rid })).await;
+}
+
+/// The same for a schematic: a headless session sees the file change and reloads it; a read-only
+/// file session opens a schematic an editor has locked and refuses every change.
+#[tokio::test]
+async fn live_schematic_freshness_reload_and_read_only() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-fresh-sch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("regulator.kicad_sch");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/v11/regulator-with-notes/regulator.kicad_sch"),
+        &schematic,
+    )
+    .unwrap();
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": "headless" }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    assert_eq!(opened["result"]["file_changed_on_disk"], false, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let value_of = |list: &Value, reference: &str| -> String {
+        list["result"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["reference"] == reference)
+            .map(|s| s["value"].as_str().unwrap().to_owned())
+            .unwrap_or_default()
+    };
+    let list = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    let c = list["result"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["value"] == "10uF")
+        .expect("a 10uF part")["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Another program changes the value in the file.
+    let text = std::fs::read_to_string(&schematic).unwrap();
+    std::fs::write(
+        &schematic,
+        text.replacen("(property \"Value\" \"10uF\"", "(property \"Value\" \"22uF\"", 1),
+    )
+    .unwrap();
+    let status = mcp.call("session_status", json!({ "session_id": id })).await;
+    assert_eq!(status["result"]["file_changed_on_disk"], true, "{status}");
+    assert!(
+        status["result"]["freshness_note"]
+            .as_str()
+            .unwrap()
+            .contains("session_reload"),
+        "{status}"
+    );
+    let stale = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert_eq!(value_of(&stale, &c), "10uF", "the session still has the old document");
+
+    let reloaded = mcp.call("session_reload", json!({ "session_id": id })).await;
+    assert_eq!(reloaded["ok"], true, "{reloaded}");
+    assert_eq!(reloaded["result"]["file_changed_on_disk"], true, "{reloaded}");
+    let list = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert_eq!(value_of(&list, &c), "22uF", "the file's value: {list}");
+    let status = mcp.call("session_status", json!({ "session_id": id })).await;
+    assert_eq!(status["result"]["file_changed_on_disk"], false, "{status}");
+
+    // An unsaved change is not dropped without being told.
+    let set = mcp
+        .call(
+            "sch_set_fields_plan",
+            json!({ "session_id": id, "edits": [{ "reference": c, "fields": { "MPN": "X1" } }] }),
+        )
+        .await;
+    assert_eq!(set["ok"], true, "{set}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": set["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("fresh-sch-{}", std::process::id()) }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    let refused = mcp.call("session_reload", json!({ "session_id": id })).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("discard_unsaved"),
+        "{refused}"
+    );
+    let dropped = mcp
+        .call("session_reload", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
+    assert_eq!(dropped["ok"], true, "{dropped}");
+    assert_eq!(dropped["result"]["had_unsaved_changes"], true, "{dropped}");
+    mcp.call("session_close", json!({ "session_id": id })).await;
+
+    // Read-only on a locked file.
+    let lock = dir.join("~regulator.kicad_sch.lck");
+    std::fs::write(&lock, "{}").unwrap();
+    let locked = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": "file" }),
+        )
+        .await;
+    assert_eq!(locked["error"]["code"], "DOCUMENT_OPEN_ELSEWHERE", "{locked}");
+    assert!(
+        locked["error"]["message"].as_str().unwrap().contains("read_only"),
+        "{locked}"
+    );
+    let ro = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": "file", "read_only": true }),
+        )
+        .await;
+    assert_eq!(ro["ok"], true, "{ro}");
+    assert_eq!(ro["result"]["read_only"], true, "{ro}");
+    let rid = ro["result"]["session_id"].clone();
+    let list = mcp.call("sch_list_symbols", json!({ "session_id": rid })).await;
+    assert_eq!(value_of(&list, &c), "22uF", "{list}");
+    let before = std::fs::read_to_string(&schematic).unwrap();
+    let set = mcp
+        .call(
+            "sch_set_field",
+            json!({ "session_id": rid, "symbol": c, "field": "value", "text": "33uF", "confirm": true }),
+        )
+        .await;
+    assert_eq!(set["error"]["code"], "READ_ONLY_MODE", "{set}");
+    assert_eq!(
+        std::fs::read_to_string(&schematic).unwrap(),
+        before,
+        "nothing was written"
+    );
+    let bad = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "provider": "headless", "read_only": true }),
+        )
+        .await;
+    assert_eq!(bad["ok"], false, "{bad}");
+    std::fs::remove_file(&lock).unwrap();
+    mcp.call("session_close", json!({ "session_id": rid })).await;
 }
 
 /// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows

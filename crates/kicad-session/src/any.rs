@@ -101,6 +101,14 @@ impl AnySession {
         }
     }
 
+    /// Reads the document from its file again (see `Session::reload`).
+    pub async fn reload(&self, discard_unsaved: bool) -> Result<crate::freshness::ReloadReport, ToolError> {
+        match self {
+            Self::Ipc(s) => s.reload(discard_unsaved).await,
+            Self::File(s) => s.reload(discard_unsaved).await,
+        }
+    }
+
     pub async fn open_documents(&self) -> Result<Vec<OpenDocument>, ToolError> {
         match self {
             Self::Ipc(s) => s.open_documents().await,

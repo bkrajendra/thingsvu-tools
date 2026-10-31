@@ -10,6 +10,7 @@ pub mod board_detail;
 pub mod board_edit;
 pub mod bom;
 pub mod capability;
+pub mod changes;
 pub mod circuit;
 pub mod connectivity;
 pub mod declutter;

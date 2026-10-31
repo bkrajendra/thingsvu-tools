@@ -27,6 +27,7 @@ use crate::session::{new_session_id, Provider, SessionConfig};
 
 mod detail;
 mod edit;
+mod reload;
 mod rules;
 pub use edit::{BoardSnapshot, EditReport, RestoreReport, SessionImport};
 
@@ -47,7 +48,15 @@ pub struct BoardStatus {
     pub kicad_version: String,
     pub document: PathBuf,
     pub connected: bool,
+    /// Changes in the open board that are not in its file (the editor's own flag for a gui session).
     pub unsaved_changes: Option<bool>,
+    /// Has the file on disk changed since this session read or saved it? If so, the board this
+    /// session holds is not the file's; `pcb_reload` takes the file's.
+    pub file_changed_on_disk: Option<bool>,
+    /// Opened for reading only (a file session whose file an editor may have open).
+    pub read_only: bool,
+    /// What to do about it, when something is stale.
+    pub freshness_note: Option<String>,
     pub server_pid: Option<u32>,
     /// What this session can do, in words.
     pub can: Vec<&'static str>,
@@ -68,6 +77,9 @@ pub struct BoardSession {
     /// A KiCad 11-series CLI for 3D renders, if one is installed.
     render_cli: Option<KicadInstall>,
     ipc: Option<Mutex<Ipc>>,
+    /// When the file was last read or written by this session.
+    freshness: crate::freshness::Freshness,
+    read_only: bool,
 }
 
 fn check_board_path(path: &Path) -> Result<PathBuf, ToolError> {
@@ -149,6 +161,8 @@ impl BoardSession {
             id,
             provider: Provider::Headless,
             kicad_version: version,
+            freshness: crate::freshness::Freshness::new(&path),
+            read_only: false,
             document_path: path,
             render_cli: Some(cli.clone()),
             cli: Some(cli),
@@ -242,6 +256,8 @@ impl BoardSession {
             id,
             provider: Provider::Gui,
             kicad_version: registration.kicad_version.clone(),
+            freshness: crate::freshness::Freshness::new(&document_path),
+            read_only: false,
             document_path,
             cli,
             render_cli,
@@ -270,11 +286,24 @@ impl BoardSession {
             id: new_session_id(),
             provider: Provider::File,
             kicad_version: cli.version.full.clone(),
+            freshness: crate::freshness::Freshness::new(&path),
+            read_only: false,
             document_path: path,
             cli: Some(cli),
             render_cli,
             ipc: None,
         })
+    }
+
+    /// Marks a file session read-only: the board file may be open in an editor, and nothing is
+    /// written to the project either.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn id(&self) -> &str {
@@ -357,6 +386,25 @@ impl BoardSession {
             }
             can.push("update the board from the schematic");
         }
+        let changed = self.freshness.changed(&self.document_path);
+        let freshness_note = match (changed, unsaved, self.provider) {
+            (Some(true), Some(true), _) => Some(
+                "the file on disk changed and the open board has unsaved changes too; pcb_reload with \
+                 discard_unsaved: true takes the file's board and drops the unsaved changes"
+                    .to_owned(),
+            ),
+            (Some(true), _, Provider::File) => Some("the file changed since it was last read; the next read sees it".to_owned()),
+            (Some(true), _, Provider::Gui) => Some(
+                "the file on disk changed (the editor saved it, or another program wrote it); the editor's board is what this session reads"
+                    .to_owned(),
+            ),
+            (Some(true), _, _) => Some(
+                "the file on disk changed after this session loaded the board, so what it reads is not the file's; \
+                 pcb_reload takes the file's board"
+                    .to_owned(),
+            ),
+            _ => None,
+        };
         BoardStatus {
             session_id: self.id.clone(),
             provider: self.provider,
@@ -364,6 +412,9 @@ impl BoardSession {
             document: self.document_path.clone(),
             connected,
             unsaved_changes: unsaved,
+            file_changed_on_disk: changed,
+            read_only: self.read_only,
+            freshness_note,
             server_pid: pid,
             can,
         }
@@ -383,6 +434,7 @@ impl BoardSession {
             })
             .await
             .map_err(|e| from_ipc_error(&e, true))?;
+        self.freshness.reset(&self.document_path);
         Ok(())
     }
 
@@ -569,6 +621,7 @@ impl BoardSession {
                     format!("cannot read {}: {e}", self.document_path.display()),
                 )
             })?;
+            self.freshness.reset(&self.document_path);
             return kicad_sexpr::pcb::read_board(&text)
                 .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the board file: {e}")));
         };

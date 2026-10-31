@@ -102,6 +102,10 @@ pub struct OpenArgs {
     pub create: bool,
     #[serde(default)]
     pub provider: ProviderArg,
+    /// File provider only: open a file that a KiCad editor has open (its lock file is present), for
+    /// reading only. Every tool that would change the file is refused for this session.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1053,7 +1057,7 @@ impl KicadAiServer {
     #[tool(
         name = "session_status",
         description = "List KiCad installs and open sessions, or report one session: KiCad version, document, \
-liveness, unsaved changes, and the capability matrix (which features are available and through which backend)."
+liveness, unsaved changes, whether the file on disk changed since the session read it (file_changed_on_disk, with a note on what to do), and the capability matrix (which features are available and through which backend)."
     )]
     pub async fn session_status(&self, Parameters(args): Parameters<StatusArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1132,7 +1136,7 @@ liveness, unsaved changes, and the capability matrix (which features are availab
 headless provider starts a private KiCad 11 API server owned by this MCP server; the file provider works on \
 the file directly (KiCad 10 or 11, no KiCad running) and checks every change with kicad-cli before it \
 replaces the file; the gui provider drives the editor the user has open. Refuses a file that a KiCad editor \
-has open. Returns the session status, including its capability matrix."
+has open, unless read_only is true (file provider: the file is then read, never written). Returns the session status, including its capability matrix."
     )]
     pub async fn session_open(&self, Parameters(args): Parameters<OpenArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1160,6 +1164,15 @@ has open. Returns the session status, including its capability matrix."
                 } else {
                     OpenTarget::Existing(path)
                 };
+                if args.read_only && !matches!(args.provider, ProviderArg::File) {
+                    return envelope::error(
+                        &cid,
+                        &ToolError::new(
+                            ErrorCode::InvalidArgument,
+                            "read_only is for the file provider (the headless and gui providers have no lock to get around)",
+                        ),
+                    );
+                }
                 if matches!(args.provider, ProviderArg::File) {
                     // A file session writes the new file straight away.
                     if args.create {
@@ -1167,7 +1180,7 @@ has open. Returns the session status, including its capability matrix."
                             return envelope::error(&cid, &e);
                         }
                     }
-                    FileSession::open(&self.state.options.session, &installs, target)
+                    FileSession::open_with(&self.state.options.session, &installs, target, args.read_only)
                         .await
                         .map(AnySession::from)
                 } else {
@@ -1233,6 +1246,25 @@ changes unless discard_unsaved is true."
                     vec![],
                     vec![],
                 )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "session_reload",
+        description = "Read the schematic of the session from its file again: after another program or a version \\ncontrol checkout changed the file, or to drop changes made in the open document. With unsaved changes it \\nrefuses and lists what would be lost; pass discard_unsaved: true to go ahead. Plans made before the \\nreload are dropped. A file session reads the file each time, so there is nothing to drop."
+    )]
+    pub async fn session_reload(&self, Parameters(args): Parameters<CloseArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match session.reload(args.discard_unsaved).await {
+            Ok(report) => {
+                self.state.plans.lock().await.forget_session(&args.session_id);
+                envelope::ok(&cid, report, live(&session), vec![])
             }
             Err(e) => envelope::error(&cid, &e),
         }

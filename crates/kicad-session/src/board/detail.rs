@@ -149,6 +149,7 @@ impl BoardSession {
                     format!("cannot read {}: {e}", self.document_path.display()),
                 )
             })?;
+            self.freshness.reset(&self.document_path);
             return kicad_sexpr::pcb_detail::read_detail(&text)
                 .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the board file: {e}")));
         };

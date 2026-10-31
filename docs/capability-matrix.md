@@ -49,6 +49,7 @@ Board sessions (`pcb_open`) are separate from schematic sessions. They have no p
 | Render (`pcb_render`) | kicad_cli (KiCad 11 only) | kicad_cli (KiCad 11 only) | kicad_cli (KiCad 11 only) |
 | Review (`pcb_review`) | ipc + kicad_cli | ipc + kicad_cli | project_file + kicad_cli |
 | Update from the schematic (`pcb_update_from_schematic_plan`, `pcb_apply_plan`) | ipc (`ImportNetlist`); the board stays unsaved until `pcb_save` | ipc; live in the editor | not available |
+| Reload and freshness (`pcb_reload`, `session_reload`, `file_changed_on_disk`) | `RevertDocument` and the file's time and size | the same; not yet tried in the editor | the file is read each time; `read_only` opens a locked file |
 | Outline, moves, placement, footprint attributes, routing, pours (`pcb_outline_plan`, `pcb_move_plan`, `pcb_footprint_attrs_plan`, `pcb_place_plan`, `pcb_route_plan`, `pcb_track_edit_plan`, `pcb_rules_plan`, `pcb_zone_plan`, `pcb_apply_plan`) | ipc, one commit; unsaved until `pcb_save` | ipc, one commit (one undo step); not yet tried live | not available (D3) |
 | Rollback of a board change that fails its checks | ipc (snapshot and restore, one commit) | ipc (one more undo step) | not applicable |
 | Autoroute (`pcb_autoroute_plan`, optional Freerouting) | kicad_cli export of a snapshot, Freerouting, ipc import | same; not yet tried live | not available |

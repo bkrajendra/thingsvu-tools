@@ -33,6 +33,10 @@ pub struct PcbOpenArgs {
     /// gui: the PCB editor the user has open, after pressing "KiCad AI: connect" there.
     #[serde(default)]
     pub provider: ProviderArg,
+    /// File provider only: the board's editor may have it open; nothing is written to the board or
+    /// its project by this session.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -790,6 +794,12 @@ impl KicadAiServer {
                 &ToolError::new(ErrorCode::InvalidArgument, "pcb_path must be an absolute path"),
             );
         }
+        if args.read_only && !matches!(args.provider, ProviderArg::File) {
+            return envelope::error(
+                &cid,
+                &ToolError::new(ErrorCode::InvalidArgument, "read_only is for the file provider"),
+            );
+        }
         let installs = self.installs().await.to_vec();
         let opened = match args.provider {
             ProviderArg::Headless | ProviderArg::File => {
@@ -803,7 +813,9 @@ impl KicadAiServer {
                     );
                 };
                 if matches!(args.provider, ProviderArg::File) {
-                    BoardSession::open_file(&installs, &path).await
+                    BoardSession::open_file(&installs, &path)
+                        .await
+                        .map(|b| b.with_read_only(args.read_only))
                 } else {
                     BoardSession::open_headless(&self.state.options.session, &installs, &path).await
                 }
@@ -851,6 +863,29 @@ impl KicadAiServer {
                     vec![],
                     vec![],
                 )
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_reload",
+        description = "Read the board from its file again: after another program, a version control checkout, or the \\neditor's own save changed the file, or to drop changes made in the open board. pcb_info and \\nsession_status say when the file changed (file_changed_on_disk). With unsaved changes it refuses and \\nlists what would be lost; pass discard_unsaved: true to go ahead. Plans made before the reload are \\ndropped. A file session reads the file each time. Not saved: the file is never written."
+    )]
+    pub async fn pcb_reload(&self, Parameters(args): Parameters<PcbCloseArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.reload(args.discard_unsaved).await {
+            Ok(report) => {
+                self.state
+                    .pending_updates
+                    .lock()
+                    .await
+                    .retain(|_, p| p.session_id != args.session_id);
+                envelope::ok(&cid, report, board_provenance(&board), vec![])
             }
             Err(e) => envelope::error(&cid, &e),
         }

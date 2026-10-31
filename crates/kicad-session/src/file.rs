@@ -22,9 +22,12 @@ use kicad_sexpr::{
 };
 use tokio::sync::Mutex;
 
+use crate::freshness::{Freshness, ReloadReport};
 use crate::mutate::{verify_nets, ApplyReport, PlacedComponent};
 use crate::schematic::{natural_key, natural_reference, OpenDocument};
-use crate::session::{check_target, lock_file, new_session_id, OpenTarget, Provider, SessionConfig, SessionStatus};
+use crate::session::{
+    check_target_with, design_counts, lock_file, new_session_id, OpenTarget, Provider, SessionConfig, SessionStatus,
+};
 
 /// The newest schematic format a `kicad-cli` of this series reads and writes.
 fn format_of(series: u32) -> u32 {
@@ -165,6 +168,10 @@ pub struct FileSession {
     /// Serializes changes to the file.
     writing: Mutex<()>,
     scratch_counter: AtomicU64,
+    /// When the file was last read or written by this session.
+    freshness: Freshness,
+    /// Opened for reading only: a file an editor has open may be opened, and nothing is written.
+    read_only: bool,
 }
 
 impl FileSession {
@@ -175,7 +182,24 @@ impl FileSession {
         installs: &[KicadInstall],
         target: OpenTarget,
     ) -> Result<Self, ToolError> {
-        let path = check_target(&target)?;
+        Self::open_with(config, installs, target, false).await
+    }
+
+    /// As [`FileSession::open`]; with `read_only` the file may be one an editor has open, and no
+    /// change is ever written to it.
+    pub async fn open_with(
+        config: &SessionConfig,
+        installs: &[KicadInstall],
+        target: OpenTarget,
+        read_only: bool,
+    ) -> Result<Self, ToolError> {
+        if read_only && matches!(target, OpenTarget::New(_)) {
+            return Err(ToolError::new(
+                ErrorCode::InvalidArgument,
+                "read_only cannot create a new schematic",
+            ));
+        }
+        let path = check_target_with(&target, read_only)?;
         let existing_format = match &target {
             OpenTarget::Existing(_) => {
                 let text = std::fs::read_to_string(&path).map_err(|e| io_error("read", &path, e))?;
@@ -219,7 +243,6 @@ impl FileSession {
         let capabilities = file_capabilities(&cli, render_cli.as_ref());
         Ok(Self {
             id: new_session_id(),
-            document_path: path,
             cli,
             render_cli,
             symbol_dir,
@@ -229,6 +252,9 @@ impl FileSession {
             libraries: StdMutex::new(HashMap::new()),
             writing: Mutex::new(()),
             scratch_counter: AtomicU64::new(0),
+            freshness: Freshness::new(&path),
+            read_only,
+            document_path: path,
         })
     }
 
@@ -271,6 +297,10 @@ impl FileSession {
             server_pid: None,
             connected: self.document_path.is_file(),
             unsaved_changes: Some(false),
+            file_changed_on_disk: self.freshness.changed(&self.document_path),
+            read_only: self.read_only,
+            freshness_note: (self.freshness.changed(&self.document_path) == Some(true))
+                .then(|| "the file changed since it was last read; the next read sees it".to_owned()),
             cli: Some(self.cli.cli.display().to_string()),
             capabilities: self.capabilities.clone(),
         }
@@ -279,6 +309,32 @@ impl FileSession {
     /// Nothing is held open, and nothing is ever unsaved.
     pub async fn close(&self, _discard_unsaved: bool) -> Result<bool, ToolError> {
         Ok(false)
+    }
+
+    /// A file session reads the file each time; a reload only notes that the file is read again.
+    pub async fn reload(&self, _discard_unsaved: bool) -> Result<ReloadReport, ToolError> {
+        let changed = self.freshness.changed(&self.document_path);
+        let design = self.read()?.design();
+        Ok(ReloadReport {
+            reloaded: true,
+            provider: Provider::File,
+            had_unsaved_changes: Some(false),
+            file_changed_on_disk: changed,
+            dropped: vec![],
+            counts_after: design_counts(&design),
+            note: "a file session reads the file each time; nothing was held".into(),
+        })
+    }
+
+    fn refuse_if_read_only(&self) -> Result<(), ToolError> {
+        if self.read_only {
+            Err(ToolError::new(
+                ErrorCode::ReadOnlyMode,
+                "this file session was opened read-only (read_only: true); open it again without that to change the schematic",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn open_documents(&self) -> Result<Vec<OpenDocument>, ToolError> {
@@ -291,10 +347,12 @@ impl FileSession {
     }
 
     fn read_bytes(&self) -> Result<Vec<u8>, ToolError> {
+        self.freshness.reset(&self.document_path);
         std::fs::read(&self.document_path).map_err(|e| io_error("read", &self.document_path, e))
     }
 
     fn read(&self) -> Result<Document, ToolError> {
+        self.freshness.reset(&self.document_path);
         let text =
             std::fs::read_to_string(&self.document_path).map_err(|e| io_error("read", &self.document_path, e))?;
         Document::parse(text).map_err(doc_error)
@@ -550,6 +608,7 @@ impl FileSession {
                 "the plan has errors and cannot be applied",
             ));
         }
+        self.refuse_if_read_only()?;
         let _writing = self.writing.lock().await;
         if lock_file(&self.document_path).is_some_and(|l| l.exists()) {
             return Err(ToolError::new(
@@ -704,6 +763,7 @@ impl FileSession {
         field: crate::SymbolField,
         text: &str,
     ) -> Result<SymbolInfo, ToolError> {
+        self.refuse_if_read_only()?;
         let _writing = self.writing.lock().await;
         if lock_file(&self.document_path).is_some_and(|l| l.exists()) {
             return Err(ToolError::new(

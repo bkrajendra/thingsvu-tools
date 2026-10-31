@@ -393,6 +393,7 @@ impl Session {
             })
             .await
             .map_err(|e| from_ipc_error(&e, true))?;
+        self.freshness.reset(self.document_path());
         Ok(())
     }
 

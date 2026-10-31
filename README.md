@@ -237,7 +237,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | Tool | What it does |
 |---|---|
 | `session_status` | KiCad installs found, open sessions, what each can do, and whether the autorouter is set up |
-| `session_open` / `session_close` | Open a schematic (or create one) and close it again |
+| `session_open` / `session_close` / `session_reload` | Open a schematic (or create one), close it again, or read it from its file again after the file changed or to drop changes (refuses with unsaved changes unless told, and lists what would be lost). `read_only: true` opens a file an editor has locked, for reading only. `session_status` says whether the file changed on disk since the session read it |
 | `session_list_documents` | Documents open in the session's KiCad |
 | `sch_list_symbols` / `sch_get_symbol_pins` | Read parts and their pins, positions, and types |
 | `sch_get_netlist` | Connectivity as KiCad's netlister sees it |
@@ -258,7 +258,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `fp_search` / `fp_get` | Search the footprint libraries and read a footprint's pads and courtyard |
 | `sch_footprint_plan` | Check every footprint (missing, not in the libraries, no pad for a pin, wrong package) and assign footprints |
 | `bom_export` | Write the BOM as CSV into the project folder (generic or JLCPCB columns) |
-| `pcb_open` / `pcb_close` / `pcb_save` | Open a board (headless, file, or the PCB editor), close it, save it |
+| `pcb_open` / `pcb_close` / `pcb_save` / `pcb_reload` | Open a board (headless, file, or the PCB editor; `read_only: true` for a file session on a board an editor has open), close it, save it, or read it from its file again (`pcb_info` says when the file changed on disk or the board has unsaved changes; a reload with unsaved changes lists what it would lose and needs `discard_unsaved`) |
 | `pcb_info` / `pcb_list_footprints` / `pcb_get_footprint` / `pcb_list_nets` / `pcb_list_tracks` | Read the board: counts, outline, footprints with pads and courtyards, nets, tracks, vias, zones. `detail: full` (with `references` to narrow it) adds each pad's shape, size, drill, and turn, the courtyard outline, and the footprint's text and fields with layer, size, place, and visibility |
 | `pcb_list_drawings` | The drawings and text on the board itself (not in footprints): lines, rectangles, circles, arcs, polygons, and text, with layer, points, line width, fill, and lock; narrowed by layers and kinds |
 | `pcb_run_drc` / `pcb_render` | Design rules check (zones refilled first; counts by type, with `summary_only`, `severity`, `types`, and `limit` to keep a big board readable; unrouted connections) and a 3D picture of the board |

@@ -471,6 +471,12 @@ impl BoardSession {
                  open the board with a live KiCad 11 session for those",
             ));
         }
+        if self.read_only {
+            return Err(ToolError::new(
+                ErrorCode::ReadOnlyMode,
+                "this file session was opened read-only (read_only: true); open it again without that to change the project file",
+            ));
+        }
         for file in [self.document_path.clone(), self.project_path()] {
             if lock_file(&file).is_some_and(|l| l.exists()) {
                 return Err(ToolError::new(
