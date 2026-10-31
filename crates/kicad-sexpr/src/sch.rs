@@ -4,7 +4,8 @@
 use kicad_domain::schematic::{DesignField, DesignShape, DesignText, ShapeKind};
 use kicad_domain::text::{HAlign, VAlign};
 use kicad_domain::{
-    DesignJunction, DesignLabel, DesignSymbol, DesignWire, Dir, Nm, Orientation, Point, SchematicDesign,
+    DesignJunction, DesignLabel, DesignNoConnect, DesignSymbol, DesignWire, Dir, Nm, Orientation, Point,
+    SchematicDesign,
 };
 
 use crate::node::{parse, Node, ParseError};
@@ -223,9 +224,14 @@ impl Document {
                         design.junctions.push(DesignJunction { id, position });
                     }
                 }
+                "no_connect" => {
+                    if let Some(position) = item.child("at").and_then(point) {
+                        design.no_connects.push(DesignNoConnect { id, position });
+                    }
+                }
                 // Things a person drew with and a tidy cannot redraw around.
-                "no_connect" | "bus" | "bus_entry" | "sheet" | "global_label" | "hierarchical_label"
-                | "directive_label" | "netclass_flag" | "rule_area" | "table" | "group" => {
+                "bus" | "bus_entry" | "sheet" | "global_label" | "hierarchical_label" | "directive_label"
+                | "netclass_flag" | "rule_area" | "table" | "group" => {
                     *design.unsupported.entry(head.to_owned()).or_default() += 1;
                 }
                 // Notes and graphics stay where they are.
@@ -479,7 +485,9 @@ mod tests {
         assert_eq!(design.junctions[0].position, Point::new(Nm(10_000_000), Nm(25_000_000)));
         assert_eq!(design.annotations, 1);
         assert_eq!(design.unsupported.get("global_label"), Some(&1));
-        assert_eq!(design.unsupported.get("no_connect"), Some(&1));
+        assert_eq!(design.no_connects.len(), 1, "a no-connect flag is read, not refused");
+        assert_eq!(design.no_connects[0].position, Point::new(Nm(2_000_000), Nm(2_000_000)));
+        assert!(!design.unsupported.contains_key("no_connect"));
     }
 
     #[test]

@@ -86,6 +86,22 @@ pub struct PcbDrcArgs {
     /// Also compare the board with its schematic (parts, footprints, and nets that differ).
     #[serde(default)]
     pub schematic_parity: bool,
+    /// Counts only (by type and severity), no violation list.
+    #[serde(default)]
+    pub summary_only: bool,
+    /// List only this severity: error, warning, or exclusion.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// List only these violation types, like `clearance` or `shorting_items`.
+    #[serde(default)]
+    pub types: Option<Vec<String>>,
+    /// Most violations to list (default 100, at most 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Refill the zones first, in the copy that is checked (default true), so stale fills do not
+    /// show as clearance errors. The board in the editor is not changed.
+    #[serde(default)]
+    pub refill_zones: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -867,7 +883,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_run_drc",
-        description = "Run the design rules check on the board as it is now (through kicad-cli, on a \\nsnapshot of a live board) and return the counts by type and severity, the violations, and the missing \\nconnections (unrouted). With schematic_parity, also the differences from the schematic. The board's own \\nrules are used. Read-only."
+        description = "Run the design rules check on the board as it is now (through kicad-cli, on a \\nsnapshot of a live board, with the zones refilled first unless refill_zones is false) and return the \\ncounts by type and severity, the violations, and the missing connections (unrouted). A big board can \\nhave hundreds of violations: summary_only gives the counts alone, and severity, types, and limit narrow \\nthe list (the counts stay whole and say how many were left out). With schematic_parity, also the \\ndifferences from the schematic. The board's own rules are used. Read-only."
     )]
     pub async fn pcb_run_drc(&self, Parameters(args): Parameters<PcbDrcArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -875,8 +891,22 @@ impl KicadAiServer {
             Ok(b) => b,
             Err(e) => return envelope::error(&cid, &e),
         };
-        match self.run_drc(&cid, &board, args.schematic_parity).await {
-            Ok(report) => envelope::ok(&cid, self.hinted(drc_json(&report)), board_provenance(&board), vec![]),
+        let view = DrcView {
+            summary_only: args.summary_only,
+            severity: args.severity.clone(),
+            types: args.types.clone().unwrap_or_default(),
+            limit: args.limit.unwrap_or(100).min(1000),
+        };
+        match self
+            .run_drc(&cid, &board, args.schematic_parity, args.refill_zones.unwrap_or(true))
+            .await
+        {
+            Ok(report) => envelope::ok(
+                &cid,
+                self.hinted(drc_json_view(&report, &view)),
+                board_provenance(&board),
+                vec![],
+            ),
             Err(e) => envelope::error(&cid, &e),
         }
     }
@@ -975,7 +1005,7 @@ impl KicadAiServer {
                 Err(_) => None,
             };
             let issues = kicad_domain::board::review(&data, schematic.as_ref().map(|(_, d)| d));
-            let drc = self.run_drc(&cid, &board, false).await.ok();
+            let drc = self.run_drc(&cid, &board, false, true).await.ok();
             Ok::<_, ToolError>((data, issues, drc, schematic.map(|(p, _)| p)))
         }
         .await;
@@ -1400,7 +1430,7 @@ Apply with pcb_apply_plan; the attributes are read back."
 
     #[tool(
         name = "pcb_autoroute_plan",
-        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nNothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move. \\nThis is the tool for complex routing: multi-pad nets and anything that must find a way around parts. session_status says whether Freerouting is configured."
+        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nA wire the router draws narrower than the board's minimum track width is widened to it (the plan says how many), \\nand vias that join fewer than two layers are removed after the import. Nothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move. \\nThis is the tool for complex routing: multi-pad nets and anything that must find a way around parts. session_status says whether Freerouting is configured."
     )]
     pub async fn pcb_autoroute_plan(&self, Parameters(args): Parameters<PcbAutorouteArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1451,18 +1481,32 @@ Apply with pcb_apply_plan; the attributes are read back."
                         format!("cannot export the board for the router: {e}"),
                     )
                 })?;
+            let min_width = mm(rules.min_track_width.0);
             let run = router
                 .route(&dsn, &ses, passes, Duration::from_secs(limit))
                 .await
                 .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))?;
-            let text = std::fs::read_to_string(&ses)
-                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}")))?;
-            let summary = kicad_sexpr::ses::summarize(&text)
-                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}")))?;
-            Ok::<_, ToolError>((data, rules, dir, ses, run, summary))
+            let read_ses = || {
+                std::fs::read_to_string(&ses)
+                    .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}")))
+            };
+            let read_err = |e: kicad_sexpr::ses::SesError| {
+                ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}"))
+            };
+            // The safety net: a wire the router still drew narrower is widened, and DRC after the
+            // import checks the clearance of the wider track.
+            let (widened_text, widened) = kicad_sexpr::ses::widen_wires(&read_ses()?, min_width).map_err(read_err)?;
+            if widened > 0 {
+                std::fs::write(&ses, &widened_text).map_err(|e| {
+                    ToolError::new(ErrorCode::KicadError, format!("cannot write {}: {e}", ses.display()))
+                })?;
+            }
+            let summary = kicad_sexpr::ses::summarize(&widened_text).map_err(read_err)?;
+            let width_note = (min_width, widened);
+            Ok::<_, ToolError>((data, dir, ses, run, summary, width_note))
         }
         .await;
-        let (data, rules, dir, ses, run, summary) = match result {
+        let (data, dir, ses, run, summary, (min_width, widened)) = match result {
             Ok(r) => r,
             Err(e) => return envelope::error(&cid, &e),
         };
@@ -1479,17 +1523,9 @@ Apply with pcb_apply_plan; the attributes are read back."
                 run.violations.unwrap_or(0)
             ));
         }
-        let min = mm(rules.min_track_width.0);
-        let narrow: Vec<String> = summary
-            .nets
-            .iter()
-            .filter(|n| n.segments > 0 && n.min_width_mm + 1e-9 < min)
-            .map(|n| format!("{} ({:.2} mm)", n.net, n.min_width_mm))
-            .collect();
-        if !narrow.is_empty() {
+        if widened > 0 {
             warnings.push(format!(
-                "tracks narrower than the board minimum of {min:.2} mm: {}; DRC after applying will show them",
-                narrow.join(", ")
+                "{widened} wire(s) came back narrower than the board minimum of {min_width:.2} mm and were widened to it;                  DRC after applying checks their clearance"
             ));
         }
         let replaced_tracks = data.tracks.iter().filter(|t| !t.locked).count();
@@ -1506,6 +1542,7 @@ Apply with pcb_apply_plan; the attributes are read back."
             "can_apply": true,
             "router": run,
             "session": summary,
+            "minimum_width": { "mm": min_width, "wires_widened": widened },
             "replaces": { "tracks": replaced_tracks, "vias": replaced_vias, "locked_tracks_kept": data.tracks.len() - replaced_tracks },
             "warnings": warnings,
             "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
@@ -1533,7 +1570,7 @@ Apply with pcb_apply_plan; the attributes are read back."
 
     #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move). A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move): \\nthe zones are refilled first, the counts by type are given before and after, and only the violations that are new are listed. A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1751,6 +1788,7 @@ impl KicadAiServer {
         cid: &str,
         board: &Arc<BoardSession>,
         parity: bool,
+        refill_zones: bool,
     ) -> Result<kicad_cli_runner::pcb::DrcReport, ToolError> {
         let cli = board
             .cli()
@@ -1767,9 +1805,16 @@ impl KicadAiServer {
                     }
                 }
             }
-            kicad_cli_runner::pcb::run_drc(&cli, &copy, &dir.join("drc.json"), parity, Duration::from_secs(300))
-                .await
-                .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))
+            kicad_cli_runner::pcb::run_drc(
+                &cli,
+                &copy,
+                &dir.join("drc.json"),
+                parity,
+                refill_zones,
+                Duration::from_secs(300),
+            )
+            .await
+            .map_err(|e| ToolError::new(ErrorCode::KicadError, e.to_string()))
         }
         .await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -1799,27 +1844,159 @@ fn footprint_json(f: &kicad_domain::board::BoardFootprint, pads: bool) -> serde_
     v
 }
 
+/// What of a DRC report to list; the counts are always whole.
+struct DrcView {
+    summary_only: bool,
+    severity: Option<String>,
+    types: Vec<String>,
+    limit: usize,
+}
+
+impl Default for DrcView {
+    fn default() -> Self {
+        Self {
+            summary_only: false,
+            severity: None,
+            types: vec![],
+            limit: 100,
+        }
+    }
+}
+
+fn drc_violation_json(v: &kicad_cli_runner::pcb::DrcViolation) -> serde_json::Value {
+    serde_json::json!({
+        "type": v.kind, "severity": v.severity, "description": v.description,
+        "items": v.items.iter().map(|i| serde_json::json!({
+            "what": i.description, "at": i.pos.as_ref().map(|p| serde_json::json!({ "x": p.x, "y": p.y })) })).collect::<Vec<_>>(),
+    })
+}
+
 fn drc_json(report: &kicad_cli_runner::pcb::DrcReport) -> serde_json::Value {
+    drc_json_view(report, &DrcView::default())
+}
+
+fn drc_json_view(report: &kicad_cli_runner::pcb::DrcReport, view: &DrcView) -> serde_json::Value {
     let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_severity: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
     for v in &report.violations {
         *by_type.entry(v.kind.as_str()).or_default() += 1;
+        *by_severity
+            .entry(v.severity.as_str())
+            .or_default()
+            .entry(v.kind.as_str())
+            .or_default() += 1;
     }
-    let show = |v: &kicad_cli_runner::pcb::DrcViolation| {
-        serde_json::json!({
-            "type": v.kind, "severity": v.severity, "description": v.description,
-            "items": v.items.iter().map(|i| serde_json::json!({
-                "what": i.description, "at": i.pos.as_ref().map(|p| serde_json::json!({ "x": p.x, "y": p.y })) })).collect::<Vec<_>>(),
-        })
+    let wanted = |v: &&kicad_cli_runner::pcb::DrcViolation| {
+        view.severity.as_ref().is_none_or(|s| &v.severity == s)
+            && (view.types.is_empty() || view.types.iter().any(|t| t == &v.kind))
     };
-    serde_json::json!({
+    let matching: Vec<_> = report.violations.iter().filter(wanted).collect();
+    let mut out = serde_json::json!({
         "kicad_version": report.kicad_version,
         "errors": report.count("error"),
         "warnings": report.count("warning"),
         "by_type": by_type,
-        "violations": report.violations.iter().take(100).map(show).collect::<Vec<_>>(),
+        "by_severity": by_severity,
         "unrouted": report.unconnected_items.len(),
-        "unrouted_items": report.unconnected_items.iter().take(50).map(show).collect::<Vec<_>>(),
-        "schematic_parity": report.schematic_parity.iter().take(50).map(show).collect::<Vec<_>>(),
+    });
+    if !view.summary_only {
+        out["violations"] = matching
+            .iter()
+            .take(view.limit)
+            .map(|v| drc_violation_json(v))
+            .collect();
+        out["violations_matching"] = matching.len().into();
+        if matching.len() > view.limit {
+            out["violations_note"] = format!(
+                "{} of {} matching violations are listed; narrow with severity or types, or raise limit",
+                view.limit,
+                matching.len()
+            )
+            .into();
+        }
+        out["schematic_parity"] = report
+            .schematic_parity
+            .iter()
+            .take(50)
+            .map(drc_violation_json)
+            .collect();
+    }
+    out["unrouted_items"] = report
+        .unconnected_items
+        .iter()
+        .take(if view.summary_only { 10 } else { 50 })
+        .map(drc_violation_json)
+        .collect();
+    out
+}
+
+/// A violation's identity for before/after comparison: its type, severity, and what and where
+/// its items are.
+fn drc_key(v: &kicad_cli_runner::pcb::DrcViolation) -> String {
+    let mut items: Vec<String> = v
+        .items
+        .iter()
+        .map(|i| match &i.pos {
+            Some(p) => format!("{}@{:.2},{:.2}", i.description, p.x, p.y),
+            None => i.description.clone(),
+        })
+        .collect();
+    items.sort();
+    format!("{}|{}|{}", v.kind, v.severity, items.join(";"))
+}
+
+/// The violations in `after` that `before` did not have (a violation that was there before and
+/// still is does not count).
+fn new_violations<'a>(
+    before: &kicad_cli_runner::pcb::DrcReport,
+    after: &'a kicad_cli_runner::pcb::DrcReport,
+) -> Vec<&'a kicad_cli_runner::pcb::DrcViolation> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for v in before.violations.iter().chain(&before.unconnected_items) {
+        *seen.entry(drc_key(v)).or_default() += 1;
+    }
+    after
+        .violations
+        .iter()
+        .chain(&after.unconnected_items)
+        .filter(|v| match seen.get_mut(&drc_key(v)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// The result of a DRC before and after a change: counts, and only the violations that are new.
+fn drc_comparison(
+    before: &kicad_cli_runner::pcb::DrcReport,
+    after: &kicad_cli_runner::pcb::DrcReport,
+) -> serde_json::Value {
+    fn counts(r: &kicad_cli_runner::pcb::DrcReport) -> BTreeMap<&str, usize> {
+        let mut m: BTreeMap<&str, usize> = BTreeMap::new();
+        for v in &r.violations {
+            *m.entry(v.kind.as_str()).or_default() += 1;
+        }
+        m
+    }
+    let new = new_violations(before, after);
+    serde_json::json!({
+        "unrouted_before": before.unconnected_items.len(),
+        "unrouted_after": after.unconnected_items.len(),
+        "errors_before": before.count("error"),
+        "errors_after": after.count("error"),
+        "by_type_before": counts(before),
+        "by_type_after": counts(after),
+        "new_violations_total": new.len(),
+        "new_violations": new.iter().take(30).map(|v| drc_violation_json(v)).collect::<Vec<_>>(),
+        "new_violations_note": if new.len() > 30 {
+            Some(format!("{} more new violations are not listed; see pcb_run_drc with types", new.len() - 30))
+        } else {
+            None
+        },
+        "unchanged_violations": after.violations.len() + after.unconnected_items.len() - new.len(),
     })
 }
 
@@ -1992,6 +2169,9 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
             "thermal_gap": mm(z.thermal_gap.0), "spoke_width": mm(z.spoke_width.0), "priority": z.priority,
         }),
         BoardOp::RemoveZone { id, name } => serde_json::json!({ "op": "remove_zone", "id": id, "name": name }),
+        BoardOp::RemoveVia { id, net, at } => {
+            serde_json::json!({ "op": "remove_via", "id": id, "net": net, "at": pt(*at) })
+        }
         BoardOp::SetAttributes {
             reference, from, to, ..
         } => serde_json::json!({ "op": "set_attributes", "reference": reference, "from": from, "to": to }),
@@ -2099,13 +2279,13 @@ impl KicadAiServer {
             // shows the overlaps it makes.
             let judged_by_drc = !matches!(plan.kind, "move" | "attributes");
             let drc_before = if judged_by_drc {
-                self.run_drc(cid, board, false).await.ok()
+                self.run_drc(cid, board, false, true).await.ok()
             } else {
                 None
             };
             let report = board.apply_edit(plan).await?;
             let drc_after = if judged_by_drc {
-                self.run_drc(cid, board, false).await.ok()
+                self.run_drc(cid, board, false, true).await.ok()
             } else {
                 None
             };
@@ -2126,13 +2306,15 @@ impl KicadAiServer {
         let drc = match (&drc_before, &drc_after) {
             (Some(b), Some(a)) => {
                 problems.extend(drc_worse(b, a));
-                Some(serde_json::json!({
-                    "unrouted_before": b.unconnected_items.len(),
-                    "unrouted_after": a.unconnected_items.len(),
-                    "errors_before": b.count("error"),
-                    "errors_after": a.count("error"),
-                    "after": self.hinted(drc_json(a)),
-                }))
+                let mut cmp = drc_comparison(b, a);
+                cmp["after"] = self.hinted(drc_json_view(
+                    a,
+                    &DrcView {
+                        summary_only: true,
+                        ..DrcView::default()
+                    },
+                ));
+                Some(cmp)
             }
             _ if !matches!(plan.kind, "move" | "attributes") => {
                 problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
@@ -2258,14 +2440,32 @@ impl KicadAiServer {
                 ));
             }
             let snapshot = board.snapshot().await?;
-            let drc_before = self.run_drc(cid, board, false).await.ok();
+            let drc_before = self.run_drc(cid, board, false, true).await.ok();
             let imported = board.import_session(&ses).await?;
-            let drc_after = self.run_drc(cid, board, false).await.ok();
-            let after = board.read().await?;
-            Ok::<_, ToolError>((before, snapshot, imported, after, drc_before, drc_after))
+            // Vias the router left that join fewer than two layers carry nothing: remove them.
+            let mut after = board.read().await?;
+            let loose: Vec<String> = board_edit::dangling_vias(&after).iter().map(|v| v.id.clone()).collect();
+            let mut cleanup = (0usize, Vec::new());
+            if !loose.is_empty() {
+                let removal = board_edit::plan_remove_vias(&after, &loose)?;
+                match board.apply_edit(&removal).await {
+                    Ok(_) => {
+                        after = board.read().await?;
+                        cleanup = (loose.len(), board_edit::verify_edit(&removal, &after));
+                    }
+                    Err(e) => cleanup.1.push(format!(
+                        "removing {} dangling via(s) failed: {}",
+                        loose.len(),
+                        e.message
+                    )),
+                }
+            }
+            let drc_after = self.run_drc(cid, board, false, true).await.ok();
+            Ok::<_, ToolError>((before, snapshot, imported, after, drc_before, drc_after, cleanup))
         }
         .await;
-        let (before, snapshot, imported, after, drc_before, drc_after) = match result {
+        let (before, snapshot, imported, after, drc_before, drc_after, (vias_removed, cleanup_problems)) = match result
+        {
             Ok(r) => r,
             Err(e) => return envelope::error(cid, &e),
         };
@@ -2273,7 +2473,7 @@ impl KicadAiServer {
             p.applied_with = Some(args.idempotency_key.clone());
         }
         let _ = std::fs::remove_dir_all(&dir);
-        let mut problems = Vec::new();
+        let mut problems = cleanup_problems;
         if imported.skipped > 0 {
             problems.push(format!("KiCad skipped {} item(s) of the session", imported.skipped));
         }
@@ -2292,13 +2492,15 @@ impl KicadAiServer {
         let drc = match (&drc_before, &drc_after) {
             (Some(b), Some(a)) => {
                 problems.extend(drc_worse(b, a));
-                Some(serde_json::json!({
-                    "unrouted_before": b.unconnected_items.len(),
-                    "unrouted_after": a.unconnected_items.len(),
-                    "errors_before": b.count("error"),
-                    "errors_after": a.count("error"),
-                    "after": self.hinted(drc_json(a)),
-                }))
+                let mut cmp = drc_comparison(b, a);
+                cmp["after"] = self.hinted(drc_json_view(
+                    a,
+                    &DrcView {
+                        summary_only: true,
+                        ..DrcView::default()
+                    },
+                ));
+                Some(cmp)
             }
             _ => {
                 problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
@@ -2312,6 +2514,7 @@ impl KicadAiServer {
             "kind": "autoroute",
             "tracks": after.tracks.len(),
             "vias": after.vias.len(),
+            "dangling_vias_removed": vias_removed,
             "skipped": imported.skipped,
             "report": imported.report,
             "drc": drc,
@@ -2373,4 +2576,106 @@ fn same_board(a: &Board, b: &Board) -> bool {
         v
     };
     fps(a) == fps(b) && tracks(a) == tracks(b) && a.outline == b.outline && a.edges.len() == b.edges.len()
+}
+
+#[cfg(test)]
+mod drc_tests {
+    use super::*;
+    use kicad_cli_runner::pcb::DrcReport;
+
+    fn violation(kind: &str, severity: &str, at: f64) -> String {
+        format!(
+            r#"{{"type":"{kind}","severity":"{severity}","description":"d","items":[{{"description":"Track [GND]","pos":{{"x":{at},"y":1.0}}}}]}}"#
+        )
+    }
+
+    fn report(violations: &[String], unrouted: usize) -> DrcReport {
+        let unconnected: Vec<String> = (0..unrouted)
+            .map(|i| format!(r#"{{"description":"missing","items":[{{"description":"Pad {i}"}}]}}"#))
+            .collect();
+        DrcReport::parse(&format!(
+            r#"{{"kicad_version":"10","violations":[{}],"unconnected_items":[{}]}}"#,
+            violations.join(","),
+            unconnected.join(",")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_summary_has_counts_and_no_list() {
+        let r = report(
+            &[
+                violation("clearance", "error", 1.0),
+                violation("silk_overlap", "warning", 2.0),
+            ],
+            3,
+        );
+        let v = drc_json_view(
+            &r,
+            &DrcView {
+                summary_only: true,
+                ..DrcView::default()
+            },
+        );
+        assert_eq!(v["errors"], 1);
+        assert_eq!(v["by_type"]["clearance"], 1);
+        assert_eq!(v["by_severity"]["warning"]["silk_overlap"], 1);
+        assert!(v.get("violations").is_none());
+        assert_eq!(v["unrouted"], 3);
+    }
+
+    #[test]
+    fn the_list_is_narrowed_and_says_what_was_left_out() {
+        let many: Vec<String> = (0..5).map(|i| violation("clearance", "error", i as f64)).collect();
+        let mut all = many.clone();
+        all.push(violation("silk_overlap", "warning", 9.0));
+        let r = report(&all, 0);
+        let v = drc_json_view(
+            &r,
+            &DrcView {
+                severity: Some("error".into()),
+                limit: 2,
+                ..DrcView::default()
+            },
+        );
+        assert_eq!(v["violations"].as_array().unwrap().len(), 2);
+        assert_eq!(v["violations_matching"], 5);
+        assert!(v["violations_note"].as_str().unwrap().contains("2 of 5"));
+        assert_eq!(v["by_type"]["silk_overlap"], 1, "the counts stay whole");
+        let v = drc_json_view(
+            &r,
+            &DrcView {
+                types: vec!["silk_overlap".into()],
+                ..DrcView::default()
+            },
+        );
+        assert_eq!(v["violations"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_new_violations_are_listed() {
+        let before = report(
+            &[
+                violation("clearance", "error", 1.0),
+                violation("clearance", "error", 2.0),
+            ],
+            2,
+        );
+        let after = report(
+            &[
+                violation("clearance", "error", 1.0),
+                violation("clearance", "error", 3.0),
+                violation("shorting_items", "error", 4.0),
+            ],
+            1,
+        );
+        let cmp = drc_comparison(&before, &after);
+        // The one at 3.0 and the short are new; the one at 1.0 was there before; the unrouted
+        // connection that is left was there before too.
+        assert_eq!(cmp["new_violations_total"], 2, "{cmp}");
+        assert_eq!(cmp["unchanged_violations"], 2, "{cmp}");
+        assert_eq!(cmp["errors_before"], 2);
+        assert_eq!(cmp["errors_after"], 3);
+        assert_eq!(cmp["by_type_after"]["shorting_items"], 1);
+    }
 }

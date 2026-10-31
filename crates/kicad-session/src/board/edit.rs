@@ -615,6 +615,7 @@ impl BoardSession {
             "route" => "AI: route",
             "zone" => "AI: copper pour",
             "attributes" => "AI: footprint attributes",
+            "cleanup" => "AI: remove dangling vias",
             _ => "AI: move footprints",
         };
         let result = apply_steps(client, &header, plan).await;
@@ -682,7 +683,9 @@ async fn apply_steps(
         .operations
         .iter()
         .filter_map(|o| match o {
-            BoardOp::RemoveEdge { id, .. } | BoardOp::RemoveZone { id, .. } => Some(ProtoKiid { value: id.clone() }),
+            BoardOp::RemoveEdge { id, .. } | BoardOp::RemoveZone { id, .. } | BoardOp::RemoveVia { id, .. } => {
+                Some(ProtoKiid { value: id.clone() })
+            }
             _ => None,
         })
         .collect();

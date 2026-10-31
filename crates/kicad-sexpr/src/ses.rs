@@ -108,6 +108,43 @@ pub fn summarize(text: &str) -> Result<SesSummary, SesError> {
     Ok(out)
 }
 
+/// Raises the width of every wire narrower than `min_mm` to `min_mm`, and returns the new text and
+/// how many wires were changed. The router is told the minimum first (see `dsn`), so this is the
+/// safety net for the few tracks it narrows anyway.
+pub fn widen_wires(text: &str, min_mm: f64) -> Result<(String, usize), SesError> {
+    let root = parse(text)?;
+    if root.head() != Some("session") {
+        return Err(SesError::NotASession);
+    }
+    let Some(routes) = root.child("routes") else {
+        return Ok((text.to_owned(), 0));
+    };
+    let scale = per_mm(routes.child("resolution"));
+    let min_units = (min_mm * scale).round();
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    if let Some(out) = routes.child("network_out") {
+        for net in out.children("net") {
+            for wire in net.children("wire") {
+                let Some(path) = wire.child("path") else {
+                    continue;
+                };
+                let (Some(width), Some(node)) = (path.arg_f64(1), path.arg(1)) else {
+                    continue;
+                };
+                if width < min_units {
+                    edits.push((node.span.clone(), format!("{min_units}")));
+                }
+            }
+        }
+    }
+    let changed = edits.len();
+    let mut out = text.to_owned();
+    for (range, with) in edits.into_iter().rev() {
+        out.replace_range(range, &with);
+    }
+    Ok((out, changed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +180,18 @@ mod tests {
         );
         assert_eq!(gnd.layers, vec!["B.Cu".to_owned()]);
         assert_eq!((s.segments, s.vias), (4, 1));
+    }
+
+    #[test]
+    fn narrow_wires_are_widened_and_only_those() {
+        // 0.2 mm is 2000 units; the GND wire is 1500.
+        let (out, n) = widen_wires(SES, 0.2).unwrap();
+        assert_eq!(n, 1);
+        assert!(out.contains("(path B.Cu 2000 0 0 30000 40000)"), "{out}");
+        assert!(out.contains("(path F.Cu 2000 1020000 -920000 1031517 -920000)"));
+        let s = summarize(&out).unwrap();
+        assert!(s.nets.iter().all(|n| n.min_width_mm >= 0.2));
+        assert_eq!(widen_wires(&out, 0.2).unwrap().1, 0);
     }
 
     #[test]

@@ -304,6 +304,11 @@ impl Rect {
     }
 
     /// True when the rectangles share interior area (touching edges do not count).
+    /// Is `p` inside, or on the edge?
+    pub fn contains(self, p: Point) -> bool {
+        (self.min.x.0..=self.max.x.0).contains(&p.x.0) && (self.min.y.0..=self.max.y.0).contains(&p.y.0)
+    }
+
     pub fn overlaps(self, other: Rect) -> bool {
         self.min.x < other.max.x && other.min.x < self.max.x && self.min.y < other.max.y && other.min.y < self.max.y
     }

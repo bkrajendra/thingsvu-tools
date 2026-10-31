@@ -106,8 +106,24 @@ struct Placement<'a> {
     reference: &'a str,
     value: &'a str,
     footprint: Option<&'a str>,
+    /// Datasheet, Description, and custom fields to write (custom ones hidden).
+    fields: Option<&'a BTreeMap<String, String>>,
     position: Point,
     orientation: Orientation,
+}
+
+/// A field the library does not define: hidden, at the part's origin, in the default text style.
+fn custom_property(name: &str, text: &str, origin: Point) -> Node {
+    Node::list(vec![
+        atom("property"),
+        Node::string(name),
+        Node::string(text),
+        at(origin, 0),
+        word("hide", "yes"),
+        word("show_name", "no"),
+        word("do_not_autoplace", "no"),
+        effects_default(),
+    ])
 }
 
 fn symbol_node(def: &Node, p: &Placement, sheet: &str, project: &str) -> Result<Node, EmitError> {
@@ -142,17 +158,29 @@ fn symbol_node(def: &Node, p: &Placement, sheet: &str, project: &str) -> Result<
         word("fields_autoplaced", "yes"),
         uuid(),
     ]);
+    let mut written = BTreeSet::new();
     for name in ["Reference", "Value", "Footprint", "Datasheet", "Description"] {
         let Some(field) = def.children("property").find(|f| f.arg_text(0) == Some(name)) else {
             continue;
         };
+        written.insert(name);
         let text = match name {
             "Reference" => p.reference,
             "Value" => p.value,
             "Footprint" => p.footprint.unwrap_or_else(|| field.arg_text(1).unwrap_or_default()),
-            _ => field.arg_text(1).unwrap_or_default(),
+            other => p
+                .fields
+                .and_then(|f| f.get(other))
+                .map(String::as_str)
+                .unwrap_or_else(|| field.arg_text(1).unwrap_or_default()),
         };
         items.push(property(field, text, p.position, o)?);
+    }
+    // Fields the library symbol has no property for: added hidden, after the standard ones.
+    for (name, text) in p.fields.into_iter().flatten() {
+        if !written.contains(name.as_str()) {
+            items.push(custom_property(name, text, p.position));
+        }
     }
     let mut seen = BTreeSet::new();
     for pin in describe(p.id, def).pins.iter().filter(|pin| pin.unit <= 1) {
@@ -300,6 +328,13 @@ fn junction_node(position: Point) -> Node {
             item("color", vec![atom("0"), atom("0"), atom("0"), atom("0")]),
             uuid(),
         ],
+    )
+}
+
+fn no_connect_node(position: Point) -> Node {
+    item(
+        "no_connect",
+        vec![item("at", vec![num(position.x), num(position.y)]), uuid()],
     )
 }
 
@@ -591,6 +626,7 @@ pub fn add_plan(
                 reference,
                 value,
                 footprint,
+                fields,
                 position,
                 orientation,
                 ..
@@ -603,6 +639,7 @@ pub fn add_plan(
                         reference,
                         value,
                         footprint: footprint.as_deref(),
+                        fields: Some(fields),
                         position: *position,
                         orientation: *orientation,
                     },
@@ -625,6 +662,7 @@ pub fn add_plan(
                         reference,
                         value: net,
                         footprint: None,
+                        fields: None,
                         position: *position,
                         orientation: *orientation,
                     },
@@ -639,6 +677,7 @@ pub fn add_plan(
                 direction,
             } => label_node(net, *position, *direction),
             Operation::AddJunction { position } => junction_node(*position),
+            Operation::AddNoConnect { position } => no_connect_node(*position),
             Operation::AddText {
                 text,
                 position,
@@ -673,6 +712,7 @@ pub fn add_plan(
             RemovedKind::Wire => ("wire", "wire"),
             RemovedKind::Label => ("label", "label"),
             RemovedKind::Junction => ("junction", "junction"),
+            RemovedKind::NoConnect => ("no_connect", "no-connect flag"),
             RemovedKind::PowerSymbol => ("symbol", "power symbol"),
             RemovedKind::Symbol => ("symbol", "part"),
             RemovedKind::Text => ("text", "text note"),
@@ -782,6 +822,7 @@ mod tests {
             reference: reference.into(),
             value: "10k".into(),
             footprint: None,
+            fields: BTreeMap::new(),
             position,
             orientation,
         }
@@ -885,6 +926,57 @@ mod tests {
             .find(|p| p.arg_text(0) == Some("Footprint"))
             .unwrap();
         assert_eq!(footprint.child_text("hide"), Some("yes"));
+    }
+
+    #[test]
+    fn fields_of_a_planned_part_are_written_hidden() {
+        let doc = Document::parse(empty_schematic(MIN_VERSION, "10.0")).unwrap();
+        let mut op = place("R1", mm_point(100.0, 100.0), Orientation::default());
+        if let Operation::PlaceSymbol { fields, .. } = &mut op {
+            fields.insert("MPN".into(), "RC0603FR-0710KL".into());
+            fields.insert("Datasheet".into(), "https://example.test/r.pdf".into());
+        }
+        let out = add_plan(&doc, &plan(vec![op]), &defs(), "p").unwrap();
+        let root = parse(&out).unwrap();
+        let symbol = root.child("symbol").unwrap();
+        let prop = |name: &str| {
+            symbol
+                .children("property")
+                .find(|p| p.arg_text(0) == Some(name))
+                .unwrap_or_else(|| panic!("no {name} property in {out}"))
+        };
+        assert_eq!(prop("MPN").arg_text(1), Some("RC0603FR-0710KL"));
+        assert_eq!(prop("MPN").child_text("hide"), Some("yes"));
+        assert_eq!(prop("Datasheet").arg_text(1), Some("https://example.test/r.pdf"));
+    }
+
+    #[test]
+    fn a_no_connect_flag_is_added_and_removed() {
+        let doc = Document::parse(empty_schematic(MIN_VERSION, "10.0")).unwrap();
+        let added = add_plan(
+            &doc,
+            &plan(vec![Operation::AddNoConnect {
+                position: mm_point(12.7, 25.4),
+            }]),
+            &defs(),
+            "p",
+        )
+        .unwrap();
+        let after = Document::parse(added.clone()).unwrap();
+        let flags = after.design().no_connects;
+        assert_eq!(flags.len(), 1, "{added}");
+        assert_eq!(flags[0].position, mm_point(12.7, 25.4));
+        let removal = OperationPlan {
+            circuit: "t".into(),
+            removals: vec![kicad_domain::plan::Removal {
+                kind: RemovedKind::NoConnect,
+                id: flags[0].id.clone(),
+                description: String::new(),
+            }],
+            ..Default::default()
+        };
+        let removed = add_plan(&after, &removal, &defs(), "p").unwrap();
+        assert!(Document::parse(removed).unwrap().design().no_connects.is_empty());
     }
 
     #[test]

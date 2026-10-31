@@ -22,9 +22,9 @@ use kicad_ipc::proto::kiapi::common::types::{
 };
 use kicad_ipc::proto::kiapi::schematic::commands::PlaceSymbolFromLibrary;
 use kicad_ipc::proto::kiapi::schematic::types::{
-    Junction, LocalLabel, SchematicGraphicShape, SchematicLabelSpinStyle, SchematicLine, SchematicLineType,
-    SchematicPin, SchematicPinOrientation, SchematicSymbol, SchematicSymbolInstance, SchematicSymbolOrientation,
-    SchematicSymbolTransform, SchematicSymbolType, SchematicText,
+    Junction, LocalLabel, NoConnectMarker, SchematicGraphicShape, SchematicLabelSpinStyle, SchematicLine,
+    SchematicLineType, SchematicPin, SchematicPinOrientation, SchematicSymbol, SchematicSymbolInstance,
+    SchematicSymbolOrientation, SchematicSymbolTransform, SchematicSymbolType, SchematicText,
 };
 use kicad_ipc::Client;
 use prost::Name;
@@ -475,6 +475,7 @@ async fn update_fields(
     mut symbol: SchematicSymbolInstance,
     value: &str,
     footprint: Option<&str>,
+    fields: &BTreeMap<String, String>,
     mirror: Option<Orientation>,
 ) -> Result<SchematicSymbolInstance, ToolError> {
     let mut paths = vec!["value_field".to_owned()];
@@ -497,7 +498,56 @@ async fn update_fields(
             paths.push("footprint_field".into());
         }
     }
+    if !fields.is_empty() {
+        set_text_fields(&mut symbol, fields, &mut paths);
+    }
     send_symbol_update(client, header, symbol, paths).await
+}
+
+/// Writes Datasheet, Description, and custom fields (new ones hidden) on a symbol, and adds the
+/// paths of the parts it changed to the field mask.
+fn set_text_fields(symbol: &mut SchematicSymbolInstance, fields: &BTreeMap<String, String>, paths: &mut Vec<String>) {
+    let mut add_path = |p: &str| {
+        if !paths.iter().any(|x| x == p) {
+            paths.push(p.to_owned());
+        }
+    };
+    for (name, text) in fields {
+        let standard = match name.as_str() {
+            "Datasheet" => Some(("datasheet_field", &mut symbol.datasheet_field)),
+            "Description" => Some(("description_field", &mut symbol.description_field)),
+            _ => None,
+        };
+        if let Some((path, field)) = standard {
+            if let Some(t) = field.as_mut().and_then(|f| f.text.as_mut()) {
+                t.text = text.clone();
+                add_path(path);
+                continue;
+            }
+        }
+        match symbol.user_fields.iter_mut().find(|f| &f.name == name) {
+            Some(f) => {
+                if let Some(t) = f.text.as_mut() {
+                    t.text = text.clone();
+                }
+            }
+            None => symbol
+                .user_fields
+                .push(kicad_ipc::proto::kiapi::schematic::types::SchematicField {
+                    name: name.clone(),
+                    text: Some(kicad_ipc::proto::kiapi::common::types::Text {
+                        position: symbol.position,
+                        text: text.clone(),
+                        ..Default::default()
+                    }),
+                    visible: false,
+                    show_name: false,
+                    allow_auto_place: true,
+                    ..Default::default()
+                }),
+        }
+        add_path("user_fields");
+    }
 }
 
 /// Sends `symbol` to KiCad with a field mask naming the only parts that may change, and returns
@@ -709,6 +759,7 @@ async fn finish(
             reference,
             value,
             footprint,
+            fields,
             orientation,
             ..
         } = op
@@ -725,6 +776,7 @@ async fn finish(
             symbol.clone(),
             value,
             footprint.as_deref(),
+            fields,
             Some(*orientation),
         )
         .await
@@ -784,6 +836,12 @@ async fn finish(
             }
             Operation::AddJunction { position } => {
                 items.push(encode(Any::from_msg(&Junction {
+                    position: vector(*position),
+                    ..Default::default()
+                }))?);
+            }
+            Operation::AddNoConnect { position } => {
+                items.push(encode(Any::from_msg(&NoConnectMarker {
                     position: vector(*position),
                     ..Default::default()
                 }))?);
@@ -933,6 +991,8 @@ fn item_kiid(any: &Any) -> Option<String> {
         any.to_msg::<LocalLabel>().ok()?.id.map(|k| k.value)
     } else if any.type_url == Junction::type_url() {
         any.to_msg::<Junction>().ok()?.id.map(|k| k.value)
+    } else if any.type_url == NoConnectMarker::type_url() {
+        any.to_msg::<NoConnectMarker>().ok()?.id.map(|k| k.value)
     } else if any.type_url == SchematicText::type_url() {
         any.to_msg::<SchematicText>().ok()?.id.map(|k| k.value)
     } else if any.type_url == SchematicGraphicShape::type_url() {

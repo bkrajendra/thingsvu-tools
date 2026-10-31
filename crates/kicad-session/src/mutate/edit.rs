@@ -337,7 +337,7 @@ impl Session {
         let mut inner = self.inner.lock().await;
         let client = &mut inner.client;
         let commit = begin_commit(client, use_commit, &header).await?;
-        let updated = match update_fields(client, &header, target, &value, footprint, None).await {
+        let updated = match update_fields(client, &header, target, &value, footprint, &Default::default(), None).await {
             Ok(updated) => updated,
             Err(err) => {
                 let _ = end_commit(client, commit, false, "", &header).await;

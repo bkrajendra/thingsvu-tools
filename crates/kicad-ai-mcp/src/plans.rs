@@ -67,6 +67,7 @@ pub fn operation_view(op: &Operation) -> Value {
             reference,
             value,
             footprint,
+            fields,
             position,
             orientation,
         } => json!({
@@ -76,6 +77,7 @@ pub fn operation_view(op: &Operation) -> Value {
             "reference": reference,
             "value": value,
             "footprint": footprint,
+            "fields": fields,
             "position_mm": mm(*position),
             "rotation_deg": orientation.rotation_deg,
         }),
@@ -104,6 +106,7 @@ pub fn operation_view(op: &Operation) -> Value {
             "rotation_deg": orientation.rotation_deg,
         }),
         Operation::AddJunction { position } => json!({ "op": "add_junction", "position_mm": mm(*position) }),
+        Operation::AddNoConnect { position } => json!({ "op": "add_no_connect", "position_mm": mm(*position) }),
         Operation::AddText {
             text,
             position,

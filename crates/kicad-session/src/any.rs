@@ -254,6 +254,18 @@ fn placement_problems(plan: &OperationPlan, design: &kicad_domain::SchematicDesi
         }
     }
     for op in &plan.operations {
+        if let kicad_domain::Operation::PlaceSymbol { reference, fields, .. } = op {
+            if let Some(s) = design.symbols.iter().find(|s| &s.reference == reference) {
+                for (name, text) in fields {
+                    let now = s.properties.get(name);
+                    if now != Some(text) {
+                        problems.push(format!(
+                            "{reference} field '{name}' reads back as {now:?}, not '{text}' as planned"
+                        ));
+                    }
+                }
+            }
+        }
         let (reference, position, orientation) = match op {
             kicad_domain::Operation::PlaceSymbol {
                 reference,

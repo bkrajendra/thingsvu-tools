@@ -141,7 +141,10 @@ pub fn check(plan: &OperationPlan, library: &BTreeMap<LibraryId, LibrarySymbol>)
                     report.labelled_power_nets.push(net.clone());
                 }
             }
-            Operation::AddJunction { .. } | Operation::AddText { .. } | Operation::AddShape { .. } => {}
+            Operation::AddJunction { .. }
+            | Operation::AddNoConnect { .. }
+            | Operation::AddText { .. }
+            | Operation::AddShape { .. } => {}
         }
     }
 

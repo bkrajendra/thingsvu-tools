@@ -400,7 +400,7 @@ impl KicadAiServer {
         let text = std::fs::read_to_string(&copy).map_err(|e| io_err(&copy, e))?;
         let parsed = kicad_sexpr::pcb::read_board(&text).map_err(kicad_err)?;
         let facts = kicad_sexpr::fab::read_fab_facts(&text).map_err(kicad_err)?;
-        let drc = kicad_cli_runner::pcb::run_drc(&cli, &copy, &scratch.join("drc.json"), false, EXPORT_TIMEOUT)
+        let drc = kicad_cli_runner::pcb::run_drc(&cli, &copy, &scratch.join("drc.json"), false, true, EXPORT_TIMEOUT)
             .await
             .ok();
         let bom = design

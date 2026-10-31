@@ -47,8 +47,8 @@ pub use plan::{
 pub use readability::Readability;
 pub use result::{ErrorCode, MutationState, Origin, Provenance, ResultState, ToolError};
 pub use schematic::{
-    DesignJunction, DesignLabel, DesignSymbol, DesignWire, NetInfo, NetPin, PinInfo, PointMm, SchematicDesign,
-    SymbolInfo, SymbolPins,
+    DesignJunction, DesignLabel, DesignNoConnect, DesignSymbol, DesignWire, NetInfo, NetPin, PinInfo, PointMm,
+    SchematicDesign, SymbolInfo, SymbolPins,
 };
 pub use tidy::{
     design_library_ids, plan_reconnect, plan_tidy, plan_tidy_with_hints, tidy_spec, LayoutHints, NearHint, PlaceHint,

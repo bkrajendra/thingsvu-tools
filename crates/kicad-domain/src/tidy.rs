@@ -567,6 +567,7 @@ fn plan_redraw(
         matched.is_none()
     });
     let at = |p: Point| format!("({:.2}, {:.2})", p.x.to_mm(), p.y.to_mm());
+    keep_no_connects(design, library, &plan.moves, &mut plan.removals, &mut additions, &at);
     for (i, w) in design.wires.iter().enumerate() {
         if same_runs.contains(&existing_wires.key(w.start, w.end)) {
             keep_wire.insert(i);
@@ -666,6 +667,55 @@ fn plan_redraw(
     }
     plan.findings = findings;
     plan
+}
+
+/// A no-connect flag sits on a pin, and a part that moves leaves it behind. The flag of a part
+/// that moved is deleted and drawn again on the pin's new place; a flag of a part that stays, or
+/// one that is on no pin, is left alone.
+fn keep_no_connects(
+    design: &SchematicDesign,
+    library: &BTreeMap<LibraryId, LibrarySymbol>,
+    moves: &[SymbolMove],
+    removals: &mut Vec<Removal>,
+    additions: &mut Vec<Operation>,
+    at: &impl Fn(Point) -> String,
+) {
+    for flag in &design.no_connects {
+        let found = design.symbols.iter().find_map(|s| {
+            let pins = &library.get(&LibraryId::parse(&s.library_id).ok()?)?.pins;
+            let pin = pins.iter().find(|pin| {
+                s.orientation
+                    .apply(pin.local)
+                    .is_some_and(|local| s.position + local == flag.position)
+            })?;
+            Some((s, pin))
+        });
+        let Some((symbol, pin)) = found else {
+            continue;
+        };
+        let Some(moved) = moves.iter().find(|m| m.id == symbol.id) else {
+            continue;
+        };
+        let Some(local) = moved.orientation.apply(pin.local) else {
+            continue;
+        };
+        if moved.to + local == flag.position {
+            continue;
+        }
+        removals.push(Removal {
+            kind: RemovedKind::NoConnect,
+            id: flag.id.clone(),
+            description: format!(
+                "no-connect flag on {} pin {} at {}",
+                symbol.reference,
+                pin.number,
+                at(flag.position)
+            ),
+        });
+        additions.push(Operation::AddNoConnect {
+            position: moved.to + local,
+        });
+    }
 }
 
 fn body_at(library: &BTreeMap<LibraryId, LibrarySymbol>, id: &LibraryId, at: Placement) -> Option<Rect> {
@@ -896,6 +946,10 @@ mod tests {
                     direction: *direction,
                 }),
                 Operation::AddJunction { position } => design.junctions.push(DesignJunction {
+                    id,
+                    position: *position,
+                }),
+                Operation::AddNoConnect { position } => design.no_connects.push(crate::schematic::DesignNoConnect {
                     id,
                     position: *position,
                 }),
@@ -1153,6 +1207,47 @@ mod tests {
             !before.is_clean(),
             "the scrambled design should have problems: {before:#?}"
         );
+    }
+
+    #[test]
+    fn a_no_connect_flag_follows_its_pin_when_the_part_moves() {
+        let (built, mut design) = built_regulator();
+        let lib = library();
+        for (i, s) in design
+            .symbols
+            .iter_mut()
+            .filter(|s| !s.reference.starts_with('#'))
+            .enumerate()
+        {
+            s.position = Point::new(Nm(76_200_000 + 1_270_000 * (i as i64 % 3)), Nm(127_000_000));
+        }
+        design.labels.clear();
+        // A flag on pin 1 of U1, where U1 is now.
+        let u1 = design.symbols.iter().find(|s| s.reference == "U1").unwrap().clone();
+        let pin = lib[&LibraryId::parse(&u1.library_id).unwrap()].pins[0].clone();
+        let flag_at = u1.position + u1.orientation.apply(pin.local).unwrap();
+        design.no_connects.push(crate::schematic::DesignNoConnect {
+            id: "flag-1".into(),
+            position: flag_at,
+        });
+        let plan = plan_tidy(&design, &nets_of(&built), &lib);
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        let moved = plan.moves.iter().find(|m| m.reference == "U1").expect("U1 moves");
+        let now = moved.to + moved.orientation.apply(pin.local).unwrap();
+        assert!(plan
+            .removals
+            .iter()
+            .any(|r| r.kind == RemovedKind::NoConnect && r.id == "flag-1"));
+        assert!(
+            plan.operations
+                .iter()
+                .any(|o| matches!(o, Operation::AddNoConnect { position } if *position == now)),
+            "the flag is drawn again on the pin's new place"
+        );
+        // A flag that is on no pin is left where it is.
+        design.no_connects[0].position = Point::new(Nm(1_270_000), Nm(1_270_000));
+        let plan = plan_tidy(&design, &nets_of(&built), &lib);
+        assert!(plan.removals.iter().all(|r| r.kind != RemovedKind::NoConnect));
     }
 
     #[test]

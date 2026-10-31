@@ -2832,6 +2832,16 @@ async fn live_board_is_autorouted() {
     assert_eq!(plan["result"]["router"]["unrouted"], 0, "{plan}");
     assert!(plan["result"]["session"]["segments"].as_u64().unwrap() > 10, "{plan}");
     assert_eq!(plan["result"]["replaces"]["tracks"], 1, "the hand-made track: {plan}");
+    // The board's minimum goes to the router, so nothing comes back narrower.
+    let minimum = &plan["result"]["minimum_width"];
+    assert!(minimum["mm"].as_f64().unwrap() > 0.0, "{plan}");
+    println!("AUTOROUTE MINIMUM WIDTH {minimum}");
+    assert!(
+        plan["result"]["session"]["nets"].as_array().unwrap().iter().all(
+            |n| n["segments"] == 0 || n["min_width_mm"].as_f64().unwrap() + 1e-6 >= minimum["mm"].as_f64().unwrap()
+        ),
+        "{plan}"
+    );
     // Planning changed nothing.
     let tracks = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
     assert_eq!(tracks["result"]["track_count"], 1, "{tracks}");
@@ -2845,6 +2855,18 @@ async fn live_board_is_autorouted() {
     );
     assert_eq!(applied["ok"], true, "{applied}");
     assert_eq!(applied["result"]["drc"]["unrouted_after"], 0, "{applied}");
+    // Counts by type before and after, and only what is new is listed.
+    assert!(applied["result"]["drc"]["by_type_after"].is_object(), "{applied}");
+    assert!(applied["result"]["drc"]["new_violations_total"].is_u64(), "{applied}");
+    assert!(
+        applied["result"]["drc"]["after"].get("violations").is_none(),
+        "{applied}"
+    );
+    assert!(applied["result"]["dangling_vias_removed"].is_u64(), "{applied}");
+    println!(
+        "AUTOROUTE NEW VIOLATIONS {} dangling vias removed {}",
+        applied["result"]["drc"]["new_violations_total"], applied["result"]["dangling_vias_removed"]
+    );
     let after = mcp.call("pcb_list_footprints", json!({ "session_id": id })).await;
     assert_eq!(
         before["result"]["footprints"], after["result"]["footprints"],
@@ -3011,6 +3033,84 @@ fn freerouting_configured() -> bool {
         || kicad_session::registry::config_file().is_file()
 }
 
+/// Phase 14.1: the `fields` of a planned part are written to the placed symbol (hidden) and read
+/// back; a field that cannot be written is refused, never dropped. Both providers.
+#[tokio::test]
+async fn live_circuit_plan_fields_are_written_through_the_file_provider() {
+    plan_fields_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_circuit_plan_fields_are_written_through_the_api() {
+    plan_fields_flow("headless").await;
+}
+
+async fn plan_fields_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-fields-{provider}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("fields.kicad_sch");
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "create": true, "provider": provider }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let circuit = |fields: Value| {
+        json!({ "schema_version": 1, "name": "fields",
+            "components": [
+                { "id": "r1", "library_id": "Device:R", "value": "10k", "reference_preference": "R1", "fields": fields },
+                { "id": "r2", "library_id": "Device:R", "value": "4k7", "reference_preference": "R2" } ],
+            "nets": [ { "name": "MID", "pins": [
+                { "component_id": "r1", "pin_number": "2" }, { "component_id": "r2", "pin_number": "1" } ] } ] })
+    };
+    // A field that cannot be written is refused.
+    for name in ["Reference", "Value", "DNP"] {
+        let refused = mcp
+            .call(
+                "sch_plan_changes",
+                json!({ "session_id": id, "circuit": circuit(json!({ name: "x" })) }),
+            )
+            .await;
+        assert_eq!(refused["result"]["can_apply"], false, "{name}: {refused}");
+        assert!(refused.to_string().contains("UNWRITABLE_FIELD"), "{name}: {refused}");
+    }
+    let plan = mcp
+        .call(
+            "sch_plan_changes",
+            json!({ "session_id": id, "circuit": circuit(json!({ "MPN": "RC0603FR-0710KL", "Manufacturer": "Yageo" })) }),
+        )
+        .await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    assert!(
+        plan.to_string().contains("RC0603FR-0710KL"),
+        "the plan shows the field: {plan}"
+    );
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("fields-{provider}-{}", std::process::id()) }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let bom = mcp.call("bom_get", json!({ "session_id": id })).await;
+    let custom = bom["result"]["custom_fields"].to_string();
+    assert!(custom.contains("MPN") && custom.contains("Manufacturer"), "{bom}");
+    assert!(bom.to_string().contains("RC0603FR-0710KL"), "{bom}");
+    mcp.call("session_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
+}
+
 /// Holes made by v0.7.0 had no attributes: the review and the export checks warn, and
 /// `pcb_footprint_attrs_plan` repairs them, read back from the board.
 #[tokio::test]
@@ -3054,6 +3154,21 @@ async fn live_board_old_holes_are_repaired() {
     assert!(drc["result"]["unrouted"].as_u64().unwrap() > 0, "{drc}");
     let hint = drc["result"]["hint"].as_str().unwrap();
     assert!(hint.contains("pcb_autoroute_plan"), "{drc}");
+    // A summary has the counts and no list; types and a limit narrow the list (the counts stay).
+    let summary = mcp
+        .call("pcb_run_drc", json!({ "session_id": id, "summary_only": true }))
+        .await;
+    assert!(summary["result"].get("violations").is_none(), "{summary}");
+    assert_eq!(summary["result"]["unrouted"], drc["result"]["unrouted"], "{summary}");
+    assert_eq!(summary["result"]["by_type"], drc["result"]["by_type"], "{summary}");
+    let narrow = mcp
+        .call(
+            "pcb_run_drc",
+            json!({ "session_id": id, "types": ["no_such_type"], "limit": 1, "refill_zones": false }),
+        )
+        .await;
+    assert_eq!(narrow["result"]["violations"], json!([]), "{narrow}");
+    assert_eq!(narrow["result"]["by_type"], drc["result"]["by_type"], "{narrow}");
 
     // Make them like v0.7.0 made them.
     let old: Vec<Value> = ["H1", "H2", "H3", "H4"]
@@ -3255,6 +3370,10 @@ async fn live_board_is_exported() {
         )
         .await;
     assert_eq!(plan["ok"], true, "{plan}");
+    println!(
+        "EXPORT AUTOROUTE router {} minimum {} warnings {}",
+        plan["result"]["router"], plan["result"]["minimum_width"], plan["result"]["warnings"]
+    );
     let routed = apply_board(&mut mcp, &id, &plan, &key("route")).await;
     assert_eq!(routed["result"]["drc"]["unrouted_after"], 0, "{routed}");
 

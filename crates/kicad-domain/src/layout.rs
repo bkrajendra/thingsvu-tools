@@ -796,6 +796,7 @@ fn layout_chain(
             reference: references[&c.id].clone(),
             value: c.value.clone(),
             footprint: c.footprint.clone(),
+            fields: c.fields.clone(),
             position: part.position,
             orientation: part.orientation,
         });
@@ -1065,6 +1066,7 @@ pub(crate) fn translate(op: Operation, by: Point) -> Operation {
             reference,
             value,
             footprint,
+            fields,
             position,
             orientation,
         } => Operation::PlaceSymbol {
@@ -1073,6 +1075,7 @@ pub(crate) fn translate(op: Operation, by: Point) -> Operation {
             reference,
             value,
             footprint,
+            fields,
             position: position + by,
             orientation,
         },
@@ -1102,6 +1105,9 @@ pub(crate) fn translate(op: Operation, by: Point) -> Operation {
             net,
             position: position + by,
             direction,
+        },
+        Operation::AddNoConnect { position } => Operation::AddNoConnect {
+            position: position + by,
         },
         Operation::AddJunction { position } => Operation::AddJunction {
             position: position + by,
@@ -1171,7 +1177,9 @@ pub fn operations_bounds(operations: &[Operation], library: &BTreeMap<LibraryId,
                 ..
             } => symbol_rect(library_id, *position, *orientation),
             Operation::AddWire { start, end, .. } => Rect::from_points([*start, *end]),
-            Operation::AddJunction { position } => Rect::from_points([*position]),
+            Operation::AddJunction { position } | Operation::AddNoConnect { position } => {
+                Rect::from_points([*position])
+            }
             Operation::AddText {
                 text,
                 position,

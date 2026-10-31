@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::circuit::{CircuitSpec, PinRef, SCHEMA_VERSION};
 
 /// MVP limits (plan §10); large specs are rejected rather than partially processed.
-pub const MAX_COMPONENTS: usize = 50;
+/// Parts in one circuit plan; power-library parts (flags, supplies) do not count.
+pub const MAX_COMPONENTS: usize = 150;
 pub const MAX_NETS: usize = 200;
 pub const MAX_TEXT_LEN: usize = 256;
 
@@ -63,12 +64,16 @@ pub fn validate_circuit(spec: &CircuitSpec) -> Vec<Finding> {
             vec![],
         ));
     }
-    if spec.components.len() > MAX_COMPONENTS {
+    let parts = spec
+        .components
+        .iter()
+        .filter(|c| c.library_id.library() != "power")
+        .count();
+    if parts > MAX_COMPONENTS {
         out.push(Finding::error(
             "TOO_MANY_COMPONENTS",
             format!(
-                "{} components exceed the limit of {MAX_COMPONENTS}",
-                spec.components.len()
+                "{parts} components exceed the limit of {MAX_COMPONENTS} (power flags and supplies are not counted);                  split the circuit into parts and add them one after the other"
             ),
             vec![],
         ));
@@ -103,6 +108,28 @@ pub fn validate_circuit(spec: &CircuitSpec) -> Vec<Finding> {
                     "DUPLICATE_REFERENCE",
                     format!("reference '{r}' is preferred by both '{other}' and '{}'", c.id),
                     vec![other.to_string(), c.id.to_string()],
+                ));
+            }
+        }
+        for name in c.fields.keys() {
+            let refusal = match name.as_str() {
+                "" => Some("has a field with no name".to_owned()),
+                "Reference" => Some("sets the field 'Reference', which the plan numbers itself".to_owned()),
+                "Value" => Some("sets the field 'Value'; use the component's value".to_owned()),
+                "Footprint" => Some("sets the field 'Footprint'; use the component's footprint".to_owned()),
+                n if crate::plan::FLAG_FIELDS.contains(&n) => Some(format!(
+                    "sets '{n}', which is a flag; set it with sch_set_fields_plan after placing the part"
+                )),
+                n if n.chars().any(char::is_control) || n.len() > MAX_TEXT_LEN => {
+                    Some("has a field name that is too long or has control characters".to_owned())
+                }
+                _ => None,
+            };
+            if let Some(why) = refusal {
+                out.push(Finding::error(
+                    "UNWRITABLE_FIELD",
+                    format!("component '{}' {why}", c.id),
+                    vec![c.id.to_string()],
                 ));
             }
         }
@@ -236,6 +263,18 @@ mod tests {
             "UNKNOWN_COMPONENT",
         ] {
             assert!(found.contains(&expected), "missing {expected} in {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_field_that_cannot_be_written_is_refused() {
+        let mut spec = CircuitSpec::from_json(EXAMPLE).unwrap();
+        spec.components[0].fields.insert("MPN".into(), "A".into());
+        assert!(!codes(&spec).contains(&"UNWRITABLE_FIELD"), "a custom field is fine");
+        for name in ["Reference", "Value", "Footprint", "DNP", ""] {
+            let mut spec = CircuitSpec::from_json(EXAMPLE).unwrap();
+            spec.components[0].fields.insert(name.into(), "x".into());
+            assert!(codes(&spec).contains(&"UNWRITABLE_FIELD"), "{name:?} should be refused");
         }
     }
 

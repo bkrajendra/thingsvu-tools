@@ -58,11 +58,14 @@ impl DrcReport {
 
 /// Runs DRC on `board`, writing the JSON report to `report_path`. Violations do not make this
 /// fail; only a failure to run is an error. `parity` also compares the board with its schematic.
+/// `refill_zones` refills every zone first (in the copy `kicad-cli` reads, not in the editor), so
+/// stale fills do not show up as clearance errors.
 pub async fn run_drc(
     install: &KicadInstall,
     board: &Path,
     report_path: &Path,
     parity: bool,
+    refill_zones: bool,
     timeout: Duration,
 ) -> Result<DrcReport, CliError> {
     let mut args: Vec<OsString> = vec![
@@ -76,6 +79,9 @@ pub async fn run_drc(
     ];
     if parity {
         args.push("--schematic-parity".into());
+    }
+    if refill_zones {
+        args.push("--refill-zones".into());
     }
     args.push("--output".into());
     args.push(report_path.into());

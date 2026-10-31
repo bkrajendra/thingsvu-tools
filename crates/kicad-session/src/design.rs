@@ -5,8 +5,8 @@
 use kicad_domain::schematic::{DesignField, DesignShape, DesignText, ShapeKind};
 use kicad_domain::text::{HAlign, VAlign, DEFAULT_SIZE};
 use kicad_domain::{
-    Capability, DesignJunction, DesignLabel, DesignSymbol, DesignWire, Dir, ErrorCode, Nm, Point, SchematicDesign,
-    ToolError,
+    Capability, DesignJunction, DesignLabel, DesignNoConnect, DesignSymbol, DesignWire, Dir, ErrorCode, Nm, Point,
+    SchematicDesign, ToolError,
 };
 use kicad_ipc::proto::kiapi::common::commands::{GetItems, GetItemsResponse};
 use kicad_ipc::proto::kiapi::common::types::graphic_shape::Geometry;
@@ -196,6 +196,7 @@ impl Session {
         let mut wires = Vec::new();
         let mut labels = Vec::new();
         let mut junctions = Vec::new();
+        let mut no_connects = Vec::new();
         let mut annotations = 0;
         let mut texts = Vec::new();
         let mut shapes = Vec::new();
@@ -244,7 +245,11 @@ impl Session {
             } else if url == DirectiveLabel::type_url() {
                 unsupported("directive_label");
             } else if url == NoConnectMarker::type_url() {
-                unsupported("no_connect");
+                let n: NoConnectMarker = decode(any)?;
+                no_connects.push(DesignNoConnect {
+                    id: n.id.map(|k| k.value).unwrap_or_default(),
+                    position: point(&n.position),
+                });
             } else if url == SheetSymbol::type_url() {
                 unsupported("sheet");
             } else if url == SchematicTable::type_url() {
@@ -331,6 +336,7 @@ impl Session {
         design.wires = wires;
         design.labels = labels;
         design.junctions = junctions;
+        design.no_connects = no_connects;
         design.annotations = annotations;
         design.texts = texts;
         design.shapes = shapes;

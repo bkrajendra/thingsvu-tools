@@ -187,7 +187,7 @@ The same engine that lays out a new circuit can lay out an existing one. The cir
 
 ```mermaid
 flowchart LR
-    SHEET["The sheet<br/>parts, wires, labels,<br/>junctions, notes"] --> CHECK{"Anything tidying<br/>cannot redraw?<br/>buses, global labels,<br/>sheets, no-connects"}
+    SHEET["The sheet<br/>parts, wires, labels,<br/>junctions, notes"] --> CHECK{"Anything tidying<br/>cannot redraw?<br/>buses, global labels,<br/>sheets"}
     CHECK -->|yes| REFUSE["Refused, nothing changed<br/>the reason is reported"]
     CHECK -->|no| SPEC["Circuit spec<br/>parts + KiCad's nets"]
     NETS["Nets<br/>(power symbols and flags<br/>attached from the drawing)"] --> SPEC

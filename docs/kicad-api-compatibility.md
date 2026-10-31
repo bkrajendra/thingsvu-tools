@@ -100,6 +100,27 @@ Observed 25 Oct 2026 while building the file provider (`kicad-sexpr`, `FileSessi
 | Library lookup | Global libraries live in `<install>/share/kicad/symbols/<nickname>.kicad_sym` (10.0 and 10.99 on Windows). The project's own `sym-lib-table` can name others; the user's global table (custom libraries) is not read. |
 | KiCad 10 GUI loading of a generated file | **Not yet checked by the author**: loaded by `kicad-cli` 10.0.7 (netlist, ERC) only. See docs/tasks.md, Phase 6 notes. |
 
+## Rules, tracks, editor state (10.99, Phase 14.0 probe)
+
+Probe: `crates/kicad-session/tests/live_probe14.rs`, headless, on the regulator board. "Handled" means the call works and a read back (or the saved file) shows the result.
+
+| Command | Result |
+|---|---|
+| `GetNetClasses` / `SetNetClasses` (project) | **Handled.** `MMM_MERGE` adds a class (`Power`: 0.5 mm track, 0.25 mm clearance) and leaves `Default`. The saved `.kicad_pro` contains it. Needs the document's `ProjectSpecifier` |
+| `SetNetClassAssignments` (project) | **Handled.** A per-net assignment (`GND` -> `Power`) shows up in `GetNetClassForNets` as an effective class (0.5 mm track, 0.25 mm clearance) and in the saved `.kicad_pro` (`netclass_assignments`) |
+| `GetBoardDesignRules` / `SetBoardDesignRules` | **Handled.** Changing `min_track_width` to 0.15 mm reads back and is saved as `"min_track_width": 0.15`. The whole `BoardDesignRules` is sent back, so read first and change one field |
+| `GetCustomDesignRules` / `SetCustomDesignRules` | **Handled** with an empty rule list (status `CRS_NONE`). A non-empty list was not tried |
+| `GetBoardStackup` | **Handled** (finish, edge, every layer with thickness and type). `UpdateBoardStackup` is documented "not yet implemented", so the stackup is read-only |
+| `GetDocumentModifiedState` | **Handled.** `DMS_MODIFIED` after an edit, `DMS_UNMODIFIED` after a revert |
+| `RevertDocument` | **Handled** on a headless board: unsaved tracks are gone and the state returns to unmodified |
+| `RefreshEditor` | **Unhandled** on a headless server ("no handler available"). Not tried on a GUI editor |
+| `GetConnectedItems` | **Handled.** For one track it returned both tracks and the via of that connected run |
+| `GetTextExtents` | **Handled.** Returns a box (position and size) for a temporary `Text`: "R1 probe" at 1 mm came back 7.08 x 1.61 mm. Replaces the Phase 13 estimate in 15.4 |
+| `GetPadShapeAsPolygon` | **Handled.** One outline per pad, in board coordinates, for a given layer |
+| `GetTitleBlockInfo` / `SetTitleBlockInfo` | **Handled.** Title and revision read back. The message has nine comment fields |
+| `GetPageSettings` / `SetPageSettings` | **Handled** for a read and a write of the same settings (A4 landscape). A change of size was not tried |
+| Tracks and vias: `CreateItems`, `UpdateItems`, `DeleteItems` | **Handled.** `UpdateItems` re-widens a track (0.25 -> 0.4 mm) and locks it (`LS_LOCKED` = 2, unlocked = 1) in place. **`DeleteItems` deletes a locked track without complaint** (status OK), so the tools must refuse locked items themselves unless the item is named |
+
 ## Re-pinning to a new KiCad build
 
 Do this when KiCad 11.0 is released (the nightly `10.99` stops being the target), and whenever the pinned nightly is replaced.

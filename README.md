@@ -152,7 +152,7 @@ To clean up a schematic that already exists:
 
 > Review the schematic, then plan a tidy and show me what would move before you change anything.
 
-The tidy lays the circuit out again, keeping every part, value, and footprint and checking that every net is identical afterwards. It handles a single sheet of parts joined by wires, labels, and power symbols; buses, global labels, hierarchical sheets, and no-connect flags are refused with a reason, and text notes stay where they are.
+The tidy lays the circuit out again, keeping every part, value, and footprint and checking that every net is identical afterwards. It handles a single sheet of parts joined by wires, labels, and power symbols; buses, global labels, and hierarchical sheets are refused with a reason; no-connect flags stay on their pins (drawn again where a part moved), and text notes stay where they are.
 
 To steer it, or to arrange a small circuit yourself:
 
@@ -260,7 +260,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `bom_export` | Write the BOM as CSV into the project folder (generic or JLCPCB columns) |
 | `pcb_open` / `pcb_close` / `pcb_save` | Open a board (headless, file, or the PCB editor), close it, save it |
 | `pcb_info` / `pcb_list_footprints` / `pcb_get_footprint` / `pcb_list_nets` / `pcb_list_tracks` | Read the board: counts, outline, footprints with pads and courtyards, nets, tracks, vias, zones |
-| `pcb_run_drc` / `pcb_render` | Design rules check (with unrouted connections) and a 3D picture of the board |
+| `pcb_run_drc` / `pcb_render` | Design rules check (zones refilled first; counts by type, with `summary_only`, `severity`, `types`, and `limit` to keep a big board readable; unrouted connections) and a 3D picture of the board |
 | `pcb_review` | What stands out: overlaps, parts outside the outline, no outline, schematic and board that disagree, far connectors and decoupling capacitors, DRC |
 | `pcb_update_from_schematic_plan` / `pcb_apply_plan` | Update the board from its schematic: a dry run first, then apply after you confirm; every footprint and pad net is checked afterwards |
 | `pcb_outline_plan` | A board outline (rectangle, rounded corners) of a given size or fitted around the parts, with mounting holes in the corners or at given places; applied with `pcb_apply_plan` |
@@ -268,7 +268,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_move_plan` | Move, turn, flip, and lock named footprints (places on a grid, exact offsets); shows overlaps before and after; applied with `pcb_apply_plan`, every pad read back |
 | `pcb_route_plan` | Tracks and vias for named nets, pad to pad or through given points, at the net class width; checked against other nets' copper and the edge; DRC before and after applying |
 | `pcb_zone_plan` | Copper pours (ground first) over the board or an area, with clearance, minimum width, and thermal reliefs; refilled after applying, DRC before and after |
-| `pcb_autoroute_plan` | Route the whole board with Freerouting (optional, when configured): the router's result first, then KiCad's import, checked with DRC before and after |
+| `pcb_autoroute_plan` | Route the whole board with Freerouting (optional, when configured): the router's result first (wires narrower than the board's minimum are widened), then KiCad's import, dangling vias removed, checked with DRC before and after |
 | `pcb_export` | Gerbers, drill, positions, STEP, PDF/SVG plots, and the mechanical model, into the project, after the pre-export checks; every file read back |
 | `pcb_fab_package` | The files a board house needs (Gerber zip, BOM, CPL; JLCPCB or generic columns) and one zip with all of them and the checks report |
 | `pcb_mechanical_info` | Outline, thickness, mounting holes, keep-outs, connectors and the edge each faces, and part heights, for enclosure design. Read-only |
@@ -342,6 +342,7 @@ How releases are made: [releasing](docs/releasing.md).
 - **Now (also):** reading, DRC, rendering, and reviewing boards, and updating a board from its schematic
 - **Now (also):** board outline, placement, routing, pours, and autorouting (optional, with Freerouting)
 - **Now (also):** manufacturing outputs (Gerbers, drill, BOM and placement files, STEP) with checks before export, and a mechanical summary of the board
+- **In progress (Phase 14, not released yet):** done so far: the planned part's custom fields are written, DRC results are summaries with only the new violations after a change, zones are refilled before DRC, autorouting keeps the minimum track width and removes dangling vias, circuit plans and the tidy take 150 parts, and the tidy keeps no-connect flags. Next: track editing, design rules, session reload, checkpoints.
 - **Next (Phase 13b fixes, then Phases 14 to 16, see [docs/workflow-gaps-plan.md](docs/workflow-gaps-plan.md)):** text that follows turned parts, a repair for older mounting holes, track editing and rip-up, net classes and design rules, reloading and checkpoints, schematic no-connects and pin swaps, footprint and silkscreen edits, stitching and connectivity checks
 - **Also open:** hierarchical schematics
 - **Later:** 3D enclosure design driven from your PCB, so the whole embedded product comes together in one workflow

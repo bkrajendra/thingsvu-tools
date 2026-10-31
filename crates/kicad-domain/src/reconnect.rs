@@ -121,6 +121,7 @@ pub fn route(
             reference: references[&c.id].clone(),
             value: c.value.clone(),
             footprint: c.footprint.clone(),
+            fields: c.fields.clone(),
             position: at.position,
             orientation: at.orientation,
         });

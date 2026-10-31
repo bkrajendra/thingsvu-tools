@@ -15,7 +15,7 @@ use crate::text::{HAlign, VAlign};
 use crate::validation::{has_errors, validate_circuit, Finding, Severity};
 
 /// Upper bound on operations in one plan (plan §10 suggested 50; drawn schematics need more).
-pub const MAX_OPERATIONS: usize = 400;
+pub const MAX_OPERATIONS: usize = 1500;
 
 /// Geometry of a library symbol, from KiCad's library before anything is placed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -55,6 +55,9 @@ pub enum Operation {
         value: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         footprint: Option<String>,
+        /// Datasheet, Description, and custom fields written with the part (custom ones hidden).
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        fields: BTreeMap<String, String>,
         position: Point,
         orientation: Orientation,
     },
@@ -78,6 +81,10 @@ pub enum Operation {
         direction: Dir,
     },
     AddJunction {
+        position: Point,
+    },
+    /// A no-connect flag on a pin that stays unconnected.
+    AddNoConnect {
         position: Point,
     },
     /// A free text note.
@@ -127,6 +134,8 @@ pub enum RemovedKind {
     Wire,
     Label,
     Junction,
+    /// A no-connect flag; the plan draws it again on its pin.
+    NoConnect,
     /// A power symbol that only names a net (`#PWR…`); the plan draws it again where it belongs.
     PowerSymbol,
     /// A part the user asked to delete.
@@ -223,6 +232,7 @@ pub struct OperationCounts {
     pub wires: usize,
     pub labels: usize,
     pub junctions: usize,
+    pub no_connects: usize,
 }
 
 impl OperationPlan {
@@ -241,6 +251,7 @@ impl OperationPlan {
                 Operation::AddWire { .. } => c.wires += 1,
                 Operation::AddLabel { .. } => c.labels += 1,
                 Operation::AddJunction { .. } => c.junctions += 1,
+                Operation::AddNoConnect { .. } => c.no_connects += 1,
                 Operation::AddText { .. } => c.texts += 1,
                 Operation::AddShape { .. } => c.shapes += 1,
             }
@@ -544,7 +555,8 @@ pub(crate) mod tests {
                 Operation::PlaceSymbol { position, .. }
                 | Operation::PlacePowerSymbol { position, .. }
                 | Operation::AddLabel { position, .. }
-                | Operation::AddJunction { position } => vec![*position],
+                | Operation::AddJunction { position }
+                | Operation::AddNoConnect { position } => vec![*position],
                 Operation::AddWire { start, end, .. } => vec![*start, *end],
                 Operation::AddText { position, .. } => vec![*position],
                 Operation::AddShape { kind, .. } => {
@@ -689,6 +701,87 @@ mod readability_tests {
                 p.readability.fallback_nets
             );
         }
+    }
+
+    /// A circuit of `parts` parts on shared rails and signal nets (resistors, capacitors, LEDs,
+    /// regulators).
+    fn big_spec(parts: usize) -> CircuitSpec {
+        let (r, c, d, u) = (parts / 3, parts / 3, parts * 4 / 15, parts / 15);
+        let mut components = Vec::new();
+        let mut nets: Vec<serde_json::Value> = Vec::new();
+        let pin = |c: &str, n: &str| serde_json::json!({ "component_id": c, "pin_number": n });
+        let (mut vin, mut gnd, mut v33) = (vec![], vec![], vec![]);
+        for i in 0..r {
+            components.push(serde_json::json!({ "id": format!("r{i}"), "library_id": "Device:R", "value": "10k" }));
+            vin.push(pin(&format!("r{i}"), "1"));
+        }
+        for i in 0..c {
+            components.push(serde_json::json!({ "id": format!("c{i}"), "library_id": "Device:C", "value": "100n" }));
+            gnd.push(pin(&format!("c{i}"), "2"));
+        }
+        for i in 0..d {
+            components.push(serde_json::json!({ "id": format!("d{i}"), "library_id": "Device:LED", "value": "red" }));
+            gnd.push(pin(&format!("d{i}"), "2"));
+        }
+        for i in 0..u {
+            components.push(serde_json::json!({ "id": format!("u{i}"), "library_id": "Regulator_Linear:AMS1117-3.3", "value": "3V3" }));
+            vin.push(pin(&format!("u{i}"), "3"));
+            gnd.push(pin(&format!("u{i}"), "1"));
+            v33.push(pin(&format!("u{i}"), "2"));
+        }
+        for i in 0..r.min(c) {
+            let mut pins = vec![pin(&format!("r{i}"), "2"), pin(&format!("c{i}"), "1")];
+            if i < d {
+                pins.push(pin(&format!("d{i}"), "1"));
+            }
+            nets.push(serde_json::json!({ "name": format!("S{i}"), "pins": pins }));
+        }
+        nets.push(serde_json::json!({ "name": "+5V", "pins": vin }));
+        nets.push(serde_json::json!({ "name": "GND", "pins": gnd }));
+        nets.push(serde_json::json!({ "name": "+3V3", "pins": v33 }));
+        let json = serde_json::json!({ "schema_version": 1, "name": "big", "components": components, "nets": nets });
+        CircuitSpec::from_json(&json.to_string()).unwrap()
+    }
+
+    /// W2: 150 parts plan in tens of milliseconds (23 ms in a release build, 671 operations), clean
+    /// and within the operation limit; one part more is refused, and power flags are not parts.
+    #[test]
+    fn a_circuit_of_150_parts_is_planned_clean() {
+        let started = std::time::Instant::now();
+        let p = plan_circuit(&big_spec(150), &library(), &ExistingDocument::default());
+        println!(
+            "150 parts: {} operations in {:?}",
+            p.operations.len(),
+            started.elapsed()
+        );
+        assert!(!has_errors(&p.findings), "{:#?}", p.findings);
+        assert!(p.readability.is_clean(), "{:#?}", p.readability);
+        assert!(p.operations.len() <= MAX_OPERATIONS);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn one_part_over_the_limit_is_refused_but_flags_are_not_counted() {
+        let over = plan_circuit(&big_spec(153), &library(), &ExistingDocument::default());
+        assert!(
+            over.findings.iter().any(|f| f.code == "TOO_MANY_COMPONENTS"),
+            "{:?}",
+            over.findings
+        );
+        let mut spec = big_spec(150);
+        for i in 0..5 {
+            spec.components.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("flag{i}"), "library_id": "power:PWR_FLAG", "value": "PWR_FLAG"
+                }))
+                .unwrap(),
+            );
+        }
+        assert!(!validate_circuit(&spec).iter().any(|f| f.code == "TOO_MANY_COMPONENTS"));
     }
 
     #[test]

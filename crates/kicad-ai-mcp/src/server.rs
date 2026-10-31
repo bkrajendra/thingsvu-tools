@@ -1348,7 +1348,7 @@ afterwards, and findings (errors block applying)."
         description = "Look at the whole drawing of an existing schematic and say what is untidy: symbols \
 that overlap, wires that run through a part, power nets named by text instead of a power symbol. Also \
 reports whether sch_tidy_plan can redraw it (it handles one sheet of parts joined by wires, local labels, \
-and power symbols; buses, global labels, hierarchical sheets, and no-connect flags are refused) and how \
+and power symbols, with no-connect flags kept on their pins; buses, global labels, and hierarchical sheets are refused) and how \
 much it would change. Read-only. Use sch_render to see it."
     )]
     pub async fn sch_review(&self, Parameters(args): Parameters<SessionArgs>) -> CallToolResult {

@@ -242,6 +242,13 @@ impl ShapeKind {
     }
 }
 
+/// A no-connect flag (the cross on a pin that is meant to stay unconnected).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DesignNoConnect {
+    pub id: String,
+    pub position: Point,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DesignJunction {
     pub id: String,
@@ -256,6 +263,8 @@ pub struct SchematicDesign {
     pub wires: Vec<DesignWire>,
     pub labels: Vec<DesignLabel>,
     pub junctions: Vec<DesignJunction>,
+    /// No-connect flags, each on a pin.
+    pub no_connects: Vec<DesignNoConnect>,
     /// Free text notes.
     pub texts: Vec<DesignText>,
     /// Lines, rectangles, and circles drawn on the sheet.

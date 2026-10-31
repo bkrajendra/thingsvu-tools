@@ -102,6 +102,8 @@ pub enum BoardOp {
         diameter: Nm,
         drill: Nm,
     },
+    /// A via deleted (a dangling one left by a router).
+    RemoveVia { id: String, net: String, at: Point },
     /// A copper pour.
     AddZone(Box<crate::zones::ZoneSpec>),
     /// A zone being replaced.
@@ -654,6 +656,74 @@ pub fn unmarked_holes(board: &Board) -> Vec<&BoardFootprint> {
 
 /// Plans setting attributes on named footprints, and with `mounting_holes` on every mounting hole
 /// that is still listed as a part. An entry that names an attribute only changes that attribute.
+/// Vias that join fewer than two copper layers, so they carry nothing: no track of their net
+/// touches them on two layers, no pad of their net is under them, and no zone of their net covers
+/// them on the layer a track does not reach. Routers leave a few behind; a via stitching a pour on
+/// both layers is not one of them.
+pub fn dangling_vias(board: &Board) -> Vec<&crate::board::BoardVia> {
+    board
+        .vias
+        .iter()
+        .filter(|via| {
+            let reach = via.diameter.0 / 2 + PLACE_TOLERANCE_NM;
+            let touches = |p: Point| {
+                let (dx, dy) = ((p.x.0 - via.at.x.0) as f64, (p.y.0 - via.at.y.0) as f64);
+                dx.hypot(dy) <= reach as f64
+            };
+            let under_pad =
+                board.footprints.iter().flat_map(|f| &f.pads).any(|pad| {
+                    pad.net == via.net && pad.copper().map_or_else(|| touches(pad.at), |r| r.contains(via.at))
+                });
+            if under_pad {
+                return false;
+            }
+            let mut layers: BTreeSet<&str> = board
+                .tracks
+                .iter()
+                .filter(|t| t.net == via.net && (touches(t.start) || touches(t.end)))
+                .map(|t| t.layer.as_str())
+                .collect();
+            for z in board.zones.iter().filter(|z| z.net == via.net) {
+                if z.bounds.is_some_and(|b| b.contains(via.at)) {
+                    layers.extend(z.layers.iter().map(String::as_str));
+                }
+            }
+            layers.len() < 2
+        })
+        .collect()
+}
+
+/// Deletes the vias in `ids`, as one plan.
+pub fn plan_remove_vias(board: &Board, ids: &[String]) -> Result<BoardEditPlan, ToolError> {
+    let mut operations = Vec::new();
+    for id in ids {
+        let via = board
+            .vias
+            .iter()
+            .find(|v| &v.id == id)
+            .ok_or_else(|| bad(format!("via {id} is not on the board")))?;
+        operations.push(BoardOp::RemoveVia {
+            id: id.clone(),
+            net: via.net.clone(),
+            at: via.at,
+        });
+    }
+    if operations.is_empty() {
+        return Err(bad("no vias to remove"));
+    }
+    let mut expected = board.clone();
+    expected.vias.retain(|v| !ids.contains(&v.id));
+    let measure = measure(board);
+    Ok(BoardEditPlan {
+        kind: "cleanup",
+        operations,
+        before: measure.clone(),
+        after: measure,
+        warnings: vec![],
+        expected,
+    })
+}
+
 pub fn plan_attributes(
     board: &Board,
     requests: &[AttributeRequest],
@@ -865,6 +935,15 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                     problems.push(format!("the old zone {name} ({id}) is still there"));
                 }
             }
+            BoardOp::RemoveVia { id, net, at } => {
+                if after.vias.iter().any(|v| &v.id == id) {
+                    problems.push(format!(
+                        "the {net} via at ({:.3}, {:.3}) mm ({id}) is still there",
+                        at.x.to_mm(),
+                        at.y.to_mm()
+                    ));
+                }
+            }
             BoardOp::SetAttributes { reference, to, .. } => match by_ref.get(reference.as_str()) {
                 Some(f) if FootprintFlags::of(f) == *to => {}
                 Some(f) => problems.push(format!(
@@ -992,6 +1071,64 @@ mod tests {
             nets: vec!["A".into(), "B".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_via_that_joins_fewer_than_two_layers_is_dangling() {
+        use crate::board::{BoardTrack, BoardVia, BoardZone};
+        let via = |id: &str, net: &str, at: Point| BoardVia {
+            id: id.into(),
+            at,
+            diameter: Nm::from_mm(0.6).unwrap(),
+            drill: Nm::from_mm(0.3).unwrap(),
+            net: net.into(),
+        };
+        let track = |net: &str, layer: &str, a: Point, b: Point| BoardTrack {
+            id: format!("t-{layer}-{}", a.x.0),
+            start: a,
+            end: b,
+            width: Nm::from_mm(0.25).unwrap(),
+            layer: layer.into(),
+            net: net.into(),
+            locked: false,
+        };
+        let mut b = board();
+        b.vias = vec![
+            via("joined", "A", p(5.0, 5.0)),
+            via("stub", "A", p(8.0, 5.0)),
+            via("loose", "A", p(30.0, 30.0)),
+            via("under-pad", "A", p(9.0, 10.0)),
+            via("stitch", "B", p(40.0, 5.0)),
+        ];
+        b.tracks = vec![
+            track("A", "F.Cu", p(5.0, 5.0), p(7.0, 5.0)),
+            track("A", "B.Cu", p(5.0, 5.0), p(5.0, 8.0)),
+            track("A", "F.Cu", p(8.0, 5.0), p(7.0, 5.0)),
+        ];
+        b.zones = vec![BoardZone {
+            id: "z".into(),
+            name: "gnd".into(),
+            layers: vec!["F.Cu".into(), "B.Cu".into()],
+            net: "B".into(),
+            priority: 0,
+            bounds: Some(Rect::from_points([p(35.0, 0.0), p(45.0, 10.0)]).unwrap()),
+            locked: false,
+            filled: true,
+        }];
+        let found: Vec<&str> = dangling_vias(&b).iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(
+            found,
+            ["stub", "loose"],
+            "pad R1.1 is net A at (9, 10): under-pad is fine"
+        );
+        let plan = plan_remove_vias(&b, &["stub".into(), "loose".into()]).unwrap();
+        assert_eq!(plan.kind, "cleanup");
+        assert!(plan.expected.vias.iter().all(|v| v.id != "stub" && v.id != "loose"));
+        let mut after = b.clone();
+        after.vias.retain(|v| v.id != "stub");
+        let problems = verify_edit(&plan, &after);
+        assert!(problems.iter().any(|m| m.contains("loose")), "{problems:?}");
+        assert!(!problems.iter().any(|m| m.contains("stub")), "{problems:?}");
     }
 
     fn outline_req() -> OutlineRequest {
