@@ -128,6 +128,8 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_render",
             "pcb_review",
             "pcb_route_plan",
+            "pcb_rules",
+            "pcb_rules_plan",
             "pcb_run_drc",
             "pcb_save",
             "pcb_track_edit_plan",
@@ -3073,6 +3075,162 @@ async fn live_tracks_are_edited() {
     assert_eq!(none["result"]["track_count"], 0, "{none}");
     mcp.call("pcb_close", json!({ "session_id": id, "discard_unsaved": true }))
         .await;
+}
+
+/// Phase 14.3: net classes, assignments, board minimums, and mask/paste margins are read and
+/// changed without a file edit: through the API in a live session (saved with `pcb_save`), and in
+/// the project file by a file session.
+#[tokio::test]
+async fn live_design_rules_are_planned_applied_and_read_back() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("rules", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-rules-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+
+    let before = mcp.call("pcb_rules", json!({ "session_id": id })).await;
+    assert_eq!(before["ok"], true, "{before}");
+    assert_eq!(before["result"]["net_classes"][0]["name"], "Default", "{before}");
+    assert!(
+        before["result"]["stackup"]["layers"].as_array().unwrap().len() >= 4,
+        "{before}"
+    );
+
+    // Refusals.
+    for bad in [
+        json!({ "session_id": id }),
+        json!({ "session_id": id, "remove_net_classes": ["Default"] }),
+        json!({ "session_id": id, "net_classes": [{ "name": "Empty" }] }),
+        json!({ "session_id": id, "assign": [{ "net": "NOPE", "class": "Default" }] }),
+        json!({ "session_id": id, "assign": [{ "net": "GND", "class": "Ghost" }] }),
+        json!({ "session_id": id, "net_classes": [{ "name": "X", "via_diameter_mm": 0.4, "via_drill_mm": 0.5 }] }),
+    ] {
+        let r = mcp.call("pcb_rules_plan", bad.clone()).await;
+        assert_eq!(r["ok"], false, "{bad}: {r}");
+    }
+
+    let plan = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": id,
+                "net_classes": [{ "name": "Power", "track_width_mm": 0.5, "clearance_mm": 0.25,
+                                  "via_diameter_mm": 0.8, "via_drill_mm": 0.4 }],
+                "assign": [{ "net": "GND", "class": "Power" }, { "pattern": "/VBUS*", "class": "Power" }],
+                "minimums": { "track_width_mm": 0.15, "hole_to_hole_mm": 0.25 },
+                "mask_paste": { "mask_expansion_mm": 0.05, "paste_margin_ratio": -0.1 } }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["kind"], "rules");
+    assert!(plan["result"]["changes"].as_array().unwrap().len() >= 10, "{plan}");
+    // Planning changed nothing.
+    let same = mcp.call("pcb_rules", json!({ "session_id": id })).await;
+    assert_eq!(same["result"]["net_classes"], before["result"]["net_classes"]);
+
+    let applied = apply_board(&mut mcp, &id, &plan, &key("apply")).await;
+    println!("RULES APPLY {}", applied["result"]);
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let after = mcp.call("pcb_rules", json!({ "session_id": id })).await;
+    let power = after["result"]["net_classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "Power")
+        .expect("the new class")
+        .clone();
+    assert_eq!(power["values_mm"]["track_width"], 0.5, "{after}");
+    assert_eq!(power["values_mm"]["via_diameter"], 0.8, "{after}");
+    assert_eq!(power["values_mm"]["via_drill"], 0.4, "{after}");
+    assert!(power["nets"].to_string().contains("GND"), "{power}");
+    assert!(power["nets"].to_string().contains("/VBUS"), "pattern: {power}");
+    assert_eq!(after["result"]["minimums_mm"]["track_width"], 0.15, "{after}");
+    assert_eq!(after["result"]["mask_paste_mm"]["paste_margin_ratio"], -0.1, "{after}");
+
+    // Saved with the board.
+    let saved = mcp.call("pcb_save", json!({ "session_id": id })).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    let project = std::fs::read_to_string(std::path::Path::new(&pcb).with_extension("kicad_pro")).unwrap();
+    assert!(
+        project.contains("\"Power\"") && project.contains("\"min_track_width\": 0.15"),
+        "{project}"
+    );
+    mcp.call("pcb_close", json!({ "session_id": id })).await;
+
+    // A file session changes the project file: a class, an assignment, a minimum; with a backup.
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "file" }))
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let fid = opened["result"]["session_id"].clone();
+    let read = mcp.call("pcb_rules", json!({ "session_id": fid })).await;
+    assert_eq!(read["ok"], true, "{read}");
+    assert!(read["result"]["net_classes"].to_string().contains("Power"), "{read}");
+    assert!(read["result"]["mask_paste_mm"].is_null(), "{read}");
+    let mask = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": fid, "mask_paste": { "mask_expansion_mm": 0.1 } }),
+        )
+        .await;
+    assert_eq!(mask["ok"], false, "mask margins are not in the project file: {mask}");
+    let plan = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": fid,
+                "net_classes": [{ "name": "Power", "track_width_mm": 0.6 }, { "name": "Signal", "track_width_mm": 0.2 }],
+                "assign": [{ "net": "+3V3", "class": "Signal" }],
+                "unassign": ["GND"],
+                "minimums": { "copper_edge_mm": 0.4 } }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    let applied = apply_board(&mut mcp, &fid, &plan, &key("file")).await;
+    println!("RULES FILE APPLY {}", applied["result"]);
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let pro_path = std::path::Path::new(&pcb).with_extension("kicad_pro");
+    assert!(
+        pro_path.with_extension("kicad_pro.thingsvu-bak").is_file(),
+        "a backup is kept"
+    );
+    let project = std::fs::read_to_string(&pro_path).unwrap();
+    assert!(
+        project.contains("\"Signal\"") && project.contains("\"min_copper_edge_clearance\": 0.4"),
+        "{project}"
+    );
+    let read = mcp.call("pcb_rules", json!({ "session_id": fid })).await;
+    let signal = read["result"]["net_classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "Signal")
+        .unwrap()
+        .clone();
+    assert!(signal["nets"].to_string().contains("+3V3"), "{read}");
+    assert!(!read["result"]["assignments"].to_string().contains("GND"), "{read}");
+
+    // An editor that has the board open blocks the change.
+    let lock = std::path::Path::new(&pcb).with_file_name(format!(
+        "~{}.lck",
+        std::path::Path::new(&pcb).file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&lock, "{}").unwrap();
+    let plan = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": fid, "minimums": { "copper_edge_mm": 0.3 } }),
+        )
+        .await;
+    let blocked = apply_board(&mut mcp, &fid, &plan, &key("locked")).await;
+    assert_eq!(blocked["error"]["code"], "DOCUMENT_OPEN_ELSEWHERE", "{blocked}");
+    std::fs::remove_file(&lock).unwrap();
+    mcp.call("pcb_close", json!({ "session_id": fid })).await;
 }
 
 /// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows

@@ -25,6 +25,7 @@ pub mod readability;
 pub mod reconnect;
 pub mod result;
 pub mod routing;
+pub mod rules;
 pub mod schematic;
 pub mod text;
 pub mod tidy;

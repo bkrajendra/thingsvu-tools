@@ -26,6 +26,7 @@ use crate::headless::HeadlessServer;
 use crate::session::{new_session_id, Provider, SessionConfig};
 
 mod edit;
+mod rules;
 pub use edit::{BoardSnapshot, EditReport, RestoreReport, SessionImport};
 
 /// What `pcb_update_from_schematic` reports, from a dry run or the real import.

@@ -10,7 +10,7 @@ use std::time::Duration;
 use kicad_domain::board::{place_rect, Board};
 use kicad_domain::board_edit::{self, BoardEditPlan, BoardOp, HolePlacement, MoveRequest, OutlineRequest};
 use kicad_domain::placement::{self, NearHint, PinnedPlace, PlaceHints, PlaceOptions};
-use kicad_domain::{routing, track_edit, zones};
+use kicad_domain::{routing, rules, track_edit, zones};
 use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
 use kicad_session::{BoardSession, Provider};
 use rmcp::handler::server::wrapper::Parameters;
@@ -357,6 +357,8 @@ pub enum PendingWork {
     Edit(Box<BoardEditPlan>),
     /// A routed Specctra session (12.7).
     Autoroute(PendingSession),
+    /// Changes to the design rules (14.3).
+    Rules(Box<rules::RulesPlan>),
 }
 
 /// A board plan waiting to be applied.
@@ -519,6 +521,119 @@ pub struct PcbTrackEditArgs {
     /// `zero_length`, `duplicates`.
     #[serde(default)]
     pub cleanup: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbRulesArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NetClassArg {
+    /// The class name. A class that does not exist is created (give at least one value); `Default` is
+    /// changed in place.
+    pub name: String,
+    #[serde(default)]
+    pub clearance_mm: Option<f64>,
+    #[serde(default)]
+    pub track_width_mm: Option<f64>,
+    #[serde(default)]
+    pub via_diameter_mm: Option<f64>,
+    #[serde(default)]
+    pub via_drill_mm: Option<f64>,
+    #[serde(default)]
+    pub diff_pair_width_mm: Option<f64>,
+    #[serde(default)]
+    pub diff_pair_gap_mm: Option<f64>,
+    /// Lower numbers win when a net is in more than one class.
+    #[serde(default)]
+    pub priority: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssignArg {
+    /// A net on the board, e.g. GND or /VBUS. Or a pattern, not both.
+    #[serde(default)]
+    pub net: Option<String>,
+    /// A wildcard pattern over net names: `*` for any run, `?` for one character (e.g. `/VBUS*`).
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// The net class they go in.
+    pub class: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MinimumsArg {
+    #[serde(default)]
+    pub clearance_mm: Option<f64>,
+    #[serde(default)]
+    pub track_width_mm: Option<f64>,
+    /// Smallest via (copper) diameter.
+    #[serde(default)]
+    pub via_diameter_mm: Option<f64>,
+    /// Smallest via ring: (diameter - drill) / 2.
+    #[serde(default)]
+    pub via_annular_mm: Option<f64>,
+    /// Smallest drilled hole.
+    #[serde(default)]
+    pub through_hole_mm: Option<f64>,
+    #[serde(default)]
+    pub hole_to_hole_mm: Option<f64>,
+    /// Copper to the board edge.
+    #[serde(default)]
+    pub copper_edge_mm: Option<f64>,
+    /// Copper to a hole.
+    #[serde(default)]
+    pub hole_clearance_mm: Option<f64>,
+    #[serde(default)]
+    pub silk_clearance_mm: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MaskPasteArg {
+    /// How far the solder mask opening reaches past a pad.
+    #[serde(default)]
+    pub mask_expansion_mm: Option<f64>,
+    /// The narrowest mask web between two openings.
+    #[serde(default)]
+    pub mask_min_width_mm: Option<f64>,
+    #[serde(default)]
+    pub mask_to_copper_mm: Option<f64>,
+    /// Paste margin (negative shrinks the stencil opening).
+    #[serde(default)]
+    pub paste_margin_mm: Option<f64>,
+    /// Paste margin as a fraction of the pad (-0.1 is 10 % smaller).
+    #[serde(default)]
+    pub paste_margin_ratio: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbRulesPlanArgs {
+    pub session_id: String,
+    /// Net classes to create or change (only the values given change).
+    #[serde(default)]
+    pub net_classes: Vec<NetClassArg>,
+    /// Net classes to remove (their assignments go with them). Not `Default`.
+    #[serde(default)]
+    pub remove_net_classes: Vec<String>,
+    /// Which nets go in which class, by name or by pattern.
+    #[serde(default)]
+    pub assign: Vec<AssignArg>,
+    /// Nets or patterns whose assignment is removed.
+    #[serde(default)]
+    pub unassign: Vec<String>,
+    /// The board's minimums (what DRC enforces whatever the classes say).
+    #[serde(default)]
+    pub minimums: Option<MinimumsArg>,
+    /// Solder mask and paste margins (live sessions only).
+    #[serde(default)]
+    pub mask_paste: Option<MaskPasteArg>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1334,6 +1449,103 @@ Apply with pcb_apply_plan; the attributes are read back."
     }
 
     #[tool(
+        name = "pcb_rules",
+        description = "Read the board's design rules: the net classes (clearance, track width, via diameter and drill, \\ndifferential pair width and gap, priority), which nets are in which class (direct assignments, then \\npatterns, else Default), the board minimums (clearance, track width, via size and ring, hole, hole to \\nhole, copper to edge and to hole, silk), the solder mask and paste margins (live sessions), and the \\nstackup (layers, thickness, material; live sessions). Read-only. Change them with pcb_rules_plan."
+    )]
+    pub async fn pcb_rules(&self, Parameters(args): Parameters<PcbRulesArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let state = board.read_rules().await?;
+            let data = board.read().await?;
+            let stackup = board.read_stackup().await?;
+            Ok::<_, ToolError>((state, data.nets, stackup))
+        }
+        .await;
+        match result {
+            Ok((state, nets, stackup)) => envelope::ok(
+                &cid,
+                serde_json::json!({
+                    "net_classes": state.classes.iter().map(|c| serde_json::json!({
+                        "name": c.name, "priority": c.priority,
+                        "values_mm": c.values.iter().map(|(f, v)| (rules::field_name(*f).replace(' ', "_"), mm(v.0))).collect::<BTreeMap<_, _>>(),
+                        "nets": nets_in_class(&state, &nets, &c.name),
+                    })).collect::<Vec<_>>(),
+                    "assignments": state.assignments,
+                    "patterns": state.patterns.iter().map(|(p, k)| serde_json::json!({ "pattern": p, "class": k })).collect::<Vec<_>>(),
+                    "minimums_mm": state.minimums.iter().map(|(f, v)| (rules::min_name(*f).replace(' ', "_"), mm(v.0))).collect::<BTreeMap<_, _>>(),
+                    "mask_paste_mm": if board.is_file_session() { serde_json::Value::Null } else {
+                        serde_json::json!({
+                            "values": state.mask.iter().map(|(f, v)| (rules::mask_name(*f).replace(' ', "_"), mm(v.0))).collect::<BTreeMap<_, _>>(),
+                            "paste_margin_ratio": state.paste_ratio,
+                        })
+                    },
+                    "stackup": stackup,
+                    "note": "Change with pcb_rules_plan.",
+                }),
+                board_provenance(&board),
+                vec![],
+            ),
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_rules_plan",
+        description = "Plan changes to the design rules: net_classes (create or change values: clearance_mm, track_width_mm, \\nvia_diameter_mm, via_drill_mm, diff_pair_width_mm, diff_pair_gap_mm, priority), remove_net_classes, \\nassign (a net or a wildcard pattern to a class), unassign, minimums (clearance, track width, via size \\nand ring, hole sizes, copper to edge), and mask_paste (solder mask and paste margins). The plan lists \\neach change with the value it replaces, and warns when a class is below a board minimum (DRC would flag \\nevery track made with it). Apply with pcb_apply_plan: in a live session the rules change in the open \\nboard (pcb_save writes them to the project); with no editor, a file session edits only these keys of \\nthe .kicad_pro file after kicad-cli has accepted a copy, and keeps a .thingsvu-bak copy. Rules are \\nread back; DRC before and after is reported, not judged. Mask and paste margins need a live session."
+    )]
+    pub async fn pcb_rules_plan(&self, Parameters(args): Parameters<PcbRulesPlanArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            let current = board.read_rules().await?;
+            let data = board.read().await?;
+            let request = rules_request(&args)?;
+            if board.is_file_session() && (!request.mask.is_empty() || request.paste_ratio.is_some()) {
+                return Err(ToolError::new(
+                    ErrorCode::FeatureUnavailable,
+                    "solder mask and paste margins are stored in the board file; open the board with a live KiCad 11 session to change them",
+                ));
+            }
+            let plan = rules::plan_rules(&current, &data.nets, &request)?;
+            Ok::<_, ToolError>((plan, rules_fingerprint(&current)))
+        }
+        .await;
+        match result {
+            Ok((plan, fp)) => {
+                let plan_id = self.next_pcb_plan_id();
+                let warnings = plan.warnings.clone();
+                let body = serde_json::json!({
+                    "plan_id": plan_id,
+                    "kind": "rules",
+                    "can_apply": true,
+                    "changes": plan.changes.iter().map(rule_change_json).collect::<Vec<_>>(),
+                    "warnings": plan.warnings,
+                    "via": if board.is_file_session() { "the .kicad_pro file (a backup is kept)" } else { "the open board; pcb_save writes the project" },
+                    "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms.",
+                });
+                self.state.pending_updates.lock().await.insert(
+                    plan_id,
+                    PendingUpdate {
+                        session_id: board.id().to_owned(),
+                        fingerprint: fp,
+                        applied_with: None,
+                        work: PendingWork::Rules(Box::new(plan)),
+                    },
+                );
+                envelope::ok(&cid, body, board_provenance(&board), warnings)
+            }
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_move_plan",
         description = "Plan moving named footprints: each entry gives a reference and an absolute place \n(x_mm, y_mm) or an offset (dx_mm, dy_mm), a turn (rotation_deg, or rotate_by_deg), a side (front or \nback; a flip as in KiCad), and lock true or false. Absolute places snap to grid_mm (0.5; 0 for none); \noffsets are exact. Locked footprints are refused unless allow_locked is true. The plan lists every move \nwith the overlaps and footprints outside the outline before and after. Needs a live KiCad 11 session. \nApply with pcb_apply_plan; every pad is read back."
     )]
@@ -1743,7 +1955,13 @@ Apply with pcb_apply_plan; the attributes are read back."
                     ),
                 );
             }
+            if let PendingWork::Rules(rules_plan) = &plan.work {
+                let (fp, rules_plan) = (plan.fingerprint.clone(), rules_plan.clone());
+                drop(pending);
+                return self.apply_rules_plan(&cid, &board, &args, &fp, &rules_plan).await;
+            }
             let work = match &plan.work {
+                PendingWork::Rules(_) => unreachable!("handled above"),
                 PendingWork::Update { netlist, schematic } => Err((netlist.clone(), schematic.clone())),
                 PendingWork::Edit(edit) => Ok(Ok(edit.clone())),
                 PendingWork::Autoroute(s) => Ok(Err((s.ses.clone(), s.dir.clone(), s.nets.clone()))),
@@ -1938,6 +2156,192 @@ impl KicadAiServer {
         let _ = std::fs::remove_dir_all(&dir);
         result
     }
+}
+
+impl KicadAiServer {
+    /// Applies changes to the design rules, reads them back, and reports DRC before and after.
+    async fn apply_rules_plan(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        args: &PcbApplyArgs,
+        fp: &str,
+        plan: &rules::RulesPlan,
+    ) -> CallToolResult {
+        let result = async {
+            let before = board.read_rules().await?;
+            if rules_fingerprint(&before) != fp {
+                return Err(ToolError::new(
+                    ErrorCode::StalePlan,
+                    "the rules changed since the plan was made; make a new plan",
+                ));
+            }
+            let drc_before = self.run_drc(cid, board, false, true).await.ok();
+            board.apply_rules(plan).await?;
+            let after = board.read_rules().await?;
+            let drc_after = self.run_drc(cid, board, false, true).await.ok();
+            Ok::<_, ToolError>((after, drc_before, drc_after))
+        }
+        .await;
+        let (after, drc_before, drc_after) = match result {
+            Ok(r) => r,
+            Err(e) => return envelope::error(cid, &e),
+        };
+        if let Some(p) = self.state.pending_updates.lock().await.get_mut(&args.plan_id) {
+            p.applied_with = Some(args.idempotency_key.clone());
+        }
+        let problems = rules::verify_rules(plan, &after);
+        let verified = problems.is_empty();
+        let drc = match (&drc_before, &drc_after) {
+            (Some(b), Some(a)) => {
+                let mut cmp = drc_comparison(b, a);
+                cmp["after"] = self.hinted(drc_json_view(
+                    a,
+                    &DrcView {
+                        summary_only: true,
+                        ..DrcView::default()
+                    },
+                ));
+                Some(cmp)
+            }
+            _ => None,
+        };
+        let undo = match board.provider() {
+            Provider::File => "the project file was replaced; the earlier one is next to it as .kicad_pro.thingsvu-bak".to_owned(),
+            Provider::Gui => "changed in the open editor; pcb_save writes the project (the editor can undo the board, not the project rules)".to_owned(),
+            _ => "not saved yet; pcb_save writes the rules to the project, closing with discard_unsaved drops them".to_owned(),
+        };
+        let body = serde_json::json!({
+            "applied": true,
+            "verified": verified,
+            "kind": "rules",
+            "changes": plan.changes.len(),
+            "problems": problems,
+            "drc": drc,
+            "undo": undo,
+            "note": "DRC is reported, not judged: tighter rules are meant to show new violations. Rules are not rolled back automatically.",
+            "next": "Check with pcb_rules, then pcb_save.",
+        });
+        if verified {
+            envelope::ok(cid, body, board_provenance(board), vec![])
+        } else {
+            envelope::ok_with_state(
+                cid,
+                kicad_domain::ResultState::Partial,
+                body,
+                board_provenance(board),
+                vec!["applied, but the rules read back differently; see problems".to_owned()],
+            )
+        }
+    }
+}
+
+fn rules_fingerprint(state: &rules::RulesState) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{state:?}").hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// The nets in a class, as KiCad resolves them: a direct assignment, then the first pattern that
+/// matches, else the Default class.
+fn nets_in_class(state: &rules::RulesState, nets: &[String], class: &str) -> Vec<String> {
+    nets.iter()
+        .filter(|n| {
+            let resolved = state
+                .assignments
+                .get(*n)
+                .and_then(|v| v.first().cloned())
+                .or_else(|| {
+                    state
+                        .patterns
+                        .iter()
+                        .find(|(p, _)| rules::glob_matches(p, n))
+                        .map(|(_, k)| k.clone())
+                })
+                .unwrap_or_else(|| rules::DEFAULT_CLASS.to_owned());
+            resolved == class
+        })
+        .cloned()
+        .collect()
+}
+
+fn rules_request(a: &PcbRulesPlanArgs) -> Result<rules::RulesRequest, ToolError> {
+    use rules::{ClassField, MaskField, MinField};
+    let opt = |name: &str, v: Option<f64>| v.map(|x| nm_arg(name, x)).transpose();
+    let mut request = rules::RulesRequest {
+        remove_classes: a.remove_net_classes.clone(),
+        unassign: a.unassign.clone(),
+        ..Default::default()
+    };
+    for c in &a.net_classes {
+        let mut values = BTreeMap::new();
+        for (field, name, v) in [
+            (ClassField::Clearance, "clearance_mm", c.clearance_mm),
+            (ClassField::TrackWidth, "track_width_mm", c.track_width_mm),
+            (ClassField::ViaDiameter, "via_diameter_mm", c.via_diameter_mm),
+            (ClassField::ViaDrill, "via_drill_mm", c.via_drill_mm),
+            (ClassField::DiffPairWidth, "diff_pair_width_mm", c.diff_pair_width_mm),
+            (ClassField::DiffPairGap, "diff_pair_gap_mm", c.diff_pair_gap_mm),
+        ] {
+            if let Some(v) = opt(name, v)? {
+                values.insert(field, v);
+            }
+        }
+        request.classes.push(rules::ClassRequest {
+            name: c.name.clone(),
+            priority: c.priority,
+            values,
+        });
+    }
+    for x in &a.assign {
+        request.assign.push(rules::AssignRequest {
+            net: x.net.clone(),
+            pattern: x.pattern.clone(),
+            class: x.class.clone(),
+        });
+    }
+    if let Some(m) = &a.minimums {
+        for (field, name, v) in [
+            (MinField::Clearance, "clearance_mm", m.clearance_mm),
+            (MinField::TrackWidth, "track_width_mm", m.track_width_mm),
+            (MinField::ViaDiameter, "via_diameter_mm", m.via_diameter_mm),
+            (MinField::ViaAnnular, "via_annular_mm", m.via_annular_mm),
+            (MinField::ThroughHole, "through_hole_mm", m.through_hole_mm),
+            (MinField::HoleToHole, "hole_to_hole_mm", m.hole_to_hole_mm),
+            (MinField::CopperEdge, "copper_edge_mm", m.copper_edge_mm),
+            (MinField::HoleClearance, "hole_clearance_mm", m.hole_clearance_mm),
+            (MinField::SilkClearance, "silk_clearance_mm", m.silk_clearance_mm),
+        ] {
+            if let Some(v) = opt(name, v)? {
+                request.minimums.insert(field, v);
+            }
+        }
+    }
+    if let Some(m) = &a.mask_paste {
+        for (field, name, v) in [
+            (MaskField::Expansion, "mask_expansion_mm", m.mask_expansion_mm),
+            (MaskField::MinWidth, "mask_min_width_mm", m.mask_min_width_mm),
+            (MaskField::ToCopper, "mask_to_copper_mm", m.mask_to_copper_mm),
+            (MaskField::PasteMargin, "paste_margin_mm", m.paste_margin_mm),
+        ] {
+            if let Some(v) = opt(name, v)? {
+                request.mask.insert(field, v);
+            }
+        }
+        request.paste_ratio = m.paste_margin_ratio;
+    }
+    Ok(request)
+}
+
+fn rule_change_json(c: &rules::RuleChange) -> serde_json::Value {
+    use rules::RuleOp::*;
+    let mut v = serde_json::to_value(c).unwrap_or_default();
+    // Sizes are in nm in the model; show mm.
+    if let ClassSet { value, .. } | MinSet { value, .. } | MaskSet { value, .. } = &c.op {
+        v["value"] = serde_json::json!(mm(value.0));
+    }
+    v
 }
 
 fn track_selector(s: &TrackSelectArg) -> Result<track_edit::Selector, ToolError> {
