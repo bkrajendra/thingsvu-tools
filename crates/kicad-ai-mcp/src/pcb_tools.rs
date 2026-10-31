@@ -57,6 +57,13 @@ pub struct PcbFootprintsArgs {
     /// Include every pad (number, kind, place, net) of each footprint.
     #[serde(default)]
     pub include_pads: bool,
+    /// `summary` (default) or `full`: every pad's shape, size, drill, and turn, the courtyard
+    /// outline, and the footprint's text and fields with layer, size, place, and visibility.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Only these references (a full listing of a whole board is long).
+    #[serde(default)]
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -65,6 +72,24 @@ pub struct PcbFootprintArgs {
     pub session_id: String,
     /// The footprint's reference, e.g. U1.
     pub reference: String,
+    /// `summary` (default) or `full`, as in pcb_list_footprints.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbDrawingsArgs {
+    pub session_id: String,
+    /// Only these layers, e.g. Edge.Cuts or F.SilkS.
+    #[serde(default)]
+    pub layers: Vec<String>,
+    /// Only these kinds: line, rect, circle, arc, polygon, bezier, or text.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// How many items to return (default 200, at most 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -881,7 +906,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_list_footprints",
-        description = "Every footprint on the board: reference, value, library id, side, position (mm), \\nrotation, locked, do-not-populate, pad count, and courtyard size; optionally every pad with its place \\nand net. Read-only."
+        description = "Every footprint on the board: reference, value, library id, side, position (mm), \\nrotation, locked, do-not-populate, pad count, and courtyard size; optionally every pad with its place \\nand net. With detail: full, also each pad's shape, size, drill, and turn, the courtyard outline, and the \\ntext and fields with layer, size, place, and visibility (narrow it with references). Read-only."
     )]
     pub async fn pcb_list_footprints(&self, Parameters(args): Parameters<PcbFootprintsArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -890,19 +915,31 @@ impl KicadAiServer {
             Err(e) => return envelope::error(&cid, &e),
         };
         let result = async {
+            let full = detail_wanted(args.detail.as_deref())?;
             let mut data = board.read().await?;
             let libs = self.footprint_libraries_in(board.document_path().parent()).await;
             fill_courtyards(&mut data, &libs);
-            Ok::<_, ToolError>(data)
+            let detail = if full { Some(board.read_detail().await?) } else { None };
+            Ok::<_, ToolError>((data, detail))
         }
         .await;
         match result {
-            Ok(data) => {
-                let mut footprints: Vec<_> = data.footprints.iter().collect();
+            Ok((data, detail)) => {
+                let mut footprints: Vec<_> = data
+                    .footprints
+                    .iter()
+                    .filter(|f| args.references.is_empty() || args.references.contains(&f.reference))
+                    .collect();
                 footprints.sort_by_key(|f| kicad_domain::bom::natural(&f.reference));
                 let rows: Vec<_> = footprints
                     .iter()
-                    .map(|f| footprint_json(f, args.include_pads))
+                    .map(|f| {
+                        let mut row = footprint_json(f, args.include_pads);
+                        if let Some(d) = detail.as_ref().and_then(|d| d.footprint(&f.reference)) {
+                            row["detail"] = footprint_detail_json(d);
+                        }
+                        row
+                    })
                     .collect();
                 envelope::ok(
                     &cid,
@@ -917,7 +954,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_get_footprint",
-        description = "One footprint with all its pads (number, kind, place in mm, net) and its courtyard. Read-only."
+        description = "One footprint with all its pads (number, kind, place in mm, net) and its courtyard; with detail: full, also each pad's shape, size, drill, and turn, the courtyard outline, and the text and fields. Read-only."
     )]
     pub async fn pcb_get_footprint(&self, Parameters(args): Parameters<PcbFootprintArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -926,15 +963,23 @@ impl KicadAiServer {
             Err(e) => return envelope::error(&cid, &e),
         };
         let result = async {
+            let full = detail_wanted(args.detail.as_deref())?;
             let mut data = board.read().await?;
             let libs = self.footprint_libraries_in(board.document_path().parent()).await;
             fill_courtyards(&mut data, &libs);
-            Ok::<_, ToolError>(data)
+            let detail = if full { Some(board.read_detail().await?) } else { None };
+            Ok::<_, ToolError>((data, detail))
         }
         .await;
         match result {
-            Ok(data) => match data.footprints.iter().find(|f| f.reference == args.reference) {
-                Some(f) => envelope::ok(&cid, footprint_json(f, true), board_provenance(&board), vec![]),
+            Ok((data, detail)) => match data.footprints.iter().find(|f| f.reference == args.reference) {
+                Some(f) => {
+                    let mut row = footprint_json(f, true);
+                    if let Some(d) = detail.as_ref().and_then(|d| d.footprint(&f.reference)) {
+                        row["detail"] = footprint_detail_json(d);
+                    }
+                    envelope::ok(&cid, row, board_provenance(&board), vec![])
+                }
                 None => envelope::error(
                     &cid,
                     &ToolError::new(
@@ -943,6 +988,56 @@ impl KicadAiServer {
                     ),
                 ),
             },
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
+        name = "pcb_list_drawings",
+        description = "The drawings and text on the board itself (not in footprints): lines, rectangles, circles, arcs, \\npolygons, and text, each with its layer, points in mm, line width, fill, and lock, and text with its size and \\nturn. Narrow by layers (e.g. Edge.Cuts, F.SilkS) and kinds; the counts per layer cover everything. \\nRead-only."
+    )]
+    pub async fn pcb_list_drawings(&self, Parameters(args): Parameters<PcbDrawingsArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        match board.read_detail().await {
+            Ok(d) => {
+                let limit = args.limit.unwrap_or(200).clamp(1, 1000);
+                let layer_ok = |l: &str| args.layers.is_empty() || args.layers.iter().any(|x| x == l);
+                let kind_ok = |k: &str| args.kinds.is_empty() || args.kinds.iter().any(|x| x == k);
+                let mut by_layer: BTreeMap<String, usize> = BTreeMap::new();
+                for s in &d.shapes {
+                    *by_layer.entry(s.layer.clone()).or_default() += 1;
+                }
+                for t in &d.texts {
+                    *by_layer.entry(t.layer.clone()).or_default() += 1;
+                }
+                let shapes: Vec<_> = d
+                    .shapes
+                    .iter()
+                    .filter(|s| layer_ok(&s.layer) && kind_ok(s.kind))
+                    .collect();
+                let texts: Vec<_> = d
+                    .texts
+                    .iter()
+                    .filter(|t| layer_ok(&t.layer) && kind_ok("text"))
+                    .collect();
+                envelope::ok(
+                    &cid,
+                    serde_json::json!({
+                        "counts_by_layer": by_layer,
+                        "shapes": shapes.iter().take(limit).map(|s| shape_detail_json(s)).collect::<Vec<_>>(),
+                        "texts": texts.iter().take(limit).map(|t| text_detail_json(t)).collect::<Vec<_>>(),
+                        "shapes_matching": shapes.len(),
+                        "texts_matching": texts.len(),
+                        "units": "mm; x grows right, y grows down",
+                    }),
+                    board_provenance(&board),
+                    vec![],
+                )
+            }
             Err(e) => envelope::error(&cid, &e),
         }
     }
@@ -2342,6 +2437,48 @@ fn rule_change_json(c: &rules::RuleChange) -> serde_json::Value {
         v["value"] = serde_json::json!(mm(value.0));
     }
     v
+}
+
+fn detail_wanted(detail: Option<&str>) -> Result<bool, ToolError> {
+    match detail {
+        None | Some("summary") => Ok(false),
+        Some("full") => Ok(true),
+        Some(other) => Err(bad_arg(format!("detail is summary or full, not '{other}'"))),
+    }
+}
+
+fn xy(p: Point) -> serde_json::Value {
+    serde_json::json!({ "x": mm(p.x.0), "y": mm(p.y.0) })
+}
+
+fn text_detail_json(t: &kicad_domain::board_detail::TextDetail) -> serde_json::Value {
+    serde_json::json!({
+        "id": t.id, "name": t.name, "text": t.text, "layer": t.layer, "at": xy(t.at),
+        "angle_deg": round2(t.angle_deg), "height": mm(t.height.0), "thickness": mm(t.thickness.0),
+        "visible": t.visible, "locked": t.locked,
+    })
+}
+
+fn shape_detail_json(s: &kicad_domain::board_detail::ShapeDetail) -> serde_json::Value {
+    serde_json::json!({
+        "id": s.id, "kind": s.kind, "layer": s.layer, "points": s.points.iter().map(|p| xy(*p)).collect::<Vec<_>>(),
+        "width": mm(s.width.0), "filled": s.filled, "locked": s.locked,
+    })
+}
+
+fn footprint_detail_json(d: &kicad_domain::board_detail::FootprintDetail) -> serde_json::Value {
+    serde_json::json!({
+        "pads": d.pads.iter().map(|p| serde_json::json!({
+            "number": p.number, "kind": p.kind, "shape": p.shape, "at": xy(p.at),
+            "angle_deg": round2(p.angle_deg),
+            "size": p.size.map(|(w, h)| serde_json::json!({ "x": mm(w.0), "y": mm(h.0) })),
+            "drill": p.drill.map(|(w, h)| serde_json::json!({ "x": mm(w.0), "y": mm(h.0) })),
+            "corner_ratio": p.corner_ratio, "layers": p.layers, "net": p.net,
+        })).collect::<Vec<_>>(),
+        "courtyard": d.courtyard.iter().map(shape_detail_json).collect::<Vec<_>>(),
+        "texts": d.texts.iter().map(text_detail_json).collect::<Vec<_>>(),
+        "other_graphics_by_layer": d.graphics,
+    })
 }
 
 fn track_selector(s: &TrackSelectArg) -> Result<track_edit::Selector, ToolError> {

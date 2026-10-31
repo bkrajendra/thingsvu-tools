@@ -8,6 +8,7 @@ pub mod fab;
 pub mod fp;
 pub mod node;
 pub mod pcb;
+pub mod pcb_detail;
 pub mod sch;
 pub mod ses;
 pub mod sym;

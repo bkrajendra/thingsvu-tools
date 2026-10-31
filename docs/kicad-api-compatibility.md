@@ -116,6 +116,7 @@ Probe: `crates/kicad-session/tests/live_probe14.rs`, headless, on the regulator 
 | `RevertDocument` | **Handled** on a headless board: unsaved tracks are gone and the state returns to unmodified |
 | `RefreshEditor` | **Unhandled** on a headless server ("no handler available"). Not tried on a GUI editor |
 | `GetConnectedItems` | **Handled.** For one track it returned both tracks and the via of that connected run |
+| Full geometry (14.4) | A footprint from `GetItems` carries its pads (`Pad` with a `PadStack`: shape, size, rounding ratio, and drill on the stack), its drawings (`BoardGraphicShape`, courtyard on `F.CrtYd`/`B.CrtYd`), extra fields (`Field`) and free text (`BoardText`) in `definition.items`, and the four standard fields on the instance. Positions are on the board. File and API give the same values for the regulator board (pad places, drills, reference text with the same id) |
 | `GetTextExtents` | **Handled.** Returns a box (position and size) for a temporary `Text`: "R1 probe" at 1 mm came back 7.08 x 1.61 mm. Replaces the Phase 13 estimate in 15.4 |
 | `GetPadShapeAsPolygon` | **Handled.** One outline per pad, in board coordinates, for a given layer |
 | `GetTitleBlockInfo` / `SetTitleBlockInfo` | **Handled.** Title and revision read back. The message has nine comment fields |

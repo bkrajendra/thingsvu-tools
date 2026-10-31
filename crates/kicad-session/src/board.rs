@@ -25,6 +25,7 @@ use crate::errors::from_ipc_error;
 use crate::headless::HeadlessServer;
 use crate::session::{new_session_id, Provider, SessionConfig};
 
+mod detail;
 mod edit;
 mod rules;
 pub use edit::{BoardSnapshot, EditReport, RestoreReport, SessionImport};

@@ -117,6 +117,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_footprint_attrs_plan",
             "pcb_get_footprint",
             "pcb_info",
+            "pcb_list_drawings",
             "pcb_list_footprints",
             "pcb_list_nets",
             "pcb_list_tracks",
@@ -1735,6 +1736,84 @@ async fn board_read_flow(provider: &str) {
         .call("pcb_get_footprint", json!({ "session_id": id, "reference": "U9" }))
         .await;
     assert_eq!(missing["ok"], false, "{missing}");
+
+    // Phase 14.4: the full geometry. Every pad has a shape and a size; the through-hole connector's
+    // pads have a drill; the courtyard is an outline; the reference is a visible text; the place of
+    // each pad agrees with the summary listing.
+    let full = mcp
+        .call(
+            "pcb_list_footprints",
+            json!({ "session_id": id, "detail": "full", "include_pads": true, "references": ["J1", "U1"] }),
+        )
+        .await;
+    assert_eq!(full["ok"], true, "{full}");
+    assert_eq!(full["result"]["count"], 2, "only the named references: {full}");
+    for f in full["result"]["footprints"].as_array().unwrap() {
+        let detail = &f["detail"];
+        let summary_pads = f["pads"].as_array().unwrap();
+        let pads = detail["pads"].as_array().unwrap();
+        assert_eq!(pads.len(), summary_pads.len(), "{f}");
+        for pad in pads {
+            assert!(
+                pad["shape"].is_string() && pad["size"]["x"].as_f64().unwrap() > 0.0,
+                "{pad}"
+            );
+            // (A number can be on two pads: the tab of a SOT-223 is a second pad 2.)
+            let near = |p: &Value| {
+                p["number"] == pad["number"]
+                    && (p["at"]["x"].as_f64().unwrap() - pad["at"]["x"].as_f64().unwrap()).abs() < 0.01
+                    && (p["at"]["y"].as_f64().unwrap() - pad["at"]["y"].as_f64().unwrap()).abs() < 0.01
+            };
+            assert!(
+                summary_pads.iter().any(near),
+                "{provider}: detail and summary agree on where pad {} is: {pad}",
+                pad["number"]
+            );
+        }
+        assert!(!detail["courtyard"].as_array().unwrap().is_empty(), "{f}");
+        let reference = detail["texts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "Reference")
+            .unwrap_or_else(|| panic!("{provider}: no reference text in {detail}"));
+        assert_eq!(reference["text"], f["reference"], "{reference}");
+        assert!(reference["height"].as_f64().unwrap() > 0.0, "{reference}");
+    }
+    let j1_full = full["result"]["footprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["reference"] == "J1")
+        .unwrap();
+    assert!(
+        j1_full["detail"]["pads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["kind"] == "thru_hole" && p["drill"]["x"].as_f64().unwrap_or(0.0) > 0.3),
+        "{provider}: the connector's pads are drilled: {j1_full}"
+    );
+    println!("DETAIL ({provider}) J1 pad {}", j1_full["detail"]["pads"][0]);
+    println!("DETAIL ({provider}) J1 reference {}", j1_full["detail"]["texts"][0]);
+    let one = mcp
+        .call(
+            "pcb_get_footprint",
+            json!({ "session_id": id, "reference": "U1", "detail": "full" }),
+        )
+        .await;
+    assert_eq!(one["result"]["detail"]["pads"].as_array().unwrap().len(), 4, "{one}");
+    let bad = mcp
+        .call(
+            "pcb_list_footprints",
+            json!({ "session_id": id, "detail": "everything" }),
+        )
+        .await;
+    assert_eq!(bad["ok"], false, "{bad}");
+    // A board with no outline and no drawings has none to list.
+    let drawings = mcp.call("pcb_list_drawings", json!({ "session_id": id })).await;
+    assert_eq!(drawings["ok"], true, "{drawings}");
+    assert_eq!(drawings["result"]["shapes_matching"], 0, "{drawings}");
 
     let nets = mcp.call("pcb_list_nets", json!({ "session_id": id })).await;
     let gnd = nets["result"]["nets"]["GND"]["pads"].as_array().unwrap();
@@ -3489,6 +3568,32 @@ async fn live_board_old_holes_are_repaired() {
         apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
         true
     );
+    // The outline is a drawing on Edge.Cuts: a rectangle 44 x 34 mm at the origin asked for.
+    let drawings = mcp
+        .call(
+            "pcb_list_drawings",
+            json!({ "session_id": id, "layers": ["Edge.Cuts"], "kinds": ["rect"] }),
+        )
+        .await;
+    assert_eq!(drawings["result"]["shapes_matching"], 1, "{drawings}");
+    let edge = &drawings["result"]["shapes"][0];
+    let (a, b) = (&edge["points"][0], &edge["points"][1]);
+    let (w, h) = (
+        (b["x"].as_f64().unwrap() - a["x"].as_f64().unwrap()).abs(),
+        (b["y"].as_f64().unwrap() - a["y"].as_f64().unwrap()).abs(),
+    );
+    assert!((w - 44.0).abs() < 0.2 && (h - 34.0).abs() < 0.2, "{edge}");
+    assert!(
+        drawings["result"]["counts_by_layer"]["Edge.Cuts"].as_u64().unwrap() >= 1,
+        "{drawings}"
+    );
+    let none = mcp
+        .call(
+            "pcb_list_drawings",
+            json!({ "session_id": id, "layers": ["F.SilkS"], "kinds": ["text"] }),
+        )
+        .await;
+    assert_eq!(none["result"]["texts_matching"], 0, "{none}");
     let codes = |review: &Value| -> Vec<String> {
         review["result"]["issues"]
             .as_array()
