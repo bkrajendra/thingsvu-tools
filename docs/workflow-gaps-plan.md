@@ -1,6 +1,6 @@
 # Plan: closing the gaps found in a full board session (Phases 14 to 16)
 
-Status: planned, not started (written 27 Oct 2026, after v0.8.0; Phase 13b added 31 Oct 2026). The task lists are in [tasks.md](tasks.md), Phases 13b and 14 to 16. This page holds the reasoning: what was missing, what already exists, what to build first, and the decisions that need the project owner's review.
+Status: Phase 13b (v0.8.1) done on 31 Oct 2026; Phases 14 to 16 planned, not started (written 27 Oct 2026, after v0.8.0). The task lists are in [tasks.md](tasks.md), Phases 13b and 14 to 16. This page holds the reasoning: what was missing, what already exists, what to build first, and the decisions that need the project owner's review.
 
 ## Where this comes from
 

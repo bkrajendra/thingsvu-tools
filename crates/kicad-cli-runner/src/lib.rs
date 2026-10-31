@@ -15,7 +15,6 @@ pub mod install;
 pub mod netlist;
 pub mod pcb;
 mod run;
-mod sexpr;
 
 pub use install::{discover, InstallSource, KicadInstall, KicadVersion};
 pub use run::{CliError, CliOutput};

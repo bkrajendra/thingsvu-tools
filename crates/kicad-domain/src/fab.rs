@@ -329,6 +329,38 @@ pub fn drc_check(drc: Option<&DrcSummary>) -> FabCheck {
     }
 }
 
+/// Mounting holes still listed as parts: boards made with v0.7.0 had no attributes on their holes,
+/// so a placement file would list each as a part to place.
+pub fn holes_check(facts: &FabFacts) -> FabCheck {
+    let mut listed: Vec<String> = facts
+        .footprints
+        .iter()
+        .filter(|f| {
+            (f.lib_id.starts_with("MountingHole:") || (f.reference.starts_with('H') && !f.connected))
+                && !(f.exclude_from_pos && f.exclude_from_bom)
+        })
+        .map(|f| f.reference.clone())
+        .collect();
+    listed.sort();
+    if listed.is_empty() {
+        return FabCheck::new(
+            "holes_marked",
+            CheckStatus::Pass,
+            "no mounting hole is listed as a part",
+            vec![],
+        );
+    }
+    FabCheck::new(
+        "holes_marked",
+        CheckStatus::Warning,
+        format!(
+            "{} mounting hole(s) would appear in the position file and the BOM as parts to place;              pcb_footprint_attrs_plan with mounting_holes: true leaves them out",
+            listed.len()
+        ),
+        listed,
+    )
+}
+
 /// Every check before an export, in order.
 pub fn pre_export(
     facts: &FabFacts,
@@ -341,6 +373,7 @@ pub fn pre_export(
         drc_check(drc),
         bom_check(facts, bom),
         silk_check(facts, outline),
+        holes_check(facts),
     ]
 }
 
@@ -475,5 +508,28 @@ mod tests {
             blocking(&checks).iter().map(|c| c.id).collect::<Vec<_>>(),
             ["outline_closed"]
         );
+    }
+
+    #[test]
+    fn holes_that_would_be_listed_as_parts_are_a_warning() {
+        let hole = |reference: &str, excluded: bool| FootprintFacts {
+            reference: reference.into(),
+            lib_id: "MountingHole:MountingHole_3.2mm_M3".into(),
+            exclude_from_bom: excluded,
+            exclude_from_pos: excluded,
+            board_only: excluded,
+            ..Default::default()
+        };
+        let facts = |holes: Vec<FootprintFacts>| FabFacts {
+            footprints: holes,
+            ..Default::default()
+        };
+        let ok = holes_check(&facts(vec![hole("H1", true), hole("H2", true)]));
+        assert_eq!(ok.status, CheckStatus::Pass);
+        let bad = holes_check(&facts(vec![hole("H1", true), hole("H2", false)]));
+        assert_eq!(bad.status, CheckStatus::Warning);
+        assert_eq!(bad.items, ["H2"]);
+        assert!(bad.message.contains("pcb_footprint_attrs_plan"));
+        assert!(blocking(&[bad]).is_empty(), "a warning never stops an export");
     }
 }

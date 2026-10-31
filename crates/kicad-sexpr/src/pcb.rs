@@ -185,6 +185,10 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
                         local_court.extend(shape_points(shape));
                     }
                 }
+                let has_attr = |name: &str| {
+                    item.child("attr")
+                        .is_some_and(|a| a.items().iter().any(|i| i.text() == Some(name)))
+                };
                 board.footprints.push(BoardFootprint {
                     id: item
                         .child_text("uuid")
@@ -198,9 +202,10 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
                     position,
                     rotation_deg,
                     locked: is_yes(item, "locked"),
-                    dnp: item
-                        .child("attr")
-                        .is_some_and(|a| a.items().iter().any(|i| i.text() == Some("dnp"))),
+                    dnp: has_attr("dnp"),
+                    exclude_from_bom: has_attr("exclude_from_bom"),
+                    exclude_from_pos: has_attr("exclude_from_pos_files"),
+                    board_only: has_attr("board_only"),
                     pads,
                     courtyard: bounds(local_court.iter().copied()).map(|r| place_rect(position, rotation_deg, r)),
                     courtyard_local: bounds(local_court),

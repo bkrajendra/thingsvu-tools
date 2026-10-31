@@ -114,6 +114,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_close",
             "pcb_export",
             "pcb_fab_package",
+            "pcb_footprint_attrs_plan",
             "pcb_get_footprint",
             "pcb_info",
             "pcb_list_footprints",
@@ -164,6 +165,9 @@ async fn lists_tools_and_returns_envelopes() {
     assert_eq!(status["ok"], true, "{status}");
     assert_eq!(status["result_state"], "done");
     assert_eq!(status["result"]["sessions"], json!([]));
+    // Whether an autorouter is set up is always reported, with where to look when it is not.
+    assert!(status["result"]["autorouter"]["configured"].is_boolean(), "{status}");
+    assert_eq!(status["result"]["autorouter"]["tool"], "pcb_autoroute_plan");
     assert!(status["correlation_id"].as_str().unwrap().starts_with("req-"));
 
     let relative = mcp
@@ -2717,6 +2721,45 @@ async fn gui_pcb_zone_demo() {
     println!("GUI DONE: GND is poured; Ctrl+Z undoes the fill, a second Ctrl+Z the zone");
 }
 
+/// Against a real KiCad 11 PCB editor: the pre-export checks and the exports, from the live board.
+/// Open a **copy** of a project in the PCB Editor (a routed board gets its files in `fab/` next to
+/// it), press "KiCad AI: connect" there, then run with THINGSVU_GUI_PCB_EXPORT=1. Nothing in the
+/// board changes.
+#[tokio::test]
+async fn gui_pcb_export_demo() {
+    if std::env::var("THINGSVU_GUI_PCB_EXPORT").as_deref() != Ok("1") {
+        eprintln!("skipped: set THINGSVU_GUI_PCB_EXPORT=1 with a registered KiCad PCB editor");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let opened = mcp.call("pcb_open", json!({ "provider": "gui" })).await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let all = json!(["gerbers", "drill", "positions", "step", "pdf", "svg", "mechanical"]);
+    let exported = mcp
+        .call("pcb_export", json!({ "session_id": id, "outputs": all }))
+        .await;
+    println!("GUI EXPORT {}", exported["result_state"]);
+    for check in exported["result"]["checks"].as_array().into_iter().flatten() {
+        println!("  check {} {}: {}", check["id"], check["status"], check["message"]);
+    }
+    match exported["result_state"].as_str() {
+        Some("done") => {
+            println!("GUI EXPORT verification {}", exported["result"]["verification"]);
+            assert!(exported["result"]["verification"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty()));
+        }
+        Some("rejected") => println!(
+            "GUI EXPORT refused by a check; nothing was written: {}",
+            exported["result"]["blocking"]
+        ),
+        other => panic!("unexpected result {other:?}: {exported}"),
+    }
+    let closed = mcp.call("pcb_close", json!({ "session_id": id })).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+}
+
 /// The placed regulator board routed by Freerouting: planned (export, route, summary; nothing
 /// changes), imported, read back, and checked with DRC. Needs KICAD_LIVE=1 and
 /// THINGSVU_FREEROUTING (and THINGSVU_JAVA unless java is on the PATH).
@@ -2966,6 +3009,103 @@ fn freerouting_configured() -> bool {
     std::env::var_os("THINGSVU_FREEROUTING").is_some()
         || std::env::var_os("THINGSVU_CONFIG").is_some()
         || kicad_session::registry::config_file().is_file()
+}
+
+/// Holes made by v0.7.0 had no attributes: the review and the export checks warn, and
+/// `pcb_footprint_attrs_plan` repairs them, read back from the board.
+#[tokio::test]
+async fn live_board_old_holes_are_repaired() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("holes", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-holes-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 44, "height_mm": 34, "origin": { "x_mm": 100, "y_mm": 80 },
+                    "mounting_holes": "corners", "hole_inset_mm": 3.5 }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let codes = |review: &Value| -> Vec<String> {
+        review["result"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["code"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // New holes carry the attributes, so nothing is reported.
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    assert!(!codes(&review).contains(&"HOLE_LISTED_AS_PART".to_owned()), "{review}");
+
+    // Unrouted connections come with the pointer to the autorouter.
+    let drc = mcp.call("pcb_run_drc", json!({ "session_id": id })).await;
+    assert!(drc["result"]["unrouted"].as_u64().unwrap() > 0, "{drc}");
+    let hint = drc["result"]["hint"].as_str().unwrap();
+    assert!(hint.contains("pcb_autoroute_plan"), "{drc}");
+
+    // Make them like v0.7.0 made them.
+    let old: Vec<Value> = ["H1", "H2", "H3", "H4"]
+        .iter()
+        .map(|r| json!({ "reference": r, "exclude_from_bom": false, "exclude_from_pos": false, "board_only": false }))
+        .collect();
+    let undo = mcp
+        .call(
+            "pcb_footprint_attrs_plan",
+            json!({ "session_id": id, "footprints": old }),
+        )
+        .await;
+    assert_eq!(undo["result"]["kind"], "attributes", "{undo}");
+    assert_eq!(
+        apply_board(&mut mcp, &id, &undo, &key("old")).await["result"]["verified"],
+        true
+    );
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    assert!(codes(&review).contains(&"HOLE_LISTED_AS_PART".to_owned()), "{review}");
+    let exported = mcp
+        .call("pcb_export", json!({ "session_id": id, "outputs": ["positions"] }))
+        .await;
+    let checks = exported["result"]["checks"].as_array().unwrap();
+    let holes = checks.iter().find(|c| c["id"] == "holes_marked").unwrap();
+    assert_eq!(holes["status"], "warning", "{exported}");
+    assert_eq!(holes["items"], json!(["H1", "H2", "H3", "H4"]));
+
+    // The repair: every hole at once; a second plan has nothing to do.
+    let fix = mcp
+        .call(
+            "pcb_footprint_attrs_plan",
+            json!({ "session_id": id, "mounting_holes": true }),
+        )
+        .await;
+    assert_eq!(fix["result"]["operations"].as_array().unwrap().len(), 4, "{fix}");
+    let applied = apply_board(&mut mcp, &id, &fix, &key("fix")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(
+        applied["result"]["report"]["attributes_set"].as_array().unwrap().len(),
+        4
+    );
+    let review = mcp.call("pcb_review", json!({ "session_id": id })).await;
+    assert!(!codes(&review).contains(&"HOLE_LISTED_AS_PART".to_owned()), "{review}");
+    let again = mcp
+        .call(
+            "pcb_footprint_attrs_plan",
+            json!({ "session_id": id, "mounting_holes": true }),
+        )
+        .await;
+    assert_eq!(again["ok"], false, "{again}");
+    mcp.call("pcb_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
 }
 
 /// Phase 13: an outlined, placed board is refused for export while it is unrouted, exported when

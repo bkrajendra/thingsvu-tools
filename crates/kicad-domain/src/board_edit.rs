@@ -44,6 +44,29 @@ impl Placement {
     }
 }
 
+/// The attributes of a footprint that decide whether it is a part to buy and place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct FootprintFlags {
+    /// Do not populate.
+    pub dnp: bool,
+    pub exclude_from_bom: bool,
+    /// Left out of the position (pick-and-place) file.
+    pub exclude_from_pos: bool,
+    /// Has no part in the schematic.
+    pub board_only: bool,
+}
+
+impl FootprintFlags {
+    pub fn of(f: &BoardFootprint) -> FootprintFlags {
+        FootprintFlags {
+            dnp: f.dnp,
+            exclude_from_bom: f.exclude_from_bom,
+            exclude_from_pos: f.exclude_from_pos,
+            board_only: f.board_only,
+        }
+    }
+}
+
 /// One change to the board, in the order it is applied.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -83,6 +106,13 @@ pub enum BoardOp {
     AddZone(Box<crate::zones::ZoneSpec>),
     /// A zone being replaced.
     RemoveZone { id: String, name: String },
+    /// A footprint's attributes changed (nothing moves).
+    SetAttributes {
+        reference: String,
+        id: String,
+        from: FootprintFlags,
+        to: FootprintFlags,
+    },
     /// A footprint moved, turned, or flipped, and its lock set.
     MoveFootprint {
         reference: String,
@@ -414,6 +444,9 @@ pub fn plan_outline(board: &Board, req: &OutlineRequest) -> Result<BoardEditPlan
             rotation_deg: 0.0,
             locked: false,
             dnp: false,
+            exclude_from_bom: false,
+            exclude_from_pos: false,
+            board_only: false,
             pads: vec![],
             courtyard: req.hole_courtyard.map(|c| c.translate(at)),
             courtyard_local: req.hole_courtyard,
@@ -587,6 +620,137 @@ pub fn plan_moves(board: &Board, requests: &[MoveRequest], grid_mm: f64) -> Resu
     })
 }
 
+// ---------------------------------------------------------------- attributes
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AttributeRequest {
+    pub reference: String,
+    pub dnp: Option<bool>,
+    pub exclude_from_bom: Option<bool>,
+    pub exclude_from_pos: Option<bool>,
+    pub board_only: Option<bool>,
+}
+
+/// The attributes a mounting hole should carry: no BOM line, no placement row, no schematic part.
+pub fn hole_flags(current: FootprintFlags) -> FootprintFlags {
+    FootprintFlags {
+        exclude_from_bom: true,
+        exclude_from_pos: true,
+        board_only: true,
+        ..current
+    }
+}
+
+/// Mounting holes that are still listed as parts to buy or place (boards made by v0.7.0 had no
+/// attributes on their holes).
+pub fn unmarked_holes(board: &Board) -> Vec<&BoardFootprint> {
+    board
+        .footprints
+        .iter()
+        .filter(|f| f.is_mounting_hole())
+        .filter(|f| !(f.exclude_from_pos && f.exclude_from_bom && f.board_only))
+        .collect()
+}
+
+/// Plans setting attributes on named footprints, and with `mounting_holes` on every mounting hole
+/// that is still listed as a part. An entry that names an attribute only changes that attribute.
+pub fn plan_attributes(
+    board: &Board,
+    requests: &[AttributeRequest],
+    mounting_holes: bool,
+) -> Result<BoardEditPlan, ToolError> {
+    if requests.is_empty() && !mounting_holes {
+        return Err(bad(
+            "nothing to change; name footprints with attributes, or pass mounting_holes: true",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut expected = board.clone();
+    let mut ops = Vec::new();
+    let mut warnings = Vec::new();
+    let change = |index: usize, to: FootprintFlags, ops: &mut Vec<BoardOp>, expected: &mut Board| {
+        let f = &board.footprints[index];
+        let from = FootprintFlags::of(f);
+        if from == to {
+            return false;
+        }
+        let e = &mut expected.footprints[index];
+        (e.dnp, e.exclude_from_bom, e.exclude_from_pos, e.board_only) =
+            (to.dnp, to.exclude_from_bom, to.exclude_from_pos, to.board_only);
+        ops.push(BoardOp::SetAttributes {
+            reference: f.reference.clone(),
+            id: f.id.clone(),
+            from,
+            to,
+        });
+        true
+    };
+    for req in requests {
+        if !seen.insert(req.reference.as_str()) {
+            return Err(bad(format!(
+                "{} is named twice; give one entry per footprint",
+                req.reference
+            )));
+        }
+        let Some(index) = board.footprints.iter().position(|f| f.reference == req.reference) else {
+            return Err(ToolError::new(
+                ErrorCode::SymbolNotFound,
+                format!("no footprint {} on the board (use pcb_list_footprints)", req.reference),
+            ));
+        };
+        if req.dnp.is_none()
+            && req.exclude_from_bom.is_none()
+            && req.exclude_from_pos.is_none()
+            && req.board_only.is_none()
+        {
+            return Err(bad(format!(
+                "{}: name at least one of dnp, exclude_from_bom, exclude_from_pos, board_only",
+                req.reference
+            )));
+        }
+        let now = FootprintFlags::of(&board.footprints[index]);
+        let to = FootprintFlags {
+            dnp: req.dnp.unwrap_or(now.dnp),
+            exclude_from_bom: req.exclude_from_bom.unwrap_or(now.exclude_from_bom),
+            exclude_from_pos: req.exclude_from_pos.unwrap_or(now.exclude_from_pos),
+            board_only: req.board_only.unwrap_or(now.board_only),
+        };
+        if !change(index, to, &mut ops, &mut expected) {
+            warnings.push(format!(
+                "{} already has these attributes; nothing to change",
+                req.reference
+            ));
+        }
+    }
+    if mounting_holes {
+        let mut found = false;
+        for (index, f) in board.footprints.iter().enumerate() {
+            if !f.is_mounting_hole() || seen.contains(f.reference.as_str()) {
+                continue;
+            }
+            found = true;
+            change(index, hole_flags(FootprintFlags::of(f)), &mut ops, &mut expected);
+        }
+        if !found {
+            warnings.push("the board has no mounting holes".into());
+        } else if ops.is_empty() {
+            warnings.push("every mounting hole is already left out of the position file and the BOM".into());
+        }
+    }
+    if ops.is_empty() {
+        return Err(bad("every footprint named already has these attributes"));
+    }
+    let measure = measure(board);
+    Ok(BoardEditPlan {
+        kind: "attributes",
+        operations: ops,
+        before: measure.clone(),
+        after: measure,
+        warnings,
+        expected,
+    })
+}
+
 // ---------------------------------------------------------------- verification
 
 /// Compares the board read back after applying with what the plan should leave: the outline, every
@@ -701,6 +865,15 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                     problems.push(format!("the old zone {name} ({id}) is still there"));
                 }
             }
+            BoardOp::SetAttributes { reference, to, .. } => match by_ref.get(reference.as_str()) {
+                Some(f) if FootprintFlags::of(f) == *to => {}
+                Some(f) => problems.push(format!(
+                    "{reference} has {:?} after applying, the plan set {:?}",
+                    FootprintFlags::of(f),
+                    to
+                )),
+                None => problems.push(format!("{reference} is no longer on the board")),
+            },
             BoardOp::MoveFootprint {
                 reference, to, locked, ..
             } => {
@@ -789,6 +962,9 @@ mod tests {
             rotation_deg: 0.0,
             locked: false,
             dnp: false,
+            exclude_from_bom: false,
+            exclude_from_pos: false,
+            board_only: false,
             pads: vec![
                 BoardPad {
                     number: "1".into(),
@@ -1035,5 +1211,80 @@ mod tests {
         assert!(verify_edit(&plan, &after).is_empty());
         after.outline = None;
         assert_eq!(verify_edit(&plan, &after).len(), 1);
+    }
+
+    fn hole(reference: &str, at: Point) -> BoardFootprint {
+        let mut h = part(reference, at);
+        h.lib_id = "MountingHole:MountingHole_3.2mm_M3".into();
+        h.pads.clear();
+        h
+    }
+
+    #[test]
+    fn mounting_holes_without_attributes_are_found_and_marked() {
+        let mut b = board();
+        b.footprints.push(hole("H1", p(2.0, 2.0)));
+        let mut marked = hole("H2", p(30.0, 2.0));
+        (marked.exclude_from_bom, marked.exclude_from_pos, marked.board_only) = (true, true, true);
+        b.footprints.push(marked);
+        assert_eq!(
+            unmarked_holes(&b)
+                .iter()
+                .map(|f| f.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["H1"]
+        );
+
+        let plan = plan_attributes(&b, &[], true).unwrap();
+        assert_eq!(plan.kind, "attributes");
+        assert_eq!(plan.operations.len(), 1);
+        let BoardOp::SetAttributes { reference, to, .. } = &plan.operations[0] else {
+            panic!("{:?}", plan.operations)
+        };
+        assert_eq!(reference, "H1");
+        assert!(to.exclude_from_bom && to.exclude_from_pos && to.board_only && !to.dnp);
+        // What the plan expects verifies against itself, and a board that ignored it does not.
+        assert!(verify_edit(&plan, &plan.expected).is_empty());
+        assert_eq!(verify_edit(&plan, &b).len(), 1);
+        assert!(unmarked_holes(&plan.expected).is_empty());
+    }
+
+    #[test]
+    fn named_footprints_change_only_the_attributes_named() {
+        let mut b = board();
+        b.footprints[0].exclude_from_bom = true;
+        let plan = plan_attributes(
+            &b,
+            &[AttributeRequest {
+                reference: "R1".into(),
+                dnp: Some(true),
+                ..Default::default()
+            }],
+            false,
+        )
+        .unwrap();
+        let BoardOp::SetAttributes { from, to, .. } = &plan.operations[0] else {
+            panic!()
+        };
+        assert!(from.exclude_from_bom && !from.dnp);
+        assert!(to.exclude_from_bom && to.dnp, "the BOM exclusion stays");
+    }
+
+    #[test]
+    fn attribute_plans_refuse_nonsense() {
+        let b = board();
+        let req = |reference: &str, dnp| AttributeRequest {
+            reference: reference.into(),
+            dnp,
+            ..Default::default()
+        };
+        assert!(plan_attributes(&b, &[], false).is_err());
+        assert!(plan_attributes(&b, &[req("R9", Some(true))], false).is_err());
+        assert!(plan_attributes(&b, &[req("R1", None)], false).is_err());
+        assert!(plan_attributes(&b, &[req("R1", Some(true)), req("R1", Some(false))], false).is_err());
+        assert!(
+            plan_attributes(&b, &[req("R1", Some(false))], false).is_err(),
+            "already so"
+        );
     }
 }

@@ -230,7 +230,7 @@ Exit criteria: a user can install everything with one script and connect an assi
 - [x] **7.8 README** — quick start (install, enable the API, connect an assistant, first prompts), the three providers, tools, troubleshooting, update and removal, build from source.
 - [x] **7.9 Architecture documentation** — new [docs/architecture.md](architecture.md) with current diagrams (components, crates, editor registration, planning pipeline, both apply sequences, releases) and a table of what changed from the plan; the plan's diagram, provider and backend sections, process table, repository layout, and stale "bridge" wording were brought in line.
 - [~] **7.10 Re-pin to KiCad 11.0** — waits for the release. The procedure is in docs/kicad-api-compatibility.md.
-- [~] **7.11 One s-expression parser** — `kicad-cli-runner` still has its own small text parser for netlists next to `kicad-sexpr`. Merging them is a cleanup with no user-visible effect.
+- [x] **7.11 One s-expression parser** — `kicad-cli-runner` still has its own small text parser for netlists next to `kicad-sexpr`. Merging them is a cleanup with no user-visible effect. Done in 13b.4.
 - [x] **7.12 Layout hints and editing tools (task 5.9)** — done in Phase 8 (v0.3.0), see 5.9.
   - **Review:** the README roadmap lists them under *Next*. Decision for you: make them Phase 8, or fold them into PCM / PCB work?
 
@@ -332,8 +332,8 @@ Where each open item stands (checked 25 Oct 2026):
 - [x] **9.5 `sch_edit_items_plan`, and ids in `sch_describe_layout`** — delete wires, labels, junctions, notes, and drawings by id; move labels (only along their own wire), notes, and drawings. Wires and junctions cannot be moved. Deleting a wire, label, or junction can split or rename nets, so the plan warns and does not promise nets. `sch_describe_layout` now lists every wire, label, junction, note, and drawing with its id, and each part's text areas.
 - [x] **9.6 Tests** — domain tests for text boxes, declutter, labels, drawings, and items; read-back tests; live tests on the file and headless providers (`live_labels_drawings_and_items_through_*`, the declutter step in `live_review_tidy_and_set_field_through_mcp`); `gui_text_demo` for the editor (below).
 - [x] **9.7 Docs and release** — README, architecture diagram, capability matrix, this file; version **0.4.0**.
-- [~] **9.8 (optional) 7.11** — merge the CLI runner's netlist parser into `kicad-sexpr`. Not done; scheduled as 13b.4.
-- [~] **9.9 Text angle when a part is turned** — found while reading real data: a tidy or arrange that turns a part keeps each field's text angle, so text on a part turned 90° stays vertical, while KiCad's own rotate turns it too. Not changed (the declutter works with whatever angle the text has). Scheduled as 13b.1.
+- [x] **9.8 (optional) 7.11** — merge the CLI runner's netlist parser into `kicad-sexpr`. Done in 13b.4.
+- [x] **9.9 Text angle when a part is turned** — found while reading real data: a tidy or arrange that turns a part keeps each field's text angle, so text on a part turned 90° stays vertical, while KiCad's own rotate turns it too. Not changed (the declutter works with whatever angle the text has). Closed in 13b.1: the cause was how the angle was read, not what the tidy writes.
 
 Known limits (Phase 9): drawings are free items, not tied to the parts they surround (a tidy or arrange does not move a box with its parts; it treats shapes as annotations that stay); labels are local only; text boxes (`text_box`) and images are listed as annotations but not edited; `PWR_FLAG` text is hidden only when it cannot be placed.
 
@@ -436,34 +436,31 @@ Exit criteria: from the 555 board, a JLCPCB-style package opens in KiCad's Gerbe
 
 Known limits (Phase 13): exports were tried live on the headless provider only (the PCB editor and file paths make the same `kicad-cli` calls on a snapshot or the file); a KiCad 10 board has not been exported yet, and there the Gerbers are not read back unless a KiCad 11 CLI is installed beside it. IPC-2581 and ODB++ are not offered. The exit criterion named the 555 board; the project's board fixture is the regulator board, so it was used.
 
-### Phase 13b — Fixes carried over from Phases 9 to 13 (planned, v0.8.1)
+### Phase 13b — Fixes carried over from Phases 9 to 13 (done, v0.8.1)
 
 Chosen by the project owner on 31 Oct 2026 from the open and deferred items, to be done before Phase 14 so the board tools in Phase 14 start from a clean base. Reasoning and decision W6: [workflow-gaps-plan.md](workflow-gaps-plan.md).
 
 Exit criteria: a tidy keeps text readable on turned parts; a board made with v0.7.0 can be exported with its mounting holes out of the position file; an assistant is told, at the moment it needs it, to use the autorouter for what a simple route cannot do; the CLI runner and `kicad-sexpr` share one parser; nothing else changes for users.
 
-- [ ] **13b.1 Text follows a turned part (9.9)** —
-  - Probe first, live: what angle KiCad gives each field after its own rotate and mirror, for 90°, 180°, and 270°.
-  - The tidy, `sch_arrange_plan`, and the hints then turn every field by the part's change of turn and keep it readable (never upside down), as KiCad does.
-  - The text boxes the declutter and the readability check use are computed with the new angle.
-  - The apply step reads the angle of every field back with the part's place and turn.
-  - Tests: domain tests for the angle rule; a live tidy of a circuit with parts turned both ways, ERC clean, no text overlap.
-- [ ] **13b.2 Mounting holes made by v0.7.0** —
-  - `pcb_review` and the pre-export checks of `pcb_export` and `pcb_fab_package` warn about a footprint from a `MountingHole` library, or with only non-plated holes and no schematic part, that is not excluded from the position file and the BOM. The warning names the fix.
-  - New `pcb_footprint_attrs_plan`: set `dnp`, `exclude_from_bom`, `exclude_from_pos`, and `board_only` on named footprints, or `mounting_holes: true` for every hole in one step. Plan, confirm, one commit, read back, DRC before and after, rolled back on a problem.
-  - Probe first: whether `UpdateItems` on a footprint writes its attributes (Phase 12 found it moves only the anchor). If not, the hole is recreated as `pcb_outline_plan` makes it (same reference, place, and library id, with the library's attributes).
-  - Later used by `pcb_footprint_edit_plan` (15.2).
-- [ ] **13b.3 The autorouter does the hard routing (W6)** — no new router is built.
-  - Tool descriptions and results tell the assistant which to use: `pcb_route_plan` for deliberate tracks (power, short links, fixed paths), `pcb_autoroute_plan` for multi-pad nets and anything that must find a way around parts.
-  - A route refused for clearance or for lack of a path says so and names `pcb_autoroute_plan`; `pcb_run_drc`, `pcb_review`, and the apply results that leave unrouted connections give the count and the same hint.
-  - `session_status` says whether an autorouter is configured; when it is not, the hint names `install.ps1 -FreeroutingOnly`.
-  - The path finder is not extended. Autoroute control (`nets`, `exclude_nets`, keeping tracks already drawn, per-net widths, ending the process tree on a timeout) moves from 15.7 to Phase 14 as 14.8.
-- [ ] **13b.4 One s-expression parser (7.11, 9.8)** — the CLI runner's own parser (`kicad-cli-runner/src/sexpr.rs`, 119 lines, used by `netlist.rs`) is replaced by `kicad-sexpr`'s. No behaviour change: the netlist tests and the live netlist tests must pass unchanged. If `kicad-sexpr` needs the runner (a dependency cycle), the shared parts move to a small crate instead.
-- [ ] **13b.5 Live checks** — things that were not tried, done on the owner's machine with demos:
-  - Export from the PCB editor: new `gui_pcb_export_demo` (checks only, writes into a scratch folder).
-  - How many undo steps `pcb_apply_plan` (netlist import) and the autorouter import take in the editor.
-  - The result goes into the API notes and the known limits of Phases 11 to 13.
-- [ ] **13b.6 Tests, docs, release** — domain, reader, and live tests for 13b.1 to 13b.4; README tool rows; capability matrix; **v0.8.1** (bump the Cargo version and push; the workflow makes the tag).
+- [x] **13b.1 Text follows a turned part (9.9)** — the probe was not needed: the API notes already said the field angle is stored relative to the symbol, and KiCad draws it swapped between horizontal and vertical when the symbol is turned a quarter turn. Our readers passed the stored angle on as if it were the drawn one, so every text box of a part turned 90° or 270° was the wrong way round (and the declutter and readability checks judged text that was not where they thought). `kicad_domain::schematic::drawn_field_angle` now gives the drawn angle, and both readers (the API's `design()` and the file's) apply it through `DesignSymbol::with_drawn_angles`. Tests: the angle rule (quarter turns swap, half turns and mirrors do not), the file reader on a turned and an upright part.
+  - **Review:** (1) The 9.9 note blamed the tidy for "keeping" the angle. That is what KiCad does as well: leaving the stored angle alone is right, and nothing is written. The defect was only in how we measured the text. (2) No change to what the tools write, so existing schematics are unaffected. (3) Not re-run against the editor; the angle rule is KiCad's own (`SCH_FIELD::GetDrawRotation`) and matched the fuse in the regulator fixture.
+- [x] **13b.2 Mounting holes made by v0.7.0** —
+  - `pcb_review` reports `HOLE_LISTED_AS_PART`, and `pcb_export` / `pcb_fab_package` run a `holes_marked` check (a warning, never blocking), when a hole is not left out of the position file and the BOM.
+  - New `pcb_footprint_attrs_plan`: `dnp`, `exclude_from_bom`, `exclude_from_pos`, and `board_only` on named footprints (an attribute left out stays), or `mounting_holes: true` for every hole. Plan, confirm with `pcb_apply_plan`, one commit, read back; a failed read-back rolls back (the restore now also puts back changed attributes). No DRC run: attributes do not change copper.
+  - **Review:** (1) The probe (`live_probe13b`) showed `UpdateItems` on a footprint **does** write its attributes, so no recreate fallback was built. (2) `BoardFootprint` gained `exclude_from_bom`, `exclude_from_pos`, and `board_only`, read from the API and the file; a plan made before an attribute change goes stale. (3) The live test `live_board_old_holes_are_repaired` makes holes the v0.7.0 way with the new tool, sees the review and export warnings, repairs them in one plan, and finds a second plan has nothing to do.
+- [x] **13b.3 The autorouter does the hard routing (W6)** — no new router is built.
+  - `pcb_route_plan` and `pcb_autoroute_plan` descriptions say which to use. A route refused for clearance says so and names `pcb_autoroute_plan`. `pcb_run_drc`, `pcb_review`, and the DRC part of an apply result add a `hint` when connections are unrouted.
+  - `session_status` reports `autorouter` (`configured`, the program, the tool, and the setup step `install.ps1 -FreeroutingOnly`); the hint says to set it up when it is not.
+  - The path finder is not extended. Autoroute control (`nets`, `exclude_nets`, keeping tracks already drawn, per-net widths, ending the process tree on a timeout) moved from 15.7 to Phase 14 as 14.8.
+- [x] **13b.4 One s-expression parser (7.11, 9.8)** — the CLI runner's own parser (`sexpr.rs`, 119 lines) is gone; `netlist.rs` reads through `kicad-sexpr` (no dependency cycle: `kicad-sexpr` needs only `kicad-domain`). The netlist tests pass unchanged, and a new one covers quoted names and non-netlist files.
+- [~] **13b.5 Live checks** —
+  - Done: the editor export demo `gui_pcb_export_demo` (`THINGSVU_GUI_PCB_EXPORT=1`; prints the checks and the verification, changes nothing in the board; a routed board gets files in `fab/` next to it, so use a copy).
+  - For the project owner to try, since I cannot drive the editor: the export demo, and how many undo steps `pcb_apply_plan` (netlist import) and the autorouter import take. Record the answers in the API notes.
+- [x] **13b.6 Tests, docs, release** — domain, reader, runner, and live tests for 13b.1 to 13b.4; README tool rows; capability matrix; API notes (attributes by update, drawn field angle); **v0.8.1**.
+
+Known limits (Phase 13b): the export demo and the editor's undo steps are not tried in the editor (13b.5); the drawn-angle rule assumes quarter turns, as KiCad's does; holes are found by their `MountingHole` library or an unconnected `H` part, so a hole from another library needs its attributes named.
+
+**Attention — please try on the live editor (v0.8.1):** open a **copy** of a routed board in the PCB Editor, press **KiCad AI: connect**, and run `THINGSVU_GUI_PCB_EXPORT=1 cargo test -p kicad-ai-mcp --test stdio gui_pcb_export_demo -- --nocapture` (PowerShell: `$env:THINGSVU_GUI_PCB_EXPORT='1'; cargo test ...`). Then ask the assistant: *"Apply the netlist update to my board"* and press Ctrl+Z to see how many steps it takes to undo, and the same for an autoroute.
 
 ### Carried over, not scheduled
 

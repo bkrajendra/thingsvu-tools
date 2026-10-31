@@ -120,6 +120,21 @@ impl DesignField {
     }
 }
 
+/// The angle a field is drawn at on the sheet, from the angle stored with it. KiCad stores the
+/// angle relative to the symbol: when the symbol is turned a quarter turn (90° or 270°), horizontal
+/// text is drawn vertical and the other way round (`SCH_FIELD::GetDrawRotation`). Half turns and
+/// mirrors leave it as it is.
+pub fn drawn_field_angle(stored_deg: u16, orientation: Orientation) -> u16 {
+    if orientation.rotation_deg % 180 != 90 {
+        return stored_deg % 360;
+    }
+    match stored_deg % 180 {
+        0 => 90,
+        90 => 0,
+        other => other,
+    }
+}
+
 /// A placed symbol, as much of it as planning needs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DesignSymbol {
@@ -132,7 +147,8 @@ pub struct DesignSymbol {
     pub position: Point,
     pub orientation: Orientation,
     pub unit: u32,
-    /// The reference and value text as drawn.
+    /// The reference and value text as drawn (`angle_deg` is the angle on the sheet, see
+    /// [`DesignSymbol::with_drawn_angles`]).
     pub fields: Vec<DesignField>,
     /// Every field with its text: Reference, Value, Footprint, Datasheet, Description, and any
     /// custom field (manufacturer, part numbers, ...).
@@ -143,6 +159,19 @@ pub struct DesignSymbol {
     pub exclude_from_bom: bool,
     /// Left off the board.
     pub exclude_from_board: bool,
+}
+
+impl DesignSymbol {
+    /// Turns each field's stored angle (relative to the symbol) into the angle it is drawn at, using
+    /// the symbol's orientation. Readers call this once, so every box and check sees the text as it
+    /// appears.
+    pub fn with_drawn_angles(mut self) -> Self {
+        let orientation = self.orientation;
+        for field in &mut self.fields {
+            field.angle_deg = drawn_field_angle(field.angle_deg, orientation);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -237,4 +266,54 @@ pub struct SchematicDesign {
     pub notes: Vec<Rect>,
     /// Items that tidying cannot handle, by kind: `no_connect`, `bus`, `sheet`, `global_label`, …
     pub unsupported: BTreeMap<String, usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turned(rotation_deg: u16, mirror_x: bool) -> Orientation {
+        Orientation {
+            rotation_deg,
+            mirror_x,
+            mirror_y: false,
+        }
+    }
+
+    #[test]
+    fn quarter_turns_swap_horizontal_and_vertical_text() {
+        assert_eq!(drawn_field_angle(0, turned(90, false)), 90);
+        assert_eq!(drawn_field_angle(90, turned(90, false)), 0);
+        assert_eq!(drawn_field_angle(0, turned(270, true)), 90);
+        assert_eq!(drawn_field_angle(90, turned(270, false)), 0);
+    }
+
+    #[test]
+    fn half_turns_and_mirrors_leave_the_angle_alone() {
+        for (stored, o) in [
+            (0, turned(0, false)),
+            (90, turned(180, false)),
+            (0, turned(0, true)),
+            (90, turned(180, true)),
+        ] {
+            assert_eq!(drawn_field_angle(stored, o), stored);
+        }
+    }
+
+    #[test]
+    fn a_symbol_turns_all_its_fields() {
+        let field = |name: &str, angle_deg| DesignField {
+            name: name.into(),
+            text: "R1".into(),
+            angle_deg,
+            ..Default::default()
+        };
+        let symbol = DesignSymbol {
+            orientation: turned(90, false),
+            fields: vec![field("Reference", 0), field("Value", 90)],
+            ..Default::default()
+        }
+        .with_drawn_angles();
+        assert_eq!(symbol.fields.iter().map(|f| f.angle_deg).collect::<Vec<_>>(), [90, 0]);
+    }
 }

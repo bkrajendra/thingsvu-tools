@@ -50,6 +50,8 @@ pub struct EditReport {
     pub placed: Vec<String>,
     pub moved: Vec<String>,
     pub flipped: Vec<String>,
+    /// Footprints whose attributes were set, by reference.
+    pub attributes_set: Vec<String>,
     /// Tracks, vias, and zones created.
     pub copper_items: usize,
     /// Zones were refilled after the change.
@@ -612,6 +614,7 @@ impl BoardSession {
             "place" => "AI: place footprints",
             "route" => "AI: route",
             "zone" => "AI: copper pour",
+            "attributes" => "AI: footprint attributes",
             _ => "AI: move footprints",
         };
         let result = apply_steps(client, &header, plan).await;
@@ -909,6 +912,41 @@ async fn apply_steps(
             )));
         }
         report.copper_items = n;
+    }
+
+    // 4b. Attributes: the footprint is sent as KiCad has it with the flags changed (an update does
+    // write them; checked live in Phase 13b).
+    let attrs: Vec<(&String, &String, &kicad_domain::board_edit::FootprintFlags)> = plan
+        .operations
+        .iter()
+        .filter_map(|o| match o {
+            BoardOp::SetAttributes { reference, id, to, .. } => Some((reference, id, to)),
+            _ => None,
+        })
+        .collect();
+    if !attrs.is_empty() {
+        let current = footprints(client, header).await?;
+        let mut items = Vec::new();
+        for (reference, id, to) in &attrs {
+            let mut f = current
+                .iter()
+                .find(|f| f.id.as_ref().is_some_and(|k| &k.value == *id))
+                .cloned()
+                .ok_or_else(|| {
+                    ToolError::new(
+                        ErrorCode::StalePlan,
+                        format!("{reference} is no longer on the board; make a new plan"),
+                    )
+                })?;
+            let a = f.attributes.get_or_insert_with(Default::default);
+            a.do_not_populate = to.dnp;
+            a.exclude_from_bill_of_materials = to.exclude_from_bom;
+            a.exclude_from_position_files = to.exclude_from_pos;
+            a.not_in_schematic = to.board_only;
+            items.push(f);
+            report.attributes_set.push((*reference).clone());
+        }
+        update(client, header, items).await?;
     }
 
     // 5. Moves: flips first (KiCad's own flip mirrors the footprint top to bottom), then every
@@ -1328,6 +1366,7 @@ async fn restore_steps(
                 now.position != was.position
                     || now.layer != was.layer
                     || now.locked != was.locked
+                    || now.attributes != was.attributes
                     || now.orientation.map(|a| a.value_degrees) != was.orientation.map(|a| a.value_degrees)
             })
         })

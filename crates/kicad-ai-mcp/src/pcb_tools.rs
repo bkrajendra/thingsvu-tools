@@ -427,6 +427,37 @@ pub struct MoveArg {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct AttributeArg {
+    /// The footprint's reference, e.g. H1.
+    pub reference: String,
+    /// Do not populate: kept off the assembly.
+    #[serde(default)]
+    pub dnp: Option<bool>,
+    /// Left out of the BOM.
+    #[serde(default)]
+    pub exclude_from_bom: Option<bool>,
+    /// Left out of the position (pick-and-place) file.
+    #[serde(default)]
+    pub exclude_from_pos: Option<bool>,
+    /// Has no part in the schematic.
+    #[serde(default)]
+    pub board_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbAttributesArgs {
+    pub session_id: String,
+    /// Footprints to change; an attribute left out stays as it is.
+    #[serde(default)]
+    pub footprints: Vec<AttributeArg>,
+    /// Also mark every mounting hole as board only and left out of the BOM and the position file.
+    #[serde(default)]
+    pub mounting_holes: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PcbMoveArgs {
     pub session_id: String,
     pub moves: Vec<MoveArg>,
@@ -473,6 +504,7 @@ fn fingerprint(board: &Board) -> String {
             f.layer.as_str(),
             (f.rotation_deg * 1000.0).round() as i64,
             f.locked,
+            (f.dnp, f.exclude_from_bom, f.exclude_from_pos, f.board_only),
         )
             .hash(&mut h);
         for p in &f.pads {
@@ -844,7 +876,7 @@ impl KicadAiServer {
             Err(e) => return envelope::error(&cid, &e),
         };
         match self.run_drc(&cid, &board, args.schematic_parity).await {
-            Ok(report) => envelope::ok(&cid, drc_json(&report), board_provenance(&board), vec![]),
+            Ok(report) => envelope::ok(&cid, self.hinted(drc_json(&report)), board_provenance(&board), vec![]),
             Err(e) => envelope::error(&cid, &e),
         }
     }
@@ -955,7 +987,7 @@ impl KicadAiServer {
                     "outline": data.outline.map(rect),
                     "schematic_compared": schematic.map(|p| p.display().to_string()),
                     "issues": issues,
-                    "drc": drc.as_ref().map(drc_json),
+                    "drc": drc.as_ref().map(|d| self.hinted(drc_json(d))),
                     "drc_note": if drc.is_none() { Some("DRC could not be run on this board") } else { None },
                 }),
                 board_provenance(&board),
@@ -1116,6 +1148,44 @@ impl KicadAiServer {
     }
 
     #[tool(
+        name = "pcb_footprint_attrs_plan",
+        description = "Plan changing footprint attributes: dnp (do not populate), exclude_from_bom, exclude_from_pos 
+(left out of the position file), and board_only (no part in the schematic), on named footprints 
+(an attribute left out stays as it is), and with mounting_holes: true on every mounting hole, so holes from 
+boards made with v0.7.0 stop appearing as parts to place. Nothing moves. Needs a live KiCad 11 session. 
+Apply with pcb_apply_plan; the attributes are read back."
+    )]
+    pub async fn pcb_footprint_attrs_plan(&self, Parameters(args): Parameters<PcbAttributesArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let data = board.read().await?;
+            let requests: Vec<_> = args
+                .footprints
+                .iter()
+                .map(|a| board_edit::AttributeRequest {
+                    reference: a.reference.clone(),
+                    dnp: a.dnp,
+                    exclude_from_bom: a.exclude_from_bom,
+                    exclude_from_pos: a.exclude_from_pos,
+                    board_only: a.board_only,
+                })
+                .collect();
+            let plan = board_edit::plan_attributes(&data, &requests, args.mounting_holes)?;
+            Ok::<_, ToolError>((plan, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, fp)) => self.store_edit_plan(&cid, &board, plan, fp).await,
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_move_plan",
         description = "Plan moving named footprints: each entry gives a reference and an absolute place \n(x_mm, y_mm) or an offset (dx_mm, dy_mm), a turn (rotation_deg, or rotate_by_deg), a side (front or \nback; a flip as in KiCad), and lock true or false. Absolute places snap to grid_mm (0.5; 0 for none); \noffsets are exact. Locked footprints are refused unless allow_locked is true. The plan lists every move \nwith the overlaps and footprints outside the outline before and after. Needs a live KiCad 11 session. \nApply with pcb_apply_plan; every pad is read back."
     )]
@@ -1242,7 +1312,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_route_plan",
-        description = "Plan tracks and vias for named nets. Each route is a list of points (pads as \\nREF.PAD, or x_mm/y_mm); a point's layer applies to the segment leaving it, and a change of layer puts a \\nvia there from the net class (none at a through-hole pad). A route of two points with no layers is given \\na path: straight if clear, else a 45° dogleg or an L, on the asked layer or either outer layer, the \\nshortest that keeps clearance. Widths, clearances, and vias come from the board's net classes and \\nminimums. Every segment and via is checked against other nets' pads, tracks, vias, and holes and the \\nboard edge; a route that cannot keep clearance refuses the whole plan with the reason. Zones are not \\nchecked (a pour is refilled around tracks). Needs a live KiCad 11 session. Apply with pcb_apply_plan, \\nwhich runs DRC before and after."
+        description = "Plan tracks and vias for named nets. Each route is a list of points (pads as \\nREF.PAD, or x_mm/y_mm); a point's layer applies to the segment leaving it, and a change of layer puts a \\nvia there from the net class (none at a through-hole pad). A route of two points with no layers is given \\na path: straight if clear, else a 45° dogleg or an L, on the asked layer or either outer layer, the \\nshortest that keeps clearance. Widths, clearances, and vias come from the board's net classes and \\nminimums. Every segment and via is checked against other nets' pads, tracks, vias, and holes and the \\nboard edge; a route that cannot keep clearance refuses the whole plan with the reason. Zones are not \\nchecked (a pour is refilled around tracks). Needs a live KiCad 11 session. Apply with pcb_apply_plan, \\nwhich runs DRC before and after. \\nUse it for deliberate tracks: power, short links, fixed paths. It finds only simple paths. For nets with many pads or routes that must find their way around parts, use pcb_autoroute_plan (Freerouting); the route plan then places only what you name."
     )]
     pub async fn pcb_route_plan(&self, Parameters(args): Parameters<PcbRouteArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1260,7 +1330,16 @@ impl KicadAiServer {
                 .enumerate()
                 .map(|(i, r)| route_request(i, r))
                 .collect::<Result<Vec<_>, _>>()?;
-            let (plan, summaries) = routing::plan_routes(&data, &rules, &requests)?;
+            let (plan, summaries) = routing::plan_routes(&data, &rules, &requests).map_err(|mut e| {
+                if e.message.contains("cannot keep their clearance") {
+                    e.message = format!(
+                        "{} - pcb_route_plan only finds simple paths. {}",
+                        e.message,
+                        self.autoroute_hint()
+                    );
+                }
+                e
+            })?;
             let used: BTreeMap<&str, serde_json::Value> = summaries
                 .iter()
                 .map(|s| {
@@ -1321,7 +1400,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_autoroute_plan",
-        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nNothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move."
+        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nNothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move. \\nThis is the tool for complex routing: multi-pad nets and anything that must find a way around parts. session_status says whether Freerouting is configured."
     )]
     pub async fn pcb_autoroute_plan(&self, Parameters(args): Parameters<PcbAutorouteArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1454,7 +1533,7 @@ impl KicadAiServer {
 
     #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move). A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move). A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1913,6 +1992,9 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
             "thermal_gap": mm(z.thermal_gap.0), "spoke_width": mm(z.spoke_width.0), "priority": z.priority,
         }),
         BoardOp::RemoveZone { id, name } => serde_json::json!({ "op": "remove_zone", "id": id, "name": name }),
+        BoardOp::SetAttributes {
+            reference, from, to, ..
+        } => serde_json::json!({ "op": "set_attributes", "reference": reference, "from": from, "to": to }),
         BoardOp::MoveFootprint {
             reference,
             from,
@@ -1927,6 +2009,26 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
 }
 
 impl KicadAiServer {
+    /// What to tell the assistant about routing what is left: the autorouter when it is set up, how
+    /// to set it up when it is not.
+    fn autoroute_hint(&self) -> String {
+        if self.state.options.freerouting.is_some() {
+            "pcb_route_plan places the tracks you specify (power, short links); pcb_autoroute_plan routes the rest              with Freerouting, which is configured"
+                .to_owned()
+        } else {
+            "pcb_route_plan places the tracks you specify (power, short links); pcb_autoroute_plan routes the rest              but needs Freerouting, which is not configured: install.ps1 -FreeroutingOnly sets it up (see the              README), then restart the server"
+                .to_owned()
+        }
+    }
+
+    /// A DRC result with a hint added when connections are left unrouted.
+    fn hinted(&self, mut drc: serde_json::Value) -> serde_json::Value {
+        if drc["unrouted"].as_u64().unwrap_or(0) > 0 {
+            drc["hint"] = serde_json::json!(self.autoroute_hint());
+        }
+        drc
+    }
+
     /// Keeps an outline or move plan for pcb_apply_plan and shows it.
     async fn store_edit_plan(
         &self,
@@ -1995,7 +2097,7 @@ impl KicadAiServer {
             let snapshot = board.snapshot().await?;
             // DRC before and after, except for a move the user asked for by name: its plan already
             // shows the overlaps it makes.
-            let judged_by_drc = plan.kind != "move";
+            let judged_by_drc = !matches!(plan.kind, "move" | "attributes");
             let drc_before = if judged_by_drc {
                 self.run_drc(cid, board, false).await.ok()
             } else {
@@ -2029,10 +2131,10 @@ impl KicadAiServer {
                     "unrouted_after": a.unconnected_items.len(),
                     "errors_before": b.count("error"),
                     "errors_after": a.count("error"),
-                    "after": drc_json(a),
+                    "after": self.hinted(drc_json(a)),
                 }))
             }
-            _ if plan.kind != "move" => {
+            _ if !matches!(plan.kind, "move" | "attributes") => {
                 problems.push("DRC could not be run before and after; check with pcb_run_drc".to_owned());
                 None
             }
@@ -2195,7 +2297,7 @@ impl KicadAiServer {
                     "unrouted_after": a.unconnected_items.len(),
                     "errors_before": b.count("error"),
                     "errors_after": a.count("error"),
-                    "after": drc_json(a),
+                    "after": self.hinted(drc_json(a)),
                 }))
             }
             _ => {
@@ -2237,12 +2339,13 @@ fn same_board(a: &Board, b: &Board) -> bool {
             .iter()
             .map(|f| {
                 format!(
-                    "{} {:?} {:.3} {} {} {:?}",
+                    "{} {:?} {:.3} {} {} {:?} {:?}",
                     f.reference,
                     f.position,
                     f.rotation_deg,
                     f.layer,
                     f.locked,
+                    (f.dnp, f.exclude_from_bom, f.exclude_from_pos, f.board_only),
                     f.pads.iter().map(|p| (&p.number, p.at, &p.net)).collect::<Vec<_>>()
                 )
             })

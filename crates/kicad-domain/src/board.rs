@@ -60,6 +60,11 @@ pub struct BoardFootprint {
     pub rotation_deg: f64,
     pub locked: bool,
     pub dnp: bool,
+    /// Left out of the BOM and the position file, and having no part in the schematic (the
+    /// footprint's attributes).
+    pub exclude_from_bom: bool,
+    pub exclude_from_pos: bool,
+    pub board_only: bool,
     pub pads: Vec<BoardPad>,
     /// The courtyard's bounding box on the board, when known.
     pub courtyard: Option<Rect>,
@@ -407,6 +412,18 @@ pub fn review(board: &Board, schematic: Option<&SchematicDesign>) -> Vec<BoardIs
             far_caps.push(format!("{} ({:.0} mm)", cap.reference, nearest));
         }
     }
+    let listed_holes = crate::board_edit::unmarked_holes(board);
+    if !listed_holes.is_empty() {
+        issues.push(issue(
+            "HOLE_LISTED_AS_PART",
+            Severity::Warning,
+            format!(
+                "mounting hole(s) not left out of the position file and the BOM (boards made with v0.7.0): {};                  pcb_footprint_attrs_plan with mounting_holes: true fixes them",
+                listed_holes.iter().map(|f| f.reference.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+            listed_holes.iter().map(|f| f.reference.clone()).collect(),
+        ));
+    }
     if !far_caps.is_empty() {
         issues.push(issue(
             "DECOUPLING_FAR",
@@ -468,6 +485,9 @@ mod tests {
             rotation_deg: 0.0,
             locked: false,
             dnp: false,
+            exclude_from_bom: false,
+            exclude_from_pos: false,
+            board_only: false,
             pads: pads
                 .iter()
                 .map(|(n, net, x, y)| BoardPad {

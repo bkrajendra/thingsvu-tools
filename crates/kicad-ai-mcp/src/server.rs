@@ -1112,6 +1112,12 @@ liveness, unsaved changes, and the capability matrix (which features are availab
                 "boards": boards,
                 "server": { "name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION") },
                 "kicad_installs": installs,
+                "autorouter": {
+                    "configured": self.state.options.freerouting.is_some(),
+                    "program": self.state.options.freerouting.as_ref().map(|f| f.program.display().to_string()),
+                    "tool": "pcb_autoroute_plan",
+                    "setup": "install.ps1 -FreeroutingOnly, then restart the server (see the README)",
+                },
                 "gui_editors": gui_editors,
                 "sessions": statuses,
             }),

@@ -165,21 +165,24 @@ impl Document {
                 })
                 .unwrap_or_default();
             let flag = |name: &str, on: &str| node.is_some_and(|n| n.child_text(name) == Some(on));
-            design.symbols.push(DesignSymbol {
-                id: s.uuid,
-                reference: s.reference,
-                value: s.value,
-                library_id: s.library_id,
-                footprint: s.footprint,
-                position: s.position,
-                orientation: s.orientation,
-                unit: s.unit,
-                fields,
-                properties,
-                dnp: flag("dnp", "yes"),
-                exclude_from_bom: flag("in_bom", "no"),
-                exclude_from_board: flag("on_board", "no"),
-            });
+            design.symbols.push(
+                DesignSymbol {
+                    id: s.uuid,
+                    reference: s.reference,
+                    value: s.value,
+                    library_id: s.library_id,
+                    footprint: s.footprint,
+                    position: s.position,
+                    orientation: s.orientation,
+                    unit: s.unit,
+                    fields,
+                    properties,
+                    dnp: flag("dnp", "yes"),
+                    exclude_from_bom: flag("in_bom", "no"),
+                    exclude_from_board: flag("on_board", "no"),
+                }
+                .with_drawn_angles(),
+            );
         }
         let point = |n: &Node| {
             Some(Point::new(
@@ -429,6 +432,30 @@ mod tests {
         );
         assert_eq!(s.pins.len(), 2);
         assert_eq!(s.definition, "Device:R");
+    }
+
+    #[test]
+    fn field_text_is_read_as_drawn_on_a_turned_part() {
+        // R7 is turned 90 degrees: text stored horizontal is drawn vertical, and the reverse.
+        let stored_90 = SCH.replace(
+            "(property \"Value\" \"10k\" (at 0 0 0))",
+            "(property \"Value\" \"10k\" (at 0 0 90))",
+        );
+        let design = Document::parse(stored_90).unwrap().design();
+        let angle = |name: &str| {
+            design.symbols[0]
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .angle_deg
+        };
+        assert_eq!(angle("Reference"), 90);
+        assert_eq!(angle("Value"), 0);
+        // The same text on a part that is not turned keeps its angle.
+        let upright = SCH.replace("(at 50.8 63.5 90)", "(at 50.8 63.5 0)");
+        let design = Document::parse(upright).unwrap().design();
+        assert!(design.symbols[0].fields.iter().all(|f| f.angle_deg == 0));
     }
 
     #[test]

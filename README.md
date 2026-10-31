@@ -236,7 +236,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 
 | Tool | What it does |
 |---|---|
-| `session_status` | KiCad installs found, open sessions, and what each can do |
+| `session_status` | KiCad installs found, open sessions, what each can do, and whether the autorouter is set up |
 | `session_open` / `session_close` | Open a schematic (or create one) and close it again |
 | `session_list_documents` | Documents open in the session's KiCad |
 | `sch_list_symbols` / `sch_get_symbol_pins` | Read parts and their pins, positions, and types |
@@ -264,6 +264,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `pcb_review` | What stands out: overlaps, parts outside the outline, no outline, schematic and board that disagree, far connectors and decoupling capacitors, DRC |
 | `pcb_update_from_schematic_plan` / `pcb_apply_plan` | Update the board from its schematic: a dry run first, then apply after you confirm; every footprint and pad net is checked afterwards |
 | `pcb_outline_plan` | A board outline (rectangle, rounded corners) of a given size or fitted around the parts, with mounting holes in the corners or at given places; applied with `pcb_apply_plan` |
+| `pcb_footprint_attrs_plan` | Set do-not-populate, BOM, position-file, and board-only attributes on named footprints, or on every mounting hole (repairs holes from boards made with v0.7.0); applied with `pcb_apply_plan`, read back |
 | `pcb_move_plan` | Move, turn, flip, and lock named footprints (places on a grid, exact offsets); shows overlaps before and after; applied with `pcb_apply_plan`, every pad read back |
 | `pcb_route_plan` | Tracks and vias for named nets, pad to pad or through given points, at the net class width; checked against other nets' copper and the edge; DRC before and after applying |
 | `pcb_zone_plan` | Copper pours (ground first) over the board or an area, with clearance, minimum width, and thermal reliefs; refilled after applying, DRC before and after |

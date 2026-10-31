@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::install::KicadInstall;
 use crate::run::{check, run, CliError};
-use crate::sexpr::{self, Sexp};
+use kicad_sexpr::Node as Sexp;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Netlist {
@@ -43,13 +43,13 @@ pub struct Node {
 
 impl Netlist {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let root = sexpr::parse(text)?;
+        let root = kicad_sexpr::parse(text).map_err(|e| e.to_string())?;
         if root.head() != Some("export") {
             return Err("not a KiCad netlist: expected (export …)".into());
         }
         let tool = root
             .child("design")
-            .and_then(|d| d.field("tool"))
+            .and_then(|d| d.child_text("tool"))
             .unwrap_or_default()
             .to_owned();
         let components = root
@@ -61,12 +61,12 @@ impl Netlist {
             .map(|n| {
                 n.children("net")
                     .map(|net| Net {
-                        name: net.field("name").unwrap_or_default().to_owned(),
+                        name: net.child_text("name").unwrap_or_default().to_owned(),
                         nodes: net
                             .children("node")
                             .map(|node| Node {
-                                reference: node.field("ref").unwrap_or_default().to_owned(),
-                                pin: node.field("pin").unwrap_or_default().to_owned(),
+                                reference: node.child_text("ref").unwrap_or_default().to_owned(),
+                                pin: node.child_text("pin").unwrap_or_default().to_owned(),
                             })
                             .collect(),
                     })
@@ -97,12 +97,12 @@ impl Netlist {
 fn component(comp: &Sexp) -> NetlistComponent {
     let lib = comp.child("libsource");
     NetlistComponent {
-        reference: comp.field("ref").unwrap_or_default().to_owned(),
-        value: comp.field("value").unwrap_or_default().to_owned(),
+        reference: comp.child_text("ref").unwrap_or_default().to_owned(),
+        value: comp.child_text("value").unwrap_or_default().to_owned(),
         lib_source: format!(
             "{}:{}",
-            lib.and_then(|l| l.field("lib")).unwrap_or_default(),
-            lib.and_then(|l| l.field("part")).unwrap_or_default()
+            lib.and_then(|l| l.child_text("lib")).unwrap_or_default(),
+            lib.and_then(|l| l.child_text("part")).unwrap_or_default()
         ),
     }
 }
@@ -164,5 +164,15 @@ mod tests {
         .map(|(n, pins)| (n.to_owned(), pins.into_iter().map(str::to_owned).collect()))
         .collect();
         assert_eq!(netlist.topology(), expected);
+    }
+
+    #[test]
+    fn reads_quoted_names_and_rejects_other_files() {
+        let text = r#"(export (version "E") (nets (net (code "1") (name "/A \"q\"") (node (ref "R1") (pin "1")))))"#;
+        let netlist = Netlist::parse(text).unwrap();
+        assert_eq!(netlist.nets[0].name, "/A \"q\"");
+        assert_eq!(netlist.nets[0].nodes[0].reference, "R1");
+        assert!(Netlist::parse("(kicad_sch (version 1))").is_err());
+        assert!(Netlist::parse("(export (nets)").is_err());
     }
 }

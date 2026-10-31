@@ -1101,6 +1101,9 @@ mod tests {
             rotation_deg: 0.0,
             locked: false,
             dnp: false,
+            exclude_from_bom: false,
+            exclude_from_pos: false,
+            board_only: false,
             pads: pads
                 .iter()
                 .map(|(n, x, y, net)| BoardPad {

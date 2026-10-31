@@ -138,21 +138,24 @@ impl Session {
             let (properties, [dnp, exclude_from_bom, exclude_from_board]) = facts_of(s.id.as_str());
             let position = Point::from_mm(s.position_mm.x, s.position_mm.y)
                 .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("{}: {e}", s.reference)))?;
-            design.symbols.push(DesignSymbol {
-                id: s.id.as_str().to_owned(),
-                reference: s.reference,
-                value: s.value,
-                library_id: s.library_id,
-                footprint: s.footprint,
-                position,
-                orientation: s.orientation,
-                unit: s.unit,
-                fields,
-                properties,
-                dnp,
-                exclude_from_bom,
-                exclude_from_board,
-            });
+            design.symbols.push(
+                DesignSymbol {
+                    id: s.id.as_str().to_owned(),
+                    reference: s.reference,
+                    value: s.value,
+                    library_id: s.library_id,
+                    footprint: s.footprint,
+                    position,
+                    orientation: s.orientation,
+                    unit: s.unit,
+                    fields,
+                    properties,
+                    dnp,
+                    exclude_from_bom,
+                    exclude_from_board,
+                }
+                .with_drawn_angles(),
+            );
         }
 
         let response: GetItemsResponse = {
