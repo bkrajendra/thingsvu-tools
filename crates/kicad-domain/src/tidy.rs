@@ -154,6 +154,8 @@ pub fn tidy_spec(design: &SchematicDesign, nets: &[NetInfo]) -> Result<CircuitSp
         description: "the circuit as it is in the schematic".into(),
         components,
         nets: net_specs,
+        no_connects: vec![],
+        power_flags: vec![],
         notes: vec![],
     })
 }
@@ -1394,6 +1396,144 @@ mod tests {
                 panic!("nets {other} and {} are joined", net.name);
             }
         }
+    }
+
+    /// A pin moves to another net, or two pins swap nets: only the wiring of the nets involved is
+    /// redrawn, and the rest of the sheet holds still and stays correct.
+    #[test]
+    fn a_pin_moves_to_another_net_and_only_those_nets_are_redrawn() {
+        use crate::pin_net::{plan_pin_net, PinNetRequest};
+        let (built, design) = built_regulator();
+        let nets = nets_of(&built);
+        let lib = library();
+        // C5.1 is on +3V3; it goes to +5V.
+        let plan = plan_pin_net(
+            &design,
+            &nets,
+            &lib,
+            &PinNetRequest::Move {
+                pin: "C5.1".into(),
+                to_net: "+5V".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(errors(&plan), Vec::<&Finding>::new(), "{:#?}", plan.findings);
+        println!(
+            "MOVE removals {} additions {}",
+            plan.removals.len(),
+            plan.operations.len()
+        );
+        assert!(plan.moves.is_empty());
+        assert!(
+            plan.removals.len() + plan.operations.len() < design.wires.len(),
+            "far less than a redraw of the sheet: {} + {} of {} wires",
+            plan.removals.len(),
+            plan.operations.len(),
+            design.wires.len()
+        );
+        // (Flags carry one name, PWR_FLAG, whatever net they are on; they are left out of the check.)
+        let without_flags = |d: SchematicDesign| {
+            let mut d = d;
+            d.symbols.retain(|s| s.value != "PWR_FLAG");
+            d
+        };
+        let after = without_flags(apply(&design, &plan));
+        let groups = joined(&after);
+        // C5.1 is now with the +5V parts, and the +3V3 parts are not with them.
+        assert_eq!(groups["C5.1"], groups["C1.1"], "joined to +5V");
+        assert_ne!(groups["C5.1"], groups["C3.1"], "no longer with +3V3");
+        assert_ne!(groups["C3.1"], groups["C1.1"], "+3V3 and +5V stay apart");
+        // The nets the plan promises hold for the whole sheet.
+        assert_nets_hold(
+            &after,
+            &OperationPlan {
+                expected_nets: plan.expected_nets.clone(),
+                ..Default::default()
+            },
+        );
+        // Wiring of nets that were not involved is untouched: no wire of the LED branch goes.
+        let led_wire_ids: BTreeSet<&str> = design
+            .wires
+            .iter()
+            .filter(|w| {
+                crate::connectivity::net_at(&design, &lib, &nets, w.start).is_some_and(|n| n.name.contains("LED_PWR"))
+            })
+            .map(|w| w.id.as_str())
+            .collect();
+        assert!(!led_wire_ids.is_empty());
+        assert!(plan.removals.iter().all(|r| !led_wire_ids.contains(r.id.as_str())));
+
+        // A swap of a +5V pin and a +3V3 pin.
+        let swap = plan_pin_net(
+            &design,
+            &nets,
+            &lib,
+            &PinNetRequest::Swap {
+                a: "C2.1".into(),
+                b: "C5.1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(errors(&swap), Vec::<&Finding>::new(), "{:#?}", swap.findings);
+        let after = without_flags(apply(&design, &swap));
+        let groups = joined(&after);
+        assert_eq!(groups["C2.1"], groups["C3.1"], "C2.1 is on +3V3");
+        assert_eq!(groups["C5.1"], groups["C1.1"], "C5.1 is on +5V");
+        assert_nets_hold(
+            &after,
+            &OperationPlan {
+                expected_nets: swap.expected_nets.clone(),
+                ..Default::default()
+            },
+        );
+
+        // Refusals.
+        let try_it = |r: PinNetRequest| plan_pin_net(&design, &nets, &lib, &r);
+        assert!(
+            try_it(PinNetRequest::Move {
+                pin: "C5.1".into(),
+                to_net: "+3V3".into()
+            })
+            .is_err(),
+            "already there"
+        );
+        assert!(
+            try_it(PinNetRequest::Move {
+                pin: "C9.1".into(),
+                to_net: "GND".into()
+            })
+            .is_err(),
+            "no such part"
+        );
+        assert!(
+            try_it(PinNetRequest::Move {
+                pin: "C5.9".into(),
+                to_net: "GND".into()
+            })
+            .is_err(),
+            "no such pin"
+        );
+        assert!(
+            try_it(PinNetRequest::Move {
+                pin: "C5".into(),
+                to_net: "GND".into()
+            })
+            .is_err(),
+            "not REF.PIN"
+        );
+        assert!(
+            try_it(PinNetRequest::Swap {
+                a: "C3.1".into(),
+                b: "C5.1".into()
+            })
+            .is_err(),
+            "same net"
+        );
+        assert!(try_it(PinNetRequest::Swap {
+            a: "C3.1".into(),
+            b: "C3.1".into()
+        })
+        .is_err());
     }
 
     #[test]

@@ -326,6 +326,24 @@ pub(crate) fn library_findings(spec: &CircuitSpec, library: &BTreeMap<LibraryId,
             }
         }
     }
+    for nc in &spec.no_connects {
+        let Some(component) = spec.component(&nc.component_id) else {
+            continue;
+        };
+        if let Some(symbol) = library.get(&component.library_id) {
+            if !symbol
+                .pins
+                .iter()
+                .any(|p| p.number == nc.pin_number && (p.unit == 0 || p.unit == 1))
+            {
+                findings.push(error(
+                    "UNKNOWN_PIN",
+                    format!("{} has no pin '{}' (no_connects)", component.library_id, nc.pin_number),
+                    vec![component.id.to_string()],
+                ));
+            }
+        }
+    }
     findings
 }
 
@@ -384,6 +402,9 @@ pub fn plan_circuit(
         return plan;
     }
 
+    // Power flags become parts on their nets.
+    let expanded = spec.expanded();
+    let spec = &expanded;
     findings.extend(library_findings(spec, library));
     if has_errors(&findings) {
         plan.findings = findings;
@@ -438,6 +459,37 @@ pub fn plan_circuit(
     plan.operations = out.operations;
     plan.fallback_nets = out.fallback_nets;
     findings.extend(out.findings);
+
+    // A no-connect flag on each pin that is meant to stay open.
+    for nc in &spec.no_connects {
+        let placed = plan.operations.iter().find_map(|op| match op {
+            Operation::PlaceSymbol {
+                component_id,
+                library_id,
+                position,
+                orientation,
+                ..
+            } if component_id == &nc.component_id => Some((library_id, *position, *orientation)),
+            _ => None,
+        });
+        let at = placed.and_then(|(id, position, orientation)| {
+            let pin = library
+                .get(id)?
+                .pins
+                .iter()
+                .find(|p| p.number == nc.pin_number && (p.unit == 0 || p.unit == 1))?;
+            Some(position + orientation.apply(pin.local)?)
+        });
+        if let Some(position) = at {
+            if !plan
+                .operations
+                .iter()
+                .any(|op| matches!(op, Operation::AddNoConnect { position: p } if *p == position))
+            {
+                plan.operations.push(Operation::AddNoConnect { position });
+            }
+        }
+    }
 
     plan.readability = crate::readability::check(&plan, library);
     findings.extend(readability_findings(&plan.readability));
@@ -782,6 +834,108 @@ mod readability_tests {
             );
         }
         assert!(!validate_circuit(&spec).iter().any(|f| f.code == "TOO_MANY_COMPONENTS"));
+    }
+
+    /// 14.7: pins meant to stay open get a no-connect flag; a power flag is written once per named
+    /// net, as a part on that net, and counts as no part.
+    #[test]
+    fn no_connects_and_power_flags_are_part_of_a_circuit() {
+        let json = r#"{ "schema_version": 1, "name": "flags",
+            "components": [
+                { "id": "r1", "library_id": "Device:R", "value": "1k", "reference_preference": "R1" },
+                { "id": "r2", "library_id": "Device:R", "value": "2k", "reference_preference": "R2" } ],
+            "nets": [
+                { "name": "+5V", "pins": [ { "component_id": "r1", "pin_number": "1" } ] },
+                { "name": "MID", "pins": [ { "component_id": "r1", "pin_number": "2" }, { "component_id": "r2", "pin_number": "1" } ] } ],
+            "no_connects": [ { "component_id": "r2", "pin_number": "2" } ],
+            "power_flags": [ "+5V" ] }"#;
+        let spec = CircuitSpec::from_json(json).unwrap();
+        assert!(crate::layout::library_ids_for(&spec)
+            .iter()
+            .any(|id| id.to_string() == "power:PWR_FLAG"));
+        let plan = plan_circuit(&spec, &library(), &ExistingDocument::default());
+        assert!(!has_errors(&plan.findings), "{:#?}", plan.findings);
+        // The flag is a part on the +5V net.
+        let flags: Vec<_> = plan
+            .operations
+            .iter()
+            .filter(|o| matches!(o, Operation::PlaceSymbol { library_id, .. } if library_id.entry() == "PWR_FLAG"))
+            .collect();
+        assert_eq!(flags.len(), 1, "{:#?}", plan.operations);
+        let five = plan.expected_nets.iter().find(|n| n.name == "+5V").unwrap();
+        assert_eq!(five.pins.len(), 2, "R1.1 and the flag: {five:?}");
+        // The no-connect flag is on pin 2 of R2.
+        let r2 = plan
+            .operations
+            .iter()
+            .find_map(|o| match o {
+                Operation::PlaceSymbol {
+                    reference,
+                    position,
+                    orientation,
+                    ..
+                } if reference == "R2" => Some((*position, *orientation)),
+                _ => None,
+            })
+            .unwrap();
+        let pin2 = library()[&LibraryId::parse("Device:R").unwrap()]
+            .pins
+            .iter()
+            .find(|p| p.number == "2")
+            .unwrap()
+            .local;
+        let want = r2.0 + r2.1.apply(pin2).unwrap();
+        assert!(
+            plan.operations
+                .iter()
+                .any(|o| matches!(o, Operation::AddNoConnect { position } if *position == want)),
+            "{:#?}",
+            plan.operations
+        );
+        assert_eq!(plan.counts().no_connects, 1);
+        // The flag is added once, even when the circuit already has one on the net.
+        let again = spec.expanded().expanded();
+        assert_eq!(
+            again
+                .components
+                .iter()
+                .filter(|c| c.library_id.entry() == "PWR_FLAG")
+                .count(),
+            1
+        );
+
+        // Mistakes.
+        let in_net = json.replace(
+            r#""no_connects": [ { "component_id": "r2", "pin_number": "2" } ]"#,
+            r#""no_connects": [ { "component_id": "r2", "pin_number": "1" } ]"#,
+        );
+        let found: Vec<_> = validate_circuit(&CircuitSpec::from_json(&in_net).unwrap())
+            .into_iter()
+            .map(|f| f.code)
+            .collect();
+        assert!(found.contains(&"NO_CONNECT_PIN_IN_NET"), "{found:?}");
+        let ghost = json.replace(r#""power_flags": [ "+5V" ]"#, r#""power_flags": [ "+9V" ]"#);
+        let found: Vec<_> = validate_circuit(&CircuitSpec::from_json(&ghost).unwrap())
+            .into_iter()
+            .map(|f| f.code)
+            .collect();
+        assert!(found.contains(&"POWER_FLAG_UNKNOWN_NET"), "{found:?}");
+        let bad_pin = json.replace(
+            r#""pin_number": "2" } ],
+            "power_flags""#,
+            r#""pin_number": "9" } ],
+            "power_flags""#,
+        );
+        let plan = plan_circuit(
+            &CircuitSpec::from_json(&bad_pin).unwrap(),
+            &library(),
+            &ExistingDocument::default(),
+        );
+        assert!(
+            plan.findings.iter().any(|f| f.code == "UNKNOWN_PIN"),
+            "{:#?}",
+            plan.findings
+        );
     }
 
     #[test]

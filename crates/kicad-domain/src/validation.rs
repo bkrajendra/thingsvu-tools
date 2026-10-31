@@ -73,7 +73,7 @@ pub fn validate_circuit(spec: &CircuitSpec) -> Vec<Finding> {
         out.push(Finding::error(
             "TOO_MANY_COMPONENTS",
             format!(
-                "{parts} components exceed the limit of {MAX_COMPONENTS} (power flags and supplies are not counted);                  split the circuit into parts and add them one after the other"
+                "{parts} components exceed the limit of {MAX_COMPONENTS} (power flags and supplies are not counted); split the circuit into parts and add them one after the other"
             ),
             vec![],
         ));
@@ -149,6 +149,15 @@ pub fn validate_circuit(spec: &CircuitSpec) -> Vec<Finding> {
 
     let mut net_names = BTreeSet::new();
     let mut pin_owner: BTreeMap<&PinRef, &str> = BTreeMap::new();
+    for flag in &spec.power_flags {
+        if !spec.nets.iter().any(|n| &n.name == flag) {
+            out.push(Finding::error(
+                "POWER_FLAG_UNKNOWN_NET",
+                format!("power_flags names '{flag}', which is not a net of the circuit"),
+                vec![flag.clone()],
+            ));
+        }
+    }
     for net in &spec.nets {
         if !is_net_name(&net.name) {
             out.push(Finding::error(
@@ -209,6 +218,35 @@ pub fn validate_circuit(spec: &CircuitSpec) -> Vec<Finding> {
                     vec![pin.component_id.to_string(), other.to_owned(), net.name.clone()],
                 ));
             }
+        }
+    }
+    let mut flagged: BTreeSet<&PinRef> = BTreeSet::new();
+    for nc in &spec.no_connects {
+        if !ids.contains(&nc.component_id) {
+            out.push(Finding::error(
+                "UNKNOWN_COMPONENT",
+                format!("no_connects refers to unknown component '{}'", nc.component_id),
+                vec![nc.component_id.to_string()],
+            ));
+        } else if let Some(net) = pin_owner.get(nc) {
+            out.push(Finding::error(
+                "NO_CONNECT_PIN_IN_NET",
+                format!(
+                    "pin {}.{} is marked no-connect but is in net '{net}'; a pin is one or the other",
+                    nc.component_id, nc.pin_number
+                ),
+                vec![nc.component_id.to_string(), (*net).to_owned()],
+            ));
+        }
+        if !flagged.insert(nc) {
+            out.push(Finding::warning(
+                "DUPLICATE_NO_CONNECT",
+                format!(
+                    "pin {}.{} is listed as no-connect twice",
+                    nc.component_id, nc.pin_number
+                ),
+                vec![nc.component_id.to_string()],
+            ));
         }
     }
     out

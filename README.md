@@ -247,6 +247,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `sch_tidy_plan` | Plan a cleaner layout for an existing schematic: parts re-laid out, old wires and labels replaced, nets kept identical. Optional hints: `keep`, `place`, `near`. Changes nothing until applied |
 | `sch_describe_layout` | Where every part and pin is (mm), its rotation and body, and the net of each pin. Read-only |
 | `sch_arrange_plan` | Plan moving, turning, mirroring, or deleting named parts. Their wires stay and break until reconnected |
+| `sch_pin_net_plan` | Move one pin to another net, or swap the nets of two pins, changing only those pins' wire, label, or power symbol (a short stub that names the new net); every net is read back from KiCad |
 | `sch_reconnect_plan` | Plan drawing all connections again with the parts where they are, for the circuit as it was before the moves |
 | `sch_declutter_plan` | Find text (part references and values, labels) that runs into other text, a wire, or a part, and plan moving it to a free place; `PWR_FLAG` text that has no room is hidden. Only text changes |
 | `sch_label_plan` | Add, rename, turn, or delete net labels. Refuses a label that would give a net a second name or join two nets by accident |
@@ -255,6 +256,7 @@ What each can do in detail: [capability matrix](docs/capability-matrix.md).
 | `bom_get` | The bill of materials as KiCad groups it, with every custom field. Read-only |
 | `bom_review` | What an order lacks: footprints, part numbers, supplier numbers, inconsistent values; plus a list of lookups to do. No network |
 | `sch_set_fields_plan` | Set fields on many parts at once: part numbers, manufacturer, datasheet, DNP, exclude from BOM (custom fields are added hidden) |
+| `sym_search` / `sym_get` | Search the symbol libraries by name, keyword, or description (default footprint and filters, pins, units) and read one symbol's pins without placing it |
 | `fp_search` / `fp_get` | Search the footprint libraries and read a footprint's pads and courtyard |
 | `sch_footprint_plan` | Check every footprint (missing, not in the libraries, no pad for a pin, wrong package) and assign footprints |
 | `bom_export` | Write the BOM as CSV into the project folder (generic or JLCPCB columns) |

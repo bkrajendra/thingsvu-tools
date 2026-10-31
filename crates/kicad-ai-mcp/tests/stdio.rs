@@ -154,6 +154,7 @@ async fn lists_tools_and_returns_envelopes() {
             "sch_get_symbol_pins",
             "sch_label_plan",
             "sch_list_symbols",
+            "sch_pin_net_plan",
             "sch_plan_changes",
             "sch_reconnect_plan",
             "sch_render",
@@ -167,7 +168,9 @@ async fn lists_tools_and_returns_envelopes() {
             "session_list_documents",
             "session_open",
             "session_reload",
-            "session_status"
+            "session_status",
+            "sym_get",
+            "sym_search"
         ]
     );
 
@@ -3873,6 +3876,325 @@ async fn live_checkpoints_keep_diff_and_restore() {
         .await;
     assert_eq!(by_path["ok"], true, "{by_path}");
     assert_eq!(by_path["result"]["identical"], false, "{by_path}");
+}
+
+/// Phase 14.7: symbols are found and described without placing them.
+#[tokio::test]
+async fn live_symbols_are_searched_and_described() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let mut mcp = Mcp::start().await;
+    let started = std::time::Instant::now();
+    let found = mcp.call("sym_search", json!({ "query": "ams1117 3.3" })).await;
+    println!(
+        "SYM SEARCH (cold) {:?}: {}",
+        started.elapsed(),
+        found["result"]["symbols"][0]
+    );
+    assert_eq!(found["ok"], true, "{found}");
+    let first = &found["result"]["symbols"][0];
+    assert_eq!(first["id"], "Regulator_Linear:AMS1117-3.3", "{found}");
+    assert_eq!(first["pins"], 3, "{found}");
+    assert!(first["footprint"].as_str().unwrap().contains("SOT-223"), "{found}");
+    assert!(first["footprint_filters"].as_str().unwrap().contains("SOT"), "{found}");
+    // By description and keyword, and narrowed to a library.
+    let ldo = mcp
+        .call(
+            "sym_search",
+            json!({ "query": "ldo fixed positive", "library": "Regulator_Linear", "limit": 5 }),
+        )
+        .await;
+    assert!(ldo["result"]["count"].as_u64().unwrap() >= 3, "{ldo}");
+    assert!(
+        ldo["result"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"].as_str().unwrap().starts_with("Regulator_Linear:")),
+        "{ldo}"
+    );
+    let again = std::time::Instant::now();
+    let _ = mcp.call("sym_search", json!({ "query": "usb c receptacle" })).await;
+    println!("SYM SEARCH (warm) {:?}", again.elapsed());
+    let power = mcp
+        .call("sym_search", json!({ "query": "pwr_flag", "library": "power" }))
+        .await;
+    assert_eq!(power["result"]["symbols"][0]["power"], true, "{power}");
+    let none = mcp.call("sym_search", json!({ "query": "zzzzqqqq" })).await;
+    assert_eq!(none["result"]["count"], 0, "{none}");
+
+    // One symbol with its pins: a derived symbol has its parent's.
+    let ams = mcp
+        .call("sym_get", json!({ "id": "Regulator_Linear:AMS1117-3.3" }))
+        .await;
+    assert_eq!(ams["ok"], true, "{ams}");
+    assert_eq!(ams["result"]["pin_count"], 3, "{ams}");
+    assert_eq!(ams["result"]["reference_prefix"], "U", "{ams}");
+    let names: Vec<&str> = ams["result"]["pins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"VI") && names.contains(&"VO") && names.contains(&"GND"),
+        "{ams}"
+    );
+    assert!(ams["result"]["pins"][0]["electrical_type"].is_string());
+    let r = mcp.call("sym_get", json!({ "id": "Device:R" })).await;
+    assert_eq!(r["result"]["pin_count"], 2, "{r}");
+    assert_eq!(r["result"]["units"], 1);
+    let missing = mcp.call("sym_get", json!({ "id": "Device:NoSuchPart" })).await;
+    assert_eq!(missing["ok"], false, "{missing}");
+    let bad = mcp.call("sym_get", json!({ "id": "R" })).await;
+    assert_eq!(bad["ok"], false, "{bad}");
+}
+
+/// Phase 14.7: a circuit with a pin left open and a power flag on a supply net; the no-connect flag
+/// and the flag part are drawn, read back, and ERC has nothing to say about the open pin.
+#[tokio::test]
+async fn live_circuit_no_connects_and_power_flags_through_the_file_provider() {
+    circuit_flags_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_circuit_no_connects_and_power_flags_through_the_api() {
+    circuit_flags_flow("headless").await;
+}
+
+async fn circuit_flags_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-ncflags-{provider}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("flags.kicad_sch");
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "create": true, "provider": provider }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let circuit = json!({ "schema_version": 1, "name": "flags",
+        "components": [
+            { "id": "r1", "library_id": "Device:R", "value": "1k", "reference_preference": "R1" },
+            { "id": "r2", "library_id": "Device:R", "value": "2k", "reference_preference": "R2" } ],
+        "nets": [
+            { "name": "+5V", "pins": [ { "component_id": "r1", "pin_number": "1" } ] },
+            { "name": "MID", "pins": [ { "component_id": "r1", "pin_number": "2" }, { "component_id": "r2", "pin_number": "1" } ] },
+            { "name": "GND", "pins": [ { "component_id": "r2", "pin_number": "2" } ] } ],
+        "power_flags": [ "+5V", "GND" ] });
+    let with_open_pin = |mut c: Value| {
+        // R2's pin 2 is left open instead of on GND.
+        c["nets"][2]["pins"] = json!([]);
+        c["nets"].as_array_mut().unwrap().pop();
+        c["no_connects"] = json!([{ "component_id": "r2", "pin_number": "2" }]);
+        c["power_flags"] = json!(["+5V"]);
+        c
+    };
+    // Mistakes are refused with the reason.
+    let mut bad = with_open_pin(circuit.clone());
+    bad["no_connects"] = json!([{ "component_id": "r1", "pin_number": "1" }]);
+    let refused = mcp
+        .call("sch_plan_changes", json!({ "session_id": id, "circuit": bad }))
+        .await;
+    assert!(refused.to_string().contains("NO_CONNECT_PIN_IN_NET"), "{refused}");
+    let mut ghost = circuit.clone();
+    ghost["power_flags"] = json!(["+9V"]);
+    let refused = mcp
+        .call("sch_plan_changes", json!({ "session_id": id, "circuit": ghost }))
+        .await;
+    assert!(refused.to_string().contains("POWER_FLAG_UNKNOWN_NET"), "{refused}");
+
+    let plan = mcp
+        .call(
+            "sch_plan_changes",
+            json!({ "session_id": id, "circuit": with_open_pin(circuit) }),
+        )
+        .await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    assert_eq!(plan["result"]["counts"]["no_connects"], 1, "{plan}");
+    assert!(plan.to_string().contains("add_no_connect"), "{plan}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": format!("ncflags-{provider}-{}", std::process::id()) }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let symbols = mcp.call("sch_list_symbols", json!({ "session_id": id })).await;
+    assert!(
+        symbols.to_string().contains("PWR_FLAG"),
+        "the flag is a part: {symbols}"
+    );
+    let text = std::fs::read_to_string(&schematic).unwrap();
+    assert_eq!(
+        text.matches("(no_connect").count(),
+        1,
+        "one no-connect flag in the file"
+    );
+    // ERC: the open pin is marked, so it is not reported as unconnected.
+    let erc = mcp.call("sch_run_erc", json!({ "session_id": id })).await;
+    // The open pin is marked, and the flag is joined to its net (a junction where the flag sits
+    // on the wire: without it KiCad 10 reads the flag as unconnected and the supply as undriven).
+    println!("ERC ({provider}) {}", erc["result"]["violations"]);
+    assert_eq!(erc["ok"], true, "{erc}");
+    assert_eq!(erc["result"]["violations"], json!([]), "a clean sheet: {erc}");
+    mcp.call("session_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
+}
+
+/// Phase 14.7: a pin moves to another net and two pins swap nets on a drawn sheet, changing only
+/// those pins' wiring, and the nets are read back from KiCad.
+#[tokio::test]
+async fn live_pins_change_nets_through_the_file_provider() {
+    pin_net_flow("file").await;
+}
+
+#[tokio::test]
+async fn live_pins_change_nets_through_the_api() {
+    pin_net_flow("headless").await;
+}
+
+async fn pin_net_flow(provider: &str) {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("thingsvu-mcp-pinnet-{provider}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schematic = dir.join("regulator.kicad_sch");
+    let mut mcp = Mcp::start().await;
+    let opened = mcp
+        .call(
+            "session_open",
+            json!({ "schematic_path": schematic, "create": true, "provider": provider }),
+        )
+        .await;
+    assert_eq!(opened["ok"], true, "{opened}");
+    let id = opened["result"]["session_id"].clone();
+    let key = |n: &str| format!("pinnet-{provider}-{n}-{}", std::process::id());
+    let circuit: Value = serde_json::from_str(include_str!("../../../docs/examples/regulator-3v3.json")).unwrap();
+    let plan = mcp
+        .call("sch_plan_changes", json!({ "session_id": id, "circuit": circuit }))
+        .await;
+    assert_eq!(plan["result"]["can_apply"], true, "{plan}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": plan["result"]["plan_id"], "confirm": true, "idempotency_key": key("build") }),
+        )
+        .await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    // Changes that remove drawing items need a saved document (so a failed one can be reverted).
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let net_of = |nets: &Value, pin: &str| -> String {
+        let (reference, number) = pin.split_once('.').unwrap();
+        nets["result"]["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| {
+                n["pins"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["reference"] == reference && p["pin"] == number)
+            })
+            .map(|n| n["name"].as_str().unwrap().to_owned())
+            .unwrap_or_default()
+    };
+    let nets = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert!(net_of(&nets, "C5.1").contains("3V3"), "{nets}");
+    let wires_before = std::fs::read_to_string(&schematic)
+        .map(|t| t.matches("(wire").count())
+        .unwrap_or(0);
+
+    // Refusals.
+    for bad in [
+        json!({ "session_id": id }),
+        json!({ "session_id": id, "move": { "pin": "C5.1", "to_net": "+3V3" } }),
+        json!({ "session_id": id, "move": { "pin": "C9.1", "to_net": "GND" } }),
+        json!({ "session_id": id, "move": { "pin": "C5.9", "to_net": "GND" } }),
+        json!({ "session_id": id, "swap": ["C3.1", "C4.1"] }),
+        json!({ "session_id": id, "swap": ["C3.1"] }),
+    ] {
+        let r = mcp.call("sch_pin_net_plan", bad.clone()).await;
+        assert_eq!(r["ok"], false, "{bad}: {r}");
+    }
+
+    // C5.1 moves from +3V3 to +5V.
+    let moved = mcp
+        .call(
+            "sch_pin_net_plan",
+            json!({ "session_id": id, "move": { "pin": "C5.1", "to_net": "+5V" } }),
+        )
+        .await;
+    assert_eq!(moved["ok"], true, "{moved}");
+    let (removals, ops) = (
+        moved["result"]["removals"].as_array().map_or(0, Vec::len),
+        moved["result"]["operations"].as_array().map_or(0, Vec::len),
+    );
+    println!("PIN MOVE ({provider}): {removals} removals, {ops} additions");
+    assert!(removals + ops <= 8, "only that pin's drawing changes: {moved}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": moved["result"]["plan_id"], "confirm": true, "idempotency_key": key("move") }),
+        )
+        .await;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(
+        applied["result"]["verified"], true,
+        "KiCad reads the nets as planned: {applied}"
+    );
+    mcp.call("sch_save", json!({ "session_id": id })).await;
+    let nets = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert!(net_of(&nets, "C5.1").contains("5V"), "{nets}");
+    assert!(
+        net_of(&nets, "C3.1").contains("3V3"),
+        "the rest of +3V3 is as it was: {nets}"
+    );
+
+    // Two pins swap: C5.1 (now +5V) and C3.1 (+3V3).
+    let swapped = mcp
+        .call(
+            "sch_pin_net_plan",
+            json!({ "session_id": id, "swap": ["C5.1", "C3.1"] }),
+        )
+        .await;
+    assert_eq!(swapped["ok"], true, "{swapped}");
+    let applied = mcp
+        .call(
+            "sch_apply_plan",
+            json!({ "session_id": id, "plan_id": swapped["result"]["plan_id"], "confirm": true, "idempotency_key": key("swap") }),
+        )
+        .await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let nets = mcp.call("sch_get_netlist", json!({ "session_id": id })).await;
+    assert!(net_of(&nets, "C5.1").contains("3V3"), "{nets}");
+    assert!(net_of(&nets, "C3.1").contains("5V"), "{nets}");
+    if provider == "file" {
+        let wires_after = std::fs::read_to_string(&schematic).unwrap().matches("(wire").count();
+        println!("WIRES {wires_before} -> {wires_after}");
+        assert!(
+            wires_after.abs_diff(wires_before) <= 6,
+            "the sheet was not redrawn: {wires_before} -> {wires_after}"
+        );
+    }
+    mcp.call("session_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
 }
 
 /// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows

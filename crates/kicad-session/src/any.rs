@@ -190,7 +190,9 @@ impl AnySession {
             || plan.operations.iter().any(|op| {
                 matches!(
                     op,
-                    kicad_domain::Operation::PlaceSymbol { .. } | kicad_domain::Operation::PlacePowerSymbol { .. }
+                    kicad_domain::Operation::PlaceSymbol { .. }
+                        | kicad_domain::Operation::PlacePowerSymbol { .. }
+                        | kicad_domain::Operation::AddNoConnect { .. }
                 )
             })
         {
@@ -298,6 +300,17 @@ fn placement_problems(plan: &OperationPlan, design: &kicad_domain::SchematicDesi
                     s.orientation,
                     at(position),
                     orientation
+                ));
+            }
+        }
+    }
+    for op in &plan.operations {
+        if let kicad_domain::Operation::AddNoConnect { position } = op {
+            if !design.no_connects.iter().any(|n| n.position == *position) {
+                problems.push(format!(
+                    "no no-connect flag at ({}, {}) after applying",
+                    position.x.to_mm(),
+                    position.y.to_mm()
                 ));
             }
         }

@@ -20,6 +20,14 @@ pub struct CircuitSpec {
     pub description: String,
     pub components: Vec<ComponentSpec>,
     pub nets: Vec<NetSpec>,
+    /// Pins that are meant to stay unconnected; each gets a no-connect flag (a pin in a net cannot
+    /// be one).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub no_connects: Vec<PinRef>,
+    /// Nets that carry a `PWR_FLAG` (a supply that comes from outside the circuit), each placed at
+    /// its net and counted as no part.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub power_flags: Vec<String>,
     /// Free-form notes for humans; ignored by tools.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -63,6 +71,54 @@ impl CircuitSpec {
 
     pub fn component(&self, id: &LogicalId) -> Option<&ComponentSpec> {
         self.components.iter().find(|c| &c.id == id)
+    }
+
+    /// The spec with `power_flags` written out as parts: one `power:PWR_FLAG` on each named net
+    /// that has none, with its pin in the net. Unknown nets are left for the validation to report.
+    pub fn expanded(&self) -> CircuitSpec {
+        let mut spec = self.clone();
+        let is_flag = |spec: &CircuitSpec, pin: &PinRef| {
+            spec.component(&pin.component_id)
+                .is_some_and(|c| c.library_id.library() == "power" && c.library_id.entry() == "PWR_FLAG")
+        };
+        for name in &self.power_flags {
+            let Some(at) = spec.nets.iter().position(|n| &n.name == name) else {
+                continue;
+            };
+            if spec.nets[at].pins.iter().any(|p| is_flag(&spec, p)) {
+                continue;
+            }
+            let base: String = format!(
+                "flag_{}",
+                name.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+            );
+            let mut id = base.clone();
+            for n in 2.. {
+                if spec.components.iter().all(|c| c.id.as_str() != id) {
+                    break;
+                }
+                id = format!("{base}_{n}");
+            }
+            let Ok(id) = LogicalId::new(id.chars().take(64).collect::<String>()) else {
+                continue;
+            };
+            spec.components.push(ComponentSpec {
+                id: id.clone(),
+                library_id: LibraryId::parse("power:PWR_FLAG").expect("a valid id"),
+                reference_preference: None,
+                value: "PWR_FLAG".into(),
+                footprint: None,
+                fields: BTreeMap::new(),
+            });
+            spec.nets[at].pins.push(PinRef {
+                component_id: id,
+                pin_number: "1".into(),
+            });
+        }
+        spec.power_flags.clear();
+        spec
     }
 }
 

@@ -68,6 +68,9 @@ pub fn power_symbol<'a>(library: &'a BTreeMap<LibraryId, LibrarySymbol>, name: &
 /// Library ids a circuit's layout may need: its components and a power symbol per net name.
 pub fn library_ids_for(spec: &CircuitSpec) -> Vec<LibraryId> {
     let mut ids: BTreeSet<LibraryId> = spec.components.iter().map(|c| c.library_id.clone()).collect();
+    if !spec.power_flags.is_empty() {
+        ids.extend(LibraryId::parse("power:PWR_FLAG"));
+    }
     for net in &spec.nets {
         if let Ok(id) = LibraryId::parse(&format!("power:{}", net.name)) {
             ids.insert(id);
@@ -861,10 +864,15 @@ pub(crate) fn drawing_operations(
         });
     }
     for (&(x, y), &count) in &drawing.ends {
-        if count >= 3 {
-            operations.push(Operation::AddJunction {
-                position: Point::new(Nm(x), Nm(y)),
-            });
+        let at = Point::new(Nm(x), Nm(y));
+        // A pin or a wire end in the middle of another wire joins it only with a junction there
+        // (KiCad 10 does not connect it otherwise; the flags of a net sit on its wires like that).
+        let inside_a_wire = drawing
+            .wires
+            .iter()
+            .any(|(_, a, b)| at != *a && at != *b && on_segment(at, *a, *b));
+        if count >= 3 || inside_a_wire {
+            operations.push(Operation::AddJunction { position: at });
         }
     }
     operations
@@ -996,6 +1004,8 @@ pub fn layout(
                 })
                 .filter(|net| !net.pins.is_empty())
                 .collect(),
+            no_connects: vec![],
+            power_flags: vec![],
             notes: vec![],
         }
     };

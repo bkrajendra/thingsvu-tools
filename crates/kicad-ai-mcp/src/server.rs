@@ -448,6 +448,54 @@ pub struct SetFieldsPlanArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SymSearchArgs {
+    /// Words to find in a symbol's name, library, description, or keywords, e.g. `ldo 3.3v` or
+    /// `usb c receptacle`.
+    pub query: String,
+    /// Only this library, e.g. Regulator_Linear.
+    #[serde(default)]
+    pub library: Option<String>,
+    /// How many to return (default 15, at most 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// A session, to include the project's own symbol libraries.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SymGetArgs {
+    /// `Library:Name`, like Device:R.
+    pub id: String,
+    /// A session, to include the project's own symbol libraries.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MovePinArg {
+    /// The pin, `REF.PIN` like U1.3.
+    pub pin: String,
+    /// The net it joins (an existing net, or a new name).
+    pub to_net: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PinNetArgs {
+    pub session_id: String,
+    /// Move one pin to another net: {"pin": "U1.3", "to_net": "GND"}. Give this or swap.
+    #[serde(default, rename = "move")]
+    pub move_pin: Option<MovePinArg>,
+    /// Swap the nets of two pins: ["U1.3", "U1.4"].
+    #[serde(default)]
+    pub swap: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FpSearchArgs {
     /// Words the footprint's `Library:Name` must contain, e.g. `r 0603` or `sot-23-5`.
     pub query: String,
@@ -516,7 +564,9 @@ pub struct PlanArgs {
     pub session_id: String,
     /// Electrical intent: {"schema_version": 1, "name": "...", "components": [{"id", "library_id"
     /// (e.g. "Device:R"), "value", optional "reference_preference", "footprint", "fields"}], "nets":
-    /// [{"name", "pins": [{"component_id", "pin_number"}]}]}. Coordinates are chosen by the layout.
+    /// [{"name", "pins": [{"component_id", "pin_number"}]}], optional "no_connects": [{"component_id",
+    /// "pin_number"}] (pins left open, each gets a no-connect flag; not in a net) and "power_flags":
+    /// ["+5V"] (nets that get a PWR_FLAG part)}. Coordinates are chosen by the layout.
     pub circuit: serde_json::Value,
 }
 
@@ -844,6 +894,29 @@ impl KicadAiServer {
         Ok(kicad_session::footprints::FootprintLibraries::discover(
             self.installs().await,
             project.as_deref(),
+        ))
+    }
+
+    /// The symbol libraries on this machine, with the project's own when a session is given.
+    async fn symbol_libraries(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<kicad_session::symbols::SymbolLibraries, ToolError> {
+        let project = match session_id {
+            Some(id) => Some(match self.session(id).await {
+                Ok(s) => s.document_path().parent().map(std::path::Path::to_path_buf),
+                Err(_) => self
+                    .board(id)
+                    .await?
+                    .document_path()
+                    .parent()
+                    .map(std::path::Path::to_path_buf),
+            }),
+            None => None,
+        };
+        Ok(kicad_session::symbols::SymbolLibraries::discover(
+            self.installs().await,
+            project.flatten().as_deref(),
         ))
     }
 
@@ -1768,6 +1841,120 @@ else changes and every net is checked unchanged after applying; each field is re
             let design = session.design().await?;
             let nets = session.netlist().await?;
             Ok::<_, ToolError>(kicad_domain::bom::plan_set_fields(&design, &nets, &edits))
+        }
+        .await;
+        self.store_and_reply(&cid, &session, plan).await
+    }
+
+    #[tool(
+        name = "sym_search",
+        description = "Search the KiCad symbol libraries (the install's, and the project's when a session_id is given) \
+for symbols whose name, description, or keywords contain every word of the query, e.g. `ldo 3.3v` or \
+`usb c receptacle`, best matches first (an exact name, then names, then keywords, then descriptions). \
+Returns the id (Library:Name), description, keywords, the default footprint and its filters, the \
+datasheet, the number of pins and units, and whether it is a power symbol, without placing anything. \
+The first search reads the libraries and takes a few seconds. A user's global library table is not \
+read. Read-only."
+    )]
+    pub async fn sym_search(&self, Parameters(args): Parameters<SymSearchArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let libs = match self.symbol_libraries(args.session_id.as_deref()).await {
+            Ok(l) => l,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let limit = args.limit.unwrap_or(15).clamp(1, 50);
+        let query = args.query.clone();
+        let library = args.library.clone();
+        // Reading the libraries is blocking work.
+        let hits = match tokio::task::spawn_blocking(move || libs.search(&query, library.as_deref(), limit)).await {
+            Ok(h) => h,
+            Err(e) => return envelope::error(&cid, &ToolError::new(ErrorCode::KicadError, e.to_string())),
+        };
+        envelope::ok(
+            &cid,
+            serde_json::json!({ "count": hits.len(), "symbols": hits.iter().map(|e| serde_json::json!({
+                "id": e.id(), "description": e.description, "keywords": e.keywords,
+                "footprint": e.footprint, "footprint_filters": e.footprint_filters, "datasheet": e.datasheet,
+                "pins": e.pins, "units": e.units, "power": e.power, "derived_from": e.extends,
+            })).collect::<Vec<_>>() }),
+            vec![],
+            if hits.is_empty() {
+                vec!["nothing matched; try fewer or other words".to_owned()]
+            } else {
+                vec![]
+            },
+        )
+    }
+
+    #[tool(
+        name = "sym_get",
+        description = "One symbol from the libraries without placing it: its fields (description, keywords, default \
+footprint, footprint filters, datasheet), reference prefix, units, and every pin (number, name, \
+electrical type, unit, place in mm, and the way it points). Use it to learn a part's pin numbers before \
+writing a circuit. Read-only."
+    )]
+    pub async fn sym_get(&self, Parameters(args): Parameters<SymGetArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let libs = match self.symbol_libraries(args.session_id.as_deref()).await {
+            Ok(l) => l,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let id = args.id.clone();
+        match tokio::task::spawn_blocking(move || libs.get(&id)).await {
+            Ok(Ok(d)) => envelope::ok(
+                &cid,
+                serde_json::json!({
+                    "id": d.id, "description": d.entry.description, "keywords": d.entry.keywords,
+                    "footprint": d.entry.footprint, "footprint_filters": d.entry.footprint_filters,
+                    "datasheet": d.entry.datasheet, "reference_prefix": d.reference_prefix,
+                    "units": d.entry.units, "power": d.entry.power, "derived_from": d.entry.extends,
+                    "pin_count": d.pins.len(), "pins": d.pins,
+                    "units_note": "unit 0 pins belong to every unit",
+                }),
+                vec![],
+                vec![],
+            ),
+            Ok(Err(e)) => envelope::error(&cid, &e),
+            Err(e) => envelope::error(&cid, &ToolError::new(ErrorCode::KicadError, e.to_string())),
+        }
+    }
+
+    #[tool(
+        name = "sch_pin_net_plan",
+        description = "Plan moving one pin to another net (move: {pin: U1.3, to_net: GND}), or swapping the nets of \
+two pins (swap: [U1.3, U1.4]), changing only those pins' wires, labels, and power symbols: the pin's own \
+wire and the name at its end go, and a short stub that names the new net (a power symbol, or a label) \
+is drawn. Where the pin is wired into the middle of other wires, the wiring of the nets involved is \
+drawn again and the rest of the sheet is left alone. Refused when the new wiring would cross \
+something that is drawn. Every net is read back from KiCad after sch_apply_plan. Returns a plan_id."
+    )]
+    pub async fn sch_pin_net_plan(&self, Parameters(args): Parameters<PinNetArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let session = match self.session(&args.session_id).await {
+            Ok(s) => s,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let plan = async {
+            let request = match (&args.move_pin, &args.swap) {
+                (Some(m), None) => kicad_domain::pin_net::PinNetRequest::Move {
+                    pin: m.pin.clone(),
+                    to_net: m.to_net.clone(),
+                },
+                (None, Some(s)) if s.len() == 2 => kicad_domain::pin_net::PinNetRequest::Swap {
+                    a: s[0].clone(),
+                    b: s[1].clone(),
+                },
+                _ => {
+                    return Err(ToolError::new(
+                        ErrorCode::InvalidArgument,
+                        "give move: {pin, to_net} or swap: [pin, pin], one of them",
+                    ))
+                }
+            };
+            let design = session.design().await?;
+            let nets = session.netlist().await?;
+            let library = self.redraw_library(&session, &design, &nets).await?;
+            kicad_domain::pin_net::plan_pin_net(&design, &nets, &library, &request)
         }
         .await;
         self.store_and_reply(&cid, &session, plan).await
