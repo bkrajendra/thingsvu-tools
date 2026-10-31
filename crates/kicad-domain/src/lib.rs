@@ -28,6 +28,7 @@ pub mod routing;
 pub mod schematic;
 pub mod text;
 pub mod tidy;
+pub mod track_edit;
 pub mod validation;
 pub mod zones;
 

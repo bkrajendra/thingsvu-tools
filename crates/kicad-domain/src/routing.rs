@@ -79,6 +79,8 @@ pub struct RouteRequest {
     pub layer: Option<String>,
     /// Track width; the net class's when not given.
     pub width: Option<Nm>,
+    /// Lock the tracks and vias this route makes, so a later rip-up or autoroute keeps them.
+    pub locked: bool,
 }
 
 /// What one route became.
@@ -650,6 +652,7 @@ pub fn plan_routes(
                         end: *b,
                         width,
                         layer: layer.clone(),
+                        locked: req.locked,
                     });
                     expected.tracks.push(BoardTrack {
                         id: String::new(),
@@ -658,7 +661,7 @@ pub fn plan_routes(
                         width,
                         layer: layer.clone(),
                         net: net.clone(),
-                        locked: false,
+                        locked: req.locked,
                     });
                 }
                 Piece::Via { at } => {
@@ -668,6 +671,7 @@ pub fn plan_routes(
                         at: *at,
                         diameter: via.0,
                         drill: via.1,
+                        locked: req.locked,
                     });
                     expected.vias.push(BoardVia {
                         id: String::new(),
@@ -675,6 +679,7 @@ pub fn plan_routes(
                         diameter: via.0,
                         drill: via.1,
                         net: net.clone(),
+                        locked: req.locked,
                     });
                 }
             }

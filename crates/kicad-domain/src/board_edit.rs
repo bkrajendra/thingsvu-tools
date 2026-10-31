@@ -94,6 +94,8 @@ pub enum BoardOp {
         end: Point,
         width: Nm,
         layer: String,
+        /// Created locked.
+        locked: bool,
     },
     /// A through via.
     AddVia {
@@ -101,6 +103,32 @@ pub enum BoardOp {
         at: Point,
         diameter: Nm,
         drill: Nm,
+        /// Created locked.
+        locked: bool,
+    },
+    /// A track deleted.
+    RemoveTrack {
+        id: String,
+        net: String,
+        layer: String,
+        start: Point,
+        end: Point,
+    },
+    /// A track given another width.
+    SetTrackWidth {
+        id: String,
+        net: String,
+        layer: String,
+        from: Nm,
+        to: Nm,
+    },
+    /// A track or via locked or unlocked.
+    SetLocked {
+        id: String,
+        /// `track` or `via`.
+        item: &'static str,
+        net: String,
+        locked: bool,
     },
     /// A via deleted (a dangling one left by a router).
     RemoveVia { id: String, net: String, at: Point },
@@ -880,9 +908,11 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                 end,
                 width,
                 layer,
+                locked,
             } => {
                 let found = after.tracks.iter().any(|t| {
                     &t.net == net
+                        && t.locked == *locked
                         && &t.layer == layer
                         && (t.width.0 - width.0).abs() <= PLACE_TOLERANCE_NM
                         && ((near(t.start, *start) && near(t.end, *end)) || (near(t.start, *end) && near(t.end, *start)))
@@ -898,10 +928,15 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
                 }
             }
             BoardOp::AddVia {
-                net, at, diameter, drill,
+                net,
+                at,
+                diameter,
+                drill,
+                locked,
             } => {
                 let found = after.vias.iter().any(|v| {
                     &v.net == net
+                        && v.locked == *locked
                         && near(v.at, *at)
                         && (v.diameter.0 - diameter.0).abs() <= PLACE_TOLERANCE_NM
                         && (v.drill.0 - drill.0).abs() <= PLACE_TOLERANCE_NM
@@ -933,6 +968,41 @@ pub fn verify_edit(plan: &BoardEditPlan, after: &Board) -> Vec<String> {
             BoardOp::RemoveZone { id, name } => {
                 if after.zones.iter().any(|a| &a.id == id) {
                     problems.push(format!("the old zone {name} ({id}) is still there"));
+                }
+            }
+            BoardOp::RemoveTrack { id, net, start, end, .. } => {
+                if after.tracks.iter().any(|t| &t.id == id) {
+                    problems.push(format!(
+                        "the {net} track from ({:.3}, {:.3}) to ({:.3}, {:.3}) mm ({id}) is still there",
+                        start.x.to_mm(),
+                        start.y.to_mm(),
+                        end.x.to_mm(),
+                        end.y.to_mm()
+                    ));
+                }
+            }
+            BoardOp::SetTrackWidth { id, net, to, .. } => match after.tracks.iter().find(|t| &t.id == id) {
+                Some(t) if (t.width.0 - to.0).abs() <= PLACE_TOLERANCE_NM => {}
+                Some(t) => problems.push(format!(
+                    "a {net} track ({id}) is {:.3} mm wide, the plan made it {:.3} mm",
+                    t.width.to_mm(),
+                    to.to_mm()
+                )),
+                None => problems.push(format!("the {net} track {id} is gone after the width change")),
+            },
+            BoardOp::SetLocked { id, item, net, locked } => {
+                let now = match *item {
+                    "via" => after.vias.iter().find(|v| &v.id == id).map(|v| v.locked),
+                    _ => after.tracks.iter().find(|t| &t.id == id).map(|t| t.locked),
+                };
+                match now {
+                    Some(l) if l == *locked => {}
+                    Some(_) => problems.push(format!(
+                        "a {net} {item} ({id}) is {} after applying, the plan {} it",
+                        if *locked { "unlocked" } else { "locked" },
+                        if *locked { "locked" } else { "unlocked" }
+                    )),
+                    None => problems.push(format!("the {net} {item} {id} is gone after the lock change")),
                 }
             }
             BoardOp::RemoveVia { id, net, at } => {
@@ -1082,6 +1152,7 @@ mod tests {
             diameter: Nm::from_mm(0.6).unwrap(),
             drill: Nm::from_mm(0.3).unwrap(),
             net: net.into(),
+            locked: false,
         };
         let track = |net: &str, layer: &str, a: Point, b: Point| BoardTrack {
             id: format!("t-{layer}-{}", a.x.0),

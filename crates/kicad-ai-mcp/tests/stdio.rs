@@ -130,6 +130,7 @@ async fn lists_tools_and_returns_envelopes() {
             "pcb_route_plan",
             "pcb_run_drc",
             "pcb_save",
+            "pcb_track_edit_plan",
             "pcb_update_from_schematic_plan",
             "pcb_zone_plan",
             "sch_apply_plan",
@@ -2879,6 +2880,199 @@ async fn live_board_is_autorouted() {
     assert_eq!(saved["ok"], true, "{saved}");
     let text = std::fs::read_to_string(&pcb).unwrap();
     assert!(text.matches("(segment").count() > 10, "the routes are saved");
+}
+
+/// Phase 14.2: routes can be made locked; a rip-up skips locked tracks unless they are named; a
+/// width change and a lock change are read back; a clean-up removes what is left over.
+#[tokio::test]
+async fn live_tracks_are_edited() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("trackedit", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-trackedit-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+
+    // Route every two-pad net a simple path can do; the first one locked.
+    let nets = mcp.call("pcb_list_nets", json!({ "session_id": id })).await;
+    let mut routes = Vec::new();
+    for (_, net) in nets["result"]["nets"].as_object().unwrap() {
+        let pads = net["pads"].as_array().unwrap();
+        if pads.len() != 2 {
+            continue;
+        }
+        let route = json!({ "points": [{ "pad": pads[0] }, { "pad": pads[1] }] });
+        let one = mcp
+            .call("pcb_route_plan", json!({ "session_id": id, "routes": [route.clone()] }))
+            .await;
+        if one["ok"] == true {
+            routes.push(route);
+        }
+    }
+    assert!(routes.len() >= 2, "two simple routes are needed");
+    routes[0]["locked"] = json!(true);
+    let plan = mcp
+        .call("pcb_route_plan", json!({ "session_id": id, "routes": routes }))
+        .await;
+    let applied = apply_board(&mut mcp, &id, &plan, &key("route")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let listing = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    let tracks = listing["result"]["tracks"].as_array().unwrap().clone();
+    let locked: Vec<&Value> = tracks.iter().filter(|t| t["locked"] == true).collect();
+    assert!(!locked.is_empty() && locked.len() < tracks.len(), "{listing}");
+    let locked_ids: Vec<Value> = locked.iter().map(|t| t["id"].clone()).collect();
+
+    // Refusals.
+    for bad in [
+        json!({ "session_id": id }),
+        json!({ "session_id": id, "action": "delete" }),
+        json!({ "session_id": id, "action": "delete", "select": { "nets": ["NOPE"] } }),
+        json!({ "session_id": id, "action": "set_width", "select": { "all": true } }),
+        json!({ "session_id": id, "action": "explode", "select": { "all": true } }),
+    ] {
+        let r = mcp.call("pcb_track_edit_plan", bad.clone()).await;
+        assert_eq!(r["ok"], false, "{bad}: {r}");
+    }
+
+    // A rip-up of everything skips the locked tracks and says so.
+    let rip = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "action": "delete", "select": { "all": true } }),
+        )
+        .await;
+    assert_eq!(rip["ok"], true, "{rip}");
+    let skipped = rip["result"]["skipped_locked"].as_array().unwrap().len();
+    assert_eq!(skipped, locked_ids.len(), "{rip}");
+    assert!(!rip["result"]["per_net"].as_object().unwrap().is_empty(), "{rip}");
+    let applied = apply_board(&mut mcp, &id, &rip, &key("rip")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert!(
+        applied["result"]["drc"]["unrouted_after"].as_u64().unwrap() > 0,
+        "{applied}"
+    );
+    let left = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    let left_ids: Vec<Value> = left["result"]["tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].clone())
+        .collect();
+    assert_eq!(left_ids, locked_ids, "only the locked tracks are left: {left}");
+
+    // A width that breaks DRC is rolled back, and the tracks are as they were (the restore puts
+    // back an edit made in place, not only what was created or deleted).
+    let before_widths = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await["result"]["tracks"].clone();
+    let huge = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "action": "set_width", "width_mm": 6.0,
+                    "select": { "ids": locked_ids, "tracks": true, "vias": false } }),
+        )
+        .await;
+    assert_eq!(huge["ok"], true, "{huge}");
+    let rolled = apply_board(&mut mcp, &id, &huge, &key("huge")).await;
+    println!(
+        "TRACKS ROLLBACK {} {}",
+        rolled["result_state"], rolled["result"]["problems"]
+    );
+    assert_eq!(rolled["result"]["rollback"]["restored"], true, "{rolled}");
+    let restored = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await["result"]["tracks"].clone();
+    assert_eq!(restored, before_widths, "the widths are back");
+
+    // New width, then unlock, then delete by name.
+    let wide = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "action": "set_width", "width_mm": 0.4,
+                    "select": { "ids": locked_ids, "tracks": true, "vias": false } }),
+        )
+        .await;
+    assert_eq!(wide["ok"], true, "named locked tracks may be re-widened: {wide}");
+    assert_eq!(
+        apply_board(&mut mcp, &id, &wide, &key("wide")).await["result"]["verified"],
+        true
+    );
+    let after = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    assert!(
+        after["result"]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["width"] == 0.4 && t["locked"] == true),
+        "{after}"
+    );
+    let unlock = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "action": "unlock", "select": { "all": true } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &unlock, &key("unlock")).await["result"]["verified"],
+        true
+    );
+    let after = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    assert!(
+        after["result"]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["locked"] == false),
+        "{after}"
+    );
+    // Nothing left to clean: refused with a reason.
+    let clean = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "cleanup": ["dangling_vias", "zero_length", "duplicates"] }),
+        )
+        .await;
+    assert_eq!(clean["ok"], false, "{clean}");
+    assert!(
+        clean["error"]["message"].as_str().unwrap().contains("nothing"),
+        "{clean}"
+    );
+    // Everything goes now.
+    let rip = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "action": "delete", "select": { "all": true } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &rip, &key("rip2")).await["result"]["verified"],
+        true
+    );
+    let none = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    assert_eq!(none["result"]["track_count"], 0, "{none}");
+    mcp.call("pcb_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
 }
 
 /// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows

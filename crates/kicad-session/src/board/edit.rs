@@ -54,8 +54,18 @@ pub struct EditReport {
     pub attributes_set: Vec<String>,
     /// Tracks, vias, and zones created.
     pub copper_items: usize,
+    /// Tracks and vias given another width or lock.
+    pub copper_changed: usize,
     /// Zones were refilled after the change.
     pub refilled: bool,
+}
+
+fn lock_state(locked: bool) -> i32 {
+    if locked {
+        LockedState::LsLocked as i32
+    } else {
+        LockedState::LsUnlocked as i32
+    }
 }
 
 /// A copper zone with every setting given (a zone sent without them has zero clearance).
@@ -616,6 +626,7 @@ impl BoardSession {
             "zone" => "AI: copper pour",
             "attributes" => "AI: footprint attributes",
             "cleanup" => "AI: remove dangling vias",
+            "tracks" => "AI: edit tracks",
             _ => "AI: move footprints",
         };
         let result = apply_steps(client, &header, plan).await;
@@ -683,9 +694,10 @@ async fn apply_steps(
         .operations
         .iter()
         .filter_map(|o| match o {
-            BoardOp::RemoveEdge { id, .. } | BoardOp::RemoveZone { id, .. } | BoardOp::RemoveVia { id, .. } => {
-                Some(ProtoKiid { value: id.clone() })
-            }
+            BoardOp::RemoveEdge { id, .. }
+            | BoardOp::RemoveZone { id, .. }
+            | BoardOp::RemoveVia { id, .. }
+            | BoardOp::RemoveTrack { id, .. } => Some(ProtoKiid { value: id.clone() }),
             _ => None,
         })
         .collect();
@@ -712,7 +724,7 @@ async fn apply_steps(
             .collect();
         if !failed.is_empty() {
             return Err(kerr(format!(
-                "KiCad did not delete the old outline or zones: {}",
+                "KiCad did not delete the items the plan removes: {}",
                 failed.join("; ")
             )));
         }
@@ -839,11 +851,13 @@ async fn apply_steps(
                 end,
                 width,
                 layer,
+                locked,
             } => Any::from_msg(&Track {
                 start: vector(*start),
                 end: vector(*end),
                 width: Some(Distance { value_nm: width.0 }),
                 layer: board_layer(layer)? as i32,
+                locked: lock_state(*locked),
                 net: Some(Net {
                     name: net.clone(),
                     ..Default::default()
@@ -855,8 +869,10 @@ async fn apply_steps(
                 at,
                 diameter,
                 drill,
+                locked,
             } => Any::from_msg(&Via {
                 position: vector(*at),
+                locked: lock_state(*locked),
                 net: Some(Net {
                     name: net.clone(),
                     ..Default::default()
@@ -915,6 +931,76 @@ async fn apply_steps(
             )));
         }
         report.copper_items = n;
+    }
+
+    // 4a. Tracks and vias already on the board: a new width, a lock. Sent as KiCad has them.
+    let changes: Vec<&BoardOp> = plan
+        .operations
+        .iter()
+        .filter(|o| matches!(o, BoardOp::SetTrackWidth { .. } | BoardOp::SetLocked { .. }))
+        .collect();
+    if !changes.is_empty() {
+        let current = other_items(client, header).await?;
+        let mut items = Vec::new();
+        for op in &changes {
+            let (id, kind) = match op {
+                BoardOp::SetTrackWidth { id, .. } => (id, "track"),
+                BoardOp::SetLocked { id, item, .. } => (id, *item),
+                _ => continue,
+            };
+            let any = current.iter().find(|(i, _)| i == id).map(|(_, a)| a).ok_or_else(|| {
+                ToolError::new(
+                    ErrorCode::StalePlan,
+                    format!("the {kind} {id} is no longer on the board; make a new plan"),
+                )
+            })?;
+            let changed = if any.type_url == Via::type_url() {
+                let mut v: Via = any.to_msg().map_err(|e| kerr(e.to_string()))?;
+                if let BoardOp::SetLocked { locked, .. } = op {
+                    v.locked = lock_state(*locked);
+                }
+                Any::from_msg(&v)
+            } else if any.type_url == Track::type_url() {
+                let mut t: Track = any.to_msg().map_err(|e| kerr(e.to_string()))?;
+                match op {
+                    BoardOp::SetTrackWidth { to, .. } => t.width = Some(Distance { value_nm: to.0 }),
+                    BoardOp::SetLocked { locked, .. } => t.locked = lock_state(*locked),
+                    _ => {}
+                }
+                Any::from_msg(&t)
+            } else {
+                let mut t: kicad_ipc::proto::kiapi::board::types::Arc =
+                    any.to_msg().map_err(|e| kerr(e.to_string()))?;
+                match op {
+                    BoardOp::SetTrackWidth { to, .. } => t.width = Some(Distance { value_nm: to.0 }),
+                    BoardOp::SetLocked { locked, .. } => t.locked = lock_state(*locked),
+                    _ => {}
+                }
+                Any::from_msg(&t)
+            };
+            items.push(changed.map_err(|e| kerr(e.to_string()))?);
+        }
+        let n = items.len();
+        let r: UpdateItemsResponse = client
+            .call(&UpdateItems {
+                header: header(),
+                items,
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
+        let failed: Vec<String> = r
+            .updated_items
+            .iter()
+            .filter_map(|u| status_ok(&u.status).err())
+            .collect();
+        if !failed.is_empty() || r.updated_items.len() != n {
+            return Err(kerr(format!(
+                "KiCad updated {} of {n} tracks and vias: {}",
+                r.updated_items.len() - failed.len(),
+                failed.join("; ")
+            )));
+        }
+        report.copper_changed = n;
     }
 
     // 4b. Attributes: the footprint is sent as KiCad has it with the flags changed (an update does
@@ -1359,6 +1445,31 @@ async fn restore_steps(
                 failed.join("; ")
             )));
         }
+    }
+    // Tracks and vias changed in place (width, lock): sent as they were.
+    let edited: Vec<Any> = snap
+        .others
+        .iter()
+        .filter(|(id, was)| {
+            now_others.iter().any(|(n, now)| {
+                n == id
+                    && now.value != was.value
+                    && (was.type_url == Track::type_url()
+                        || was.type_url == Via::type_url()
+                        || was.type_url == kicad_ipc::proto::kiapi::board::types::Arc::type_url())
+            })
+        })
+        .map(|(_, a)| a.clone())
+        .collect();
+    if !edited.is_empty() {
+        report.recreated += edited.len();
+        client
+            .call::<_, UpdateItemsResponse>(&UpdateItems {
+                header: header(),
+                items: edited,
+            })
+            .await
+            .map_err(|e| from_ipc_error(&e, true))?;
     }
     // Footprints that changed: flipped back first, then sent as they were.
     let changed: Vec<&FootprintInstance> = snap

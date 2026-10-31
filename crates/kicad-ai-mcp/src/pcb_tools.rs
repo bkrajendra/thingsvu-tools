@@ -10,7 +10,7 @@ use std::time::Duration;
 use kicad_domain::board::{place_rect, Board};
 use kicad_domain::board_edit::{self, BoardEditPlan, BoardOp, HolePlacement, MoveRequest, OutlineRequest};
 use kicad_domain::placement::{self, NearHint, PinnedPlace, PlaceHints, PlaceOptions};
-use kicad_domain::{routing, zones};
+use kicad_domain::{routing, track_edit, zones};
 use kicad_domain::{ErrorCode, Origin, Point, Provenance, Rect, ToolError};
 use kicad_session::{BoardSession, Provider};
 use rmcp::handler::server::wrapper::Parameters;
@@ -264,6 +264,10 @@ pub struct RouteArg {
     /// Track width, mm (default: the net class's).
     #[serde(default)]
     pub width_mm: Option<f64>,
+    /// Lock the tracks and vias this route makes, so a later rip-up (pcb_track_edit_plan) or
+    /// autoroute keeps them.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -474,6 +478,51 @@ pub struct PcbAttributesArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct TrackSelectArg {
+    /// Only these nets.
+    #[serde(default)]
+    pub nets: Vec<String>,
+    /// Only these copper layers (vias are on every layer, so a layer does not narrow them).
+    #[serde(default)]
+    pub layers: Vec<String>,
+    /// Only items inside this rectangle (a track when both its ends are).
+    #[serde(default)]
+    pub area: Option<RectMm>,
+    /// Only these tracks and vias, by id (from pcb_list_tracks). A locked item is deleted or
+    /// re-widened only when it is named here.
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// Include tracks (default true).
+    #[serde(default)]
+    pub tracks: Option<bool>,
+    /// Include vias (default true).
+    #[serde(default)]
+    pub vias: Option<bool>,
+    /// Every track and via on the board, as an explicit choice.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PcbTrackEditArgs {
+    pub session_id: String,
+    /// Which tracks and vias. Needed with an action.
+    #[serde(default)]
+    pub select: Option<TrackSelectArg>,
+    /// delete, set_width (with width_mm), lock, or unlock.
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub width_mm: Option<f64>,
+    /// Clean-ups, on the whole board and never on locked items: any of `dangling_vias`,
+    /// `zero_length`, `duplicates`.
+    #[serde(default)]
+    pub cleanup: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PcbMoveArgs {
     pub session_id: String,
     pub moves: Vec<MoveArg>,
@@ -529,6 +578,12 @@ fn fingerprint(board: &Board) -> String {
     }
     board.tracks.len().hash(&mut h);
     board.vias.len().hash(&mut h);
+    for t in &board.tracks {
+        (&t.id, t.width.0, t.locked).hash(&mut h);
+    }
+    for v in &board.vias {
+        (&v.id, v.locked).hash(&mut h);
+    }
     board.zones.len().hash(&mut h);
     for e in &board.edges {
         (&e.id, e.locked).hash(&mut h);
@@ -854,6 +909,7 @@ impl KicadAiServer {
                     .map(|v| {
                         serde_json::json!({
                             "id": v.id, "at": pt(v.at), "diameter": mm(v.diameter.0), "drill": mm(v.drill.0), "net": v.net,
+                            "locked": v.locked,
                         })
                     })
                     .collect();
@@ -1216,6 +1272,68 @@ Apply with pcb_apply_plan; the attributes are read back."
     }
 
     #[tool(
+        name = "pcb_track_edit_plan",
+        description = "Plan editing the copper already on the board: delete (rip up) tracks and vias, give tracks a new \\nwidth, or lock and unlock them. select picks what: nets, layers, an area (rect in mm), ids (from \\npcb_list_tracks), tracks/vias (both by default), or all: true. Locked items are safe: a delete or width \\nchange skips them (the plan lists which) unless they are named in ids. cleanup (any of dangling_vias, \\nzero_length, duplicates) removes what a router leaves behind, on the whole board, never touching locked \\nitems. The plan lists every item touched and a count per net. Needs a live KiCad 11 session. Apply with \\npcb_apply_plan: one change (one undo step in the editor), read back, with DRC before and after; \\ndeleting tracks shows up as new unrouted connections. Routes can be made locked with pcb_route_plan."
+    )]
+    pub async fn pcb_track_edit_plan(&self, Parameters(args): Parameters<PcbTrackEditArgs>) -> CallToolResult {
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let result = async {
+            refuse_unless_live(&board)?;
+            let data = board.read().await?;
+            let select = match &args.select {
+                Some(s) => track_selector(s)?,
+                None => track_edit::Selector::default(),
+            };
+            let action = match (args.action.as_deref(), args.width_mm) {
+                (None, None) => None,
+                (None, Some(_)) => return Err(bad_arg("width_mm needs action: set_width")),
+                (Some("delete"), None) => Some(track_edit::Action::Delete),
+                (Some("lock"), None) => Some(track_edit::Action::Lock),
+                (Some("unlock"), None) => Some(track_edit::Action::Unlock),
+                (Some("set_width"), Some(w)) => Some(track_edit::Action::SetWidth(nm_arg("width_mm", w)?)),
+                (Some("set_width"), None) => return Err(bad_arg("set_width needs width_mm")),
+                (Some(a @ ("delete" | "lock" | "unlock")), Some(_)) => {
+                    return Err(bad_arg(format!("{a} does not take width_mm")))
+                }
+                (Some(other), _) => {
+                    return Err(bad_arg(format!(
+                        "action is delete, set_width, lock, or unlock, not '{other}'"
+                    )))
+                }
+            };
+            let mut cleanup = track_edit::Cleanup::default();
+            for c in &args.cleanup {
+                match c.as_str() {
+                    "dangling_vias" => cleanup.dangling_vias = true,
+                    "zero_length" => cleanup.zero_length = true,
+                    "duplicates" => cleanup.duplicates = true,
+                    other => {
+                        return Err(bad_arg(format!(
+                            "cleanup is dangling_vias, zero_length, or duplicates, not '{other}'"
+                        )))
+                    }
+                }
+            }
+            let (plan, notes) = track_edit::plan_track_edit(&data, &select, action, cleanup)?;
+            let extras = serde_json::json!({
+                "per_net": per_net(&plan),
+                "skipped_locked": notes.skipped_locked,
+                "already_as_asked": notes.unchanged,
+            });
+            Ok::<_, ToolError>((plan, extras, fingerprint(&data)))
+        }
+        .await;
+        match result {
+            Ok((plan, extras, fp)) => self.store_edit_plan_extras(&cid, &board, plan, fp, Some(extras)).await,
+            Err(e) => envelope::error(&cid, &e),
+        }
+    }
+
+    #[tool(
         name = "pcb_move_plan",
         description = "Plan moving named footprints: each entry gives a reference and an absolute place \n(x_mm, y_mm) or an offset (dx_mm, dy_mm), a turn (rotation_deg, or rotate_by_deg), a side (front or \nback; a flip as in KiCad), and lock true or false. Absolute places snap to grid_mm (0.5; 0 for none); \noffsets are exact. Locked footprints are refused unless allow_locked is true. The plan lists every move \nwith the overlaps and footprints outside the outline before and after. Needs a live KiCad 11 session. \nApply with pcb_apply_plan; every pad is read back."
     )]
@@ -1570,7 +1688,7 @@ Apply with pcb_apply_plan; the attributes are read back."
 
     #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move): \\nthe zones are refilled first, the counts by type are given before and after, and only the violations that are new are listed. A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_track_edit_plan, pcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move): \\nthe zones are refilled first, the counts by type are given before and after, and only the violations that are new are listed. A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1822,6 +1940,76 @@ impl KicadAiServer {
     }
 }
 
+fn track_selector(s: &TrackSelectArg) -> Result<track_edit::Selector, ToolError> {
+    let area = match &s.area {
+        Some(r) => Some(
+            Rect::from_points([point_arg(r.min.x_mm, r.min.y_mm)?, point_arg(r.max.x_mm, r.max.y_mm)?])
+                .expect("two corners"),
+        ),
+        None => None,
+    };
+    Ok(track_edit::Selector {
+        nets: s.nets.clone(),
+        layers: s.layers.clone(),
+        area,
+        ids: s.ids.clone(),
+        tracks: s.tracks.unwrap_or(true),
+        vias: s.vias.unwrap_or(true),
+        all: s.all,
+    })
+}
+
+/// What a copper edit touches, counted per net.
+fn per_net(plan: &BoardEditPlan) -> serde_json::Value {
+    #[derive(Default)]
+    struct Count {
+        tracks_removed: usize,
+        vias_removed: usize,
+        length_removed_mm: f64,
+        widths_changed: usize,
+        locked: usize,
+        unlocked: usize,
+    }
+    let mut nets: BTreeMap<&str, Count> = BTreeMap::new();
+    for op in &plan.operations {
+        match op {
+            BoardOp::RemoveTrack { net, start, end, .. } => {
+                let c = nets.entry(net).or_default();
+                c.tracks_removed += 1;
+                c.length_removed_mm += ((end.x.0 - start.x.0) as f64).hypot((end.y.0 - start.y.0) as f64) / 1e6;
+            }
+            BoardOp::RemoveVia { net, .. } => nets.entry(net).or_default().vias_removed += 1,
+            BoardOp::SetTrackWidth { net, .. } => nets.entry(net).or_default().widths_changed += 1,
+            BoardOp::SetLocked { net, locked, .. } => {
+                let c = nets.entry(net).or_default();
+                if *locked {
+                    c.locked += 1;
+                } else {
+                    c.unlocked += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    nets.into_iter()
+        .map(|(net, c)| {
+            (
+                if net.is_empty() {
+                    "(no net)".to_owned()
+                } else {
+                    net.to_owned()
+                },
+                serde_json::json!({
+                    "tracks_removed": c.tracks_removed, "vias_removed": c.vias_removed,
+                    "length_removed_mm": round2(c.length_removed_mm), "widths_changed": c.widths_changed,
+                    "locked": c.locked, "unlocked": c.unlocked,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 fn footprint_json(f: &kicad_domain::board::BoardFootprint, pads: bool) -> serde_json::Value {
     let mut v = serde_json::json!({
         "reference": f.reference, "value": f.value, "library_id": f.lib_id, "side": if f.is_back() { "back" } else { "front" },
@@ -2067,6 +2255,7 @@ fn route_request(i: usize, r: &RouteArg) -> Result<routing::RouteRequest, ToolEr
         points,
         layer: r.layer.clone(),
         width: r.width_mm.map(|w| nm_arg("width_mm", w)).transpose()?,
+        locked: r.locked,
     })
 }
 
@@ -2151,16 +2340,41 @@ fn op_json(op: &BoardOp) -> serde_json::Value {
             end,
             width,
             layer,
+            locked,
         } => serde_json::json!({
             "op": "add_track", "net": net, "from": pt(*start), "to": pt(*end), "width": mm(width.0), "layer": layer,
+            "locked": locked,
         }),
         BoardOp::AddVia {
             net,
             at,
             diameter,
             drill,
+            locked,
         } => serde_json::json!({
             "op": "add_via", "net": net, "at": pt(*at), "diameter": mm(diameter.0), "drill": mm(drill.0),
+            "locked": locked,
+        }),
+        BoardOp::RemoveTrack {
+            id,
+            net,
+            layer,
+            start,
+            end,
+        } => serde_json::json!({
+            "op": "remove_track", "id": id, "net": net, "layer": layer, "from": pt(*start), "to": pt(*end),
+        }),
+        BoardOp::SetTrackWidth {
+            id,
+            net,
+            layer,
+            from,
+            to,
+        } => serde_json::json!({
+            "op": "set_track_width", "id": id, "net": net, "layer": layer, "from": mm(from.0), "to": mm(to.0),
+        }),
+        BoardOp::SetLocked { id, item, net, locked } => serde_json::json!({
+            "op": if *locked { "lock" } else { "unlock" }, "item": item, "id": id, "net": net,
         }),
         BoardOp::AddZone(z) => serde_json::json!({
             "op": "add_zone", "name": z.name, "net": z.net, "layers": z.layers,
@@ -2229,6 +2443,19 @@ impl KicadAiServer {
         fp: String,
         measured: Option<serde_json::Value>,
     ) -> CallToolResult {
+        let extras = measured.map(|m| serde_json::json!({ "measured": m }));
+        self.store_edit_plan_extras(cid, board, plan, fp, extras).await
+    }
+
+    /// As `store_edit_plan`, with more fields (an object) added to what the user is shown.
+    async fn store_edit_plan_extras(
+        &self,
+        cid: &str,
+        board: &Arc<BoardSession>,
+        plan: BoardEditPlan,
+        fp: String,
+        extras: Option<serde_json::Value>,
+    ) -> CallToolResult {
         let plan_id = self.next_pcb_plan_id();
         let mut body = serde_json::json!({
             "plan_id": plan_id,
@@ -2241,8 +2468,10 @@ impl KicadAiServer {
             "units": "mm; x grows right, y grows down; turns counter-clockwise on screen",
             "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
         });
-        if let Some(m) = measured {
-            body["measured"] = m;
+        if let Some(serde_json::Value::Object(extra)) = extras {
+            for (k, v) in extra {
+                body[k] = v;
+            }
         }
         let warnings = plan.warnings.clone();
         self.state.pending_updates.lock().await.insert(

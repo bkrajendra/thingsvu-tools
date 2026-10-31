@@ -757,6 +757,7 @@ impl BoardSession {
                         .unwrap_or(0)),
                     drill: Nm(stack.drill.and_then(|d| d.diameter).map(|d| d.x_nm).unwrap_or(0)),
                     net: net_name(&v.net),
+                    locked: v.locked == 2,
                 });
             } else if url == Zone::type_url() {
                 let z: Zone = any.to_msg().map_err(|e| decode_err("zone", e))?;

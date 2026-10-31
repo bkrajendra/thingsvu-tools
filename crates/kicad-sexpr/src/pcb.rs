@@ -242,6 +242,7 @@ pub fn read_board(text: &str) -> Result<Board, BoardError> {
                         diameter: nm(item.child_f64("size").unwrap_or(0.0)),
                         drill: nm(item.child_f64("drill").unwrap_or(0.0)),
                         net,
+                        locked: is_yes(item, "locked"),
                     });
                 }
             }

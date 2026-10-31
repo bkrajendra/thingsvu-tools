@@ -111,6 +111,7 @@ pub struct BoardVia {
     pub diameter: Nm,
     pub drill: Nm,
     pub net: String,
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
