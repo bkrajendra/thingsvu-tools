@@ -1,6 +1,6 @@
 # Plan: closing the gaps found in a full board session (Phases 14 to 16)
 
-Status: planned, not started (written 27 Oct 2026, after v0.8.0). The task lists are in [tasks.md](tasks.md), Phases 14 to 16. This page holds the reasoning: what was missing, what already exists, what to build first, and the decisions that need the project owner's review.
+Status: planned, not started (written 27 Oct 2026, after v0.8.0; Phase 13b added 31 Oct 2026). The task lists are in [tasks.md](tasks.md), Phases 13b and 14 to 16. This page holds the reasoning: what was missing, what already exists, what to build first, and the decisions that need the project owner's review.
 
 ## Where this comes from
 
@@ -66,7 +66,7 @@ Priority comes from the time each gap cost, how often a board needs it, and how 
 | 17 | `pcb_silk_plan`: board text (header pin labels, version, logo text) on silkscreen or copper; and a silkscreen tidy that moves overlapping or off-board references using KiCad's real text extents | #5 | P2 | M | Also fixes the J1 warning seen in Phase 13 |
 | 18 | Zones: per-pad connection overrides; islands reported after every refill (and removable); `pcb_stitch_plan` for a grid or edge row of ground vias clear of pads, tracks, and edges | #4 | P2 | M | |
 | 19 | `pcb_connectivity`: for each net, its isolated pockets and the pads, tracks, vias, and zone pieces in each | #27 | P2 | M | Found the USB-C ground pocket by guessing |
-| 20 | Autoroute control: `nets` (route only these), `exclude_nets`, per-net width through net classes in the DSN; a time limit that always ends the process | #19, #22 | P2 | M | #22: check the timeout kills the whole process tree |
+| 20 | Autoroute control: `nets` (route only these), `exclude_nets`, `keep_existing` (hand-routed tracks stay fixed), per-net width through net classes in the DSN; a time limit that always ends the process | #19, #22 | P1 (moved up, W6) | M | #22: check the timeout kills the whole process tree. Task 14.8 |
 | 21 | Renders: `pcb_render` `view: perspective`, `rotate`, `zoom`; `sch_render` cropped to the parts, with `width` or `zoom`, from a snapshot when the file is locked | #16 | P2 | S | |
 | 22 | Exports: `ipc2581`, `odb`, `netlist` (IPC-D-356) in `pcb_export`; a `pcbway` preset in `pcb_fab_package` | #15, #18 | P2 | S | |
 | 23 | Differential pairs: route a pair together at the class gap, report length mismatch; length matching by meanders | #28 | P3 | L | Freerouting can route pairs given the classes; doing it ourselves is large |
@@ -74,17 +74,37 @@ Priority comes from the time each gap cost, how often a board needs it, and how 
 | 25 | Layout checks: return path under signals (ground plane gaps), stitching density near the edge and layer changes, power track width against a current the user gives (IPC-2152) | #29 | P3 | M | Findings to look at, as `pcb_review` |
 | 26 | Whole-BOM resolution recipe: `bom_review` gives the lookups as one batch an assistant can hand to its parts tool, and `sch_set_fields_plan` takes the answers in one plan | #30 | P3 | S | Mostly documentation; no network in the server (W1) |
 
+## Fixes carried over from earlier phases (Phase 13b)
+
+Not from the ESP32-S3 list: open items from Phases 9 to 13 that the project owner chose to fix first. Each is small, and none depends on the Phase 14 tools.
+
+| | Item | Why now | Priority | Effort |
+|---|---|---|---|---|
+| B1 | Text follows a turned part (task 9.9): fields turn with the part, as KiCad's rotate does, and stay readable | Every tidy of a circuit with turned parts leaves text the wrong way round, and the declutter measures it wrongly | P0 | S |
+| B2 | Mounting holes from v0.7.0: a review and export warning, and `pcb_footprint_attrs_plan` (`dnp`, BOM, position file, board-only; `mounting_holes: true` for all holes) | Existing boards list their holes as parts to place in the position file; hand-editing is the fallback Phase 14 is meant to remove | P0 | S |
+| B3 | The autorouter does the hard routing: tool descriptions, refusals, and DRC and review results point to `pcb_autoroute_plan`; `session_status` says whether it is configured | An assistant that does not know a router exists tries to build long routes track by track | P0 | S |
+| B4 | One s-expression parser for the CLI runner and `kicad-sexpr` (7.11, 9.8) | Two parsers drift apart; Phase 14's checkpoint diff and `.kicad_pro` work read more files | P0 | S |
+| B5 | Live checks: export from the PCB editor, undo steps of the netlist import and the autorouter import | Written as "not tried" in three phases' known limits | P0 | S |
+
+Left where they are, and why:
+- **A router of our own**: no. Freerouting does the complex routing (W6); `pcb_route_plan` stays an explicit-track tool and its path finder is not extended. Phase 14 makes the autorouter easier to steer (row 20) instead.
+- **Text placement on the board (silkscreen)**: already row 17 (Phase 15).
+- **KiCad 10 board editing (12.9)**: only if asked. **Hierarchical sheets, global labels, multi-unit symbols**, boxes that follow their parts, the two unexplained tidy removals, and the re-pin to KiCad 11.0: not scheduled, as before.
+
 ## Phases
 
-**Phase 14 (v0.9.0): fix what broke, and edit without touching files** (rows 1 to 13). First the bugs and limits that cost the most time or lost data, then the four tools whose absence forced file edits most often: track editing, design rules, session freshness, and checkpoints, then the small schematic tools. Exit: the ESP32-S3 session's file-edit steps (rip-up, locks, net classes, no-connects, pin swap, reload, backups) can each be done with a tool, with no `.kicad_*` file opened by the assistant.
+**Phase 13b (v0.8.1): fixes carried over** (B1 to B5). Small and independent; done first so that Phase 14 starts from a clean base. Exit: a tidy keeps text readable on turned parts, v0.7.0 holes can be repaired and are warned about, the routing tools point to the autorouter, and the runner and `kicad-sexpr` share a parser.
 
-**Phase 15 (v0.10.0): finishing a board** (rows 14 to 22): footprint and pad edits, footprints updated from the library, silkscreen text and tidy, zone details, stitching, connectivity pockets, autoroute control, renders, more exports. Exit: a board with a ground pour on both layers, stitching, a silkscreen without overlaps, and a USB connector updated from the library, produced and checked with tools only.
+**Phase 14 (v0.9.0): fix what broke, and edit without touching files** (rows 1 to 13 and 20). First the bugs and limits that cost the most time or lost data, then the four tools whose absence forced file edits most often: track editing, design rules, session freshness, and checkpoints, then the small schematic tools. Exit: the ESP32-S3 session's file-edit steps (rip-up, locks, net classes, no-connects, pin swap, reload, backups) can each be done with a tool, with no `.kicad_*` file opened by the assistant.
+
+**Phase 15 (v0.10.0): finishing a board** (rows 14 to 19 and 21 to 22): footprint and pad edits, footprints updated from the library, silkscreen text and tidy, zone details, stitching, connectivity pockets, renders, more exports. Exit: a board with a ground pour on both layers, stitching, a silkscreen without overlaps, and a USB connector updated from the library, produced and checked with tools only.
 
 **Phase 16 (later): signal integrity and layout checks** (rows 23 to 26). Each is larger and more approximate, so each is planned on its own once Phases 14 and 15 are in use.
 
 ```mermaid
 flowchart LR
-    P14["Phase 14 (v0.9.0)<br/>bug fixes, limits,<br/>track edits, rules,<br/>reload, checkpoints,<br/>schematic gaps"] --> P15["Phase 15 (v0.10.0)<br/>footprint edits, silkscreen,<br/>zones, stitching, pockets,<br/>autoroute control,<br/>renders, exports"]
+    P13b["Phase 13b (v0.8.1)<br/>text angle, v0.7.0 holes,<br/>autorouter hints,<br/>one parser, live checks"] --> P14["Phase 14 (v0.9.0)<br/>bug fixes, limits,<br/>track edits, rules,<br/>reload, checkpoints,<br/>schematic gaps,<br/>autoroute control"]
+    P14 --> P15["Phase 15 (v0.10.0)<br/>footprint edits, silkscreen,<br/>zones, stitching, pockets,<br/>renders, exports"]
     P15 --> P16["Phase 16 (later)<br/>diff pairs, impedance,<br/>layout checks,<br/>BOM recipe"]
 ```
 
@@ -97,6 +117,7 @@ flowchart LR
 | W3 | Reverting a live editor (#24) | `RevertDocument` throws away unsaved changes, so it runs only with `discard_unsaved: true` and after the user has been told what they lose (the tool reports the modified state first). Headless sessions simply reopen |
 | W4 | Editing `.kicad_pro` directly (#3) | Through the API in live sessions. With the file provider (no editor open), edit only the JSON keys the tool owns (net classes, assignments, rules), keep everything else byte for byte, and check the result by running DRC with `kicad-cli` before replacing the file, as schematics are |
 | W5 | Diff pairs and impedance (#28) | Phase 16, approximate and labelled so. Not a field solver |
+| W6 | Routing (project owner, 31 Oct 2026) | **No router of our own.** `pcb_route_plan` stays for explicit, deliberate tracks. Anything complex goes to Freerouting through `pcb_autoroute_plan`, which gets better controls (14.8). Differential pairs (16.1) are routed by Freerouting given the net classes, and we check the result |
 
 ## Risks
 
@@ -106,3 +127,5 @@ flowchart LR
 | Reverting or restoring loses work | The user loses unsaved edits | W3: reported first, explicit flag, checkpoint taken before any restore |
 | Bigger plans are slow or unreadable | Assistants make worse schematics | W2: measure before raising the limit |
 | Track deletion by area catches more than intended | Good routing removed | The plan lists every track and via it would delete (by net, with counts), and locked items are never deleted unless named |
+| `UpdateItems` does not write a footprint's attributes (Phase 12: it moves only the anchor) | `pcb_footprint_attrs_plan` cannot change them in place | 13b.2 probes first; the fallback recreates the hole as `pcb_outline_plan` does, with a rollback snapshot |
+| Freerouting is not installed on the user's machine | The autorouter hints lead nowhere | `session_status` says whether it is configured, and the hint names the one-line installer step (`-FreeroutingOnly`) |

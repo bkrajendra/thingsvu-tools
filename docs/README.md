@@ -9,7 +9,7 @@ How thingsvu-tools is built, what it can do, and how it is released. For install
 | [kicad-api-compatibility.md](kicad-api-compatibility.md) | Pinned KiCad builds, the proto commit, `kicad-cli` differences, and everything observed while probing KiCad 10 and 11 |
 | [releasing.md](releasing.md) | How a release is made (the Cargo version drives the tag) and what is published |
 | [pcb-and-bom-plan.md](pcb-and-bom-plan.md) | The plan for parts, footprints, BOM, and PCB tools (Phases 10 to 13): goals, what KiCad allows, decisions for review, and risks |
-| [workflow-gaps-plan.md](workflow-gaps-plan.md) | The plan for Phases 14 to 16: the gaps an assistant hit building a whole board, what already covers some of them, every candidate tool prioritised, and decisions for review |
+| [workflow-gaps-plan.md](workflow-gaps-plan.md) | The plan for Phases 13b to 16 (fixes carried over from earlier phases first, then Phases 14 to 16): the gaps an assistant hit building a whole board, what already covers some of them, every candidate tool prioritised, and decisions for review |
 | [tasks.md](tasks.md) | Phase-by-phase task list, with the decisions and workarounds that need the project owner's review |
 | [kicad-ai-mcp-design-plan.md](kicad-ai-mcp-design-plan.md) | The design plan: reasoning, requirements, tool contracts, test plan, and risks. Written before the code; where it differs from [architecture.md](architecture.md), the architecture page is right |
 | [examples/](examples/) | Circuit descriptions used as test fixtures: a two-resistor chain, a 3.3 V regulator, an NE555 blinker |
