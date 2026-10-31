@@ -3,6 +3,7 @@
 //! positions, symbol library and schematic readers, and a writer that adds planned items to a
 //! `.kicad_sch` text without touching anything else in it.
 
+pub mod dsn;
 pub mod emit;
 pub mod fab;
 pub mod fp;

@@ -39,7 +39,10 @@ pub enum RouterError {
     #[error("could not start Freerouting ({program}): {source}")]
     Spawn { program: PathBuf, source: std::io::Error },
     #[error(
-        "Freerouting did not finish within {0:?}; give a longer time limit or fewer passes. A build that          crashes can hang instead of exiting (Freerouting 2.5.0's native Windows build does on KiCad boards):          use its .jar, or run install.ps1 -FreeroutingOnly, which checks the router on a test board"
+        "Freerouting did not finish within {0:?}; it and everything it started were ended, and nothing was routed. \
+         Give a longer time limit or fewer passes. A build that crashes can hang instead of exiting \
+         (Freerouting 2.5.0's native Windows build does on KiCad boards): use its .jar, or run \
+         install.ps1 -FreeroutingOnly, which checks the router on a test board"
     )]
     Timeout(Duration),
     #[error("Freerouting exited with {exit_code:?} and wrote no session: {log}")]

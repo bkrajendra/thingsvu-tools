@@ -2922,7 +2922,12 @@ async fn live_board_is_autorouted() {
     assert_eq!(plan["ok"], true, "{plan}");
     assert_eq!(plan["result"]["router"]["unrouted"], 0, "{plan}");
     assert!(plan["result"]["session"]["segments"].as_u64().unwrap() > 10, "{plan}");
-    assert_eq!(plan["result"]["replaces"]["tracks"], 1, "the hand-made track: {plan}");
+    // The track drawn by hand is protected in the router's file and written again as it is.
+    assert_eq!(
+        plan["result"]["replaces"]["tracks"], 0,
+        "the hand-made track stays: {plan}"
+    );
+    assert_eq!(plan["result"]["replaces"]["unlocked_tracks_identical"], 1, "{plan}");
     // The board's minimum goes to the router, so nothing comes back narrower.
     let minimum = &plan["result"]["minimum_width"];
     assert!(minimum["mm"].as_f64().unwrap() > 0.0, "{plan}");
@@ -4194,6 +4199,190 @@ async fn pin_net_flow(provider: &str) {
         );
     }
     mcp.call("session_close", json!({ "session_id": id, "discard_unsaved": true }))
+        .await;
+}
+
+/// Phase 14.8: the autorouter is told which nets to route and what it may rip up; tracks already on
+/// the board stay (a locked one stays locked and is not doubled); a net class gives a net its width.
+/// Needs Freerouting.
+#[tokio::test]
+async fn live_board_autoroute_is_controlled() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") || !freerouting_configured() {
+        eprintln!("skipped: set KICAD_LIVE=1 and set up Freerouting");
+        return;
+    }
+    let pcb = board_fixture("autoctl", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-autoctl-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+    // One track by hand, locked: it must stay, and stay locked, and not be drawn twice.
+    let route = mcp
+        .call(
+            "pcb_route_plan",
+            json!({ "session_id": id, "routes": [{ "points": [{ "pad": "J1.1" }, { "pad": "F1.1" }], "locked": true }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &route, &key("route")).await["result"]["verified"],
+        true
+    );
+    let tracks_of = |list: &Value| -> Vec<Value> { list["result"]["tracks"].as_array().unwrap().clone() };
+    let nets_with_tracks = |tracks: &[Value]| -> std::collections::BTreeSet<String> {
+        tracks.iter().map(|t| t["net"].as_str().unwrap().to_owned()).collect()
+    };
+    let list = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await;
+    let hand = tracks_of(&list);
+    assert_eq!(hand.len(), 1, "{list}");
+    assert_eq!(hand[0]["locked"], true);
+
+    // Refusals.
+    for bad in [
+        json!({ "session_id": id, "nets": ["NOPE"] }),
+        json!({ "session_id": id, "exclude_nets": ["NOPE"] }),
+        json!({ "session_id": id, "nets": ["GND"], "exclude_nets": ["GND"] }),
+    ] {
+        let r = mcp.call("pcb_autoroute_plan", bad.clone()).await;
+        assert_eq!(r["ok"], false, "{bad}: {r}");
+    }
+
+    // 1. Only +3V3.
+    let plan = mcp
+        .call(
+            "pcb_autoroute_plan",
+            json!({ "session_id": id, "nets": ["+3V3"], "passes": 20, "time_limit_s": 180 }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["routes"]["nets"], json!(["+3V3"]), "{plan}");
+    assert!(
+        plan["result"]["routes"]["left_alone"].to_string().contains("GND"),
+        "{plan}"
+    );
+    assert_eq!(plan["result"]["routes"]["keep_existing"], true);
+    assert_eq!(
+        plan["result"]["replaces"]["tracks"], 0,
+        "the hand track is written again as it is: {plan}"
+    );
+    assert_eq!(plan["result"]["replaces"]["locked_tracks_kept"], 1, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("only-3v3")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let after = tracks_of(&mcp.call("pcb_list_tracks", json!({ "session_id": id })).await);
+    let nets = nets_with_tracks(&after);
+    println!("ONLY +3V3: tracks on {nets:?}");
+    assert_eq!(
+        nets,
+        ["+3V3".to_owned(), "/VBUS".to_owned()].into(),
+        "only the asked net and the hand track"
+    );
+    // The locked hand track is still there, still locked, and there is one of it.
+    let vbus: Vec<&Value> = after.iter().filter(|t| t["net"] == "/VBUS").collect();
+    assert_eq!(vbus.len(), 1, "not doubled: {after:?}");
+    assert_eq!(vbus[0]["locked"], true);
+    let tracks_3v3 = after.iter().filter(|t| t["net"] == "+3V3").count();
+
+    // 2. Everything but GND: the +3V3 tracks are kept, GND stays bare.
+    let plan = mcp
+        .call(
+            "pcb_autoroute_plan",
+            json!({ "session_id": id, "exclude_nets": ["GND"], "passes": 20, "time_limit_s": 180 }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert!(!plan["result"]["routes"]["nets"].to_string().contains("GND"), "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("not-gnd")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let after = tracks_of(&mcp.call("pcb_list_tracks", json!({ "session_id": id })).await);
+    assert!(!nets_with_tracks(&after).contains("GND"), "GND was left alone");
+    assert_eq!(
+        after.iter().filter(|t| t["net"] == "+3V3").count(),
+        tracks_3v3,
+        "the +3V3 tracks were kept"
+    );
+    assert!(
+        applied["result"]["drc"]["unrouted_after"].as_u64().unwrap() > 0,
+        "GND is not connected: {applied}"
+    );
+
+    // 3. Ripping up +3V3 and routing it again: the plan says what it rips up.
+    let plan = mcp
+        .call(
+            "pcb_autoroute_plan",
+            json!({ "session_id": id, "nets": ["+3V3"], "keep_existing": false, "passes": 20, "time_limit_s": 180 }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["result"]["routes"]["keep_existing"], false);
+    assert_eq!(plan["result"]["routes"]["ripped_up"]["tracks"], tracks_3v3, "{plan}");
+    let applied = apply_board(&mut mcp, &id, &plan, &key("rip-3v3")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    let after = tracks_of(&mcp.call("pcb_list_tracks", json!({ "session_id": id })).await);
+    assert!(nets_with_tracks(&after).contains("+3V3"));
+    assert_eq!(
+        after
+            .iter()
+            .filter(|t| t["net"] == "/VBUS" && t["locked"] == true)
+            .count(),
+        1,
+        "the locked track stayed"
+    );
+
+    // 4. A net class gives GND its width, and the router uses it.
+    let rules = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": id, "net_classes": [{ "name": "Power", "track_width_mm": 0.5 }],
+                    "assign": [{ "net": "GND", "class": "Power" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &rules, &key("rules")).await["result"]["verified"],
+        true
+    );
+    let plan = mcp
+        .call(
+            "pcb_autoroute_plan",
+            json!({ "session_id": id, "nets": ["GND"], "passes": 20, "time_limit_s": 180 }),
+        )
+        .await;
+    assert_eq!(plan["ok"], true, "{plan}");
+    let gnd = plan["result"]["session"]["nets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["net"] == "GND")
+        .expect("GND in the session")
+        .clone();
+    println!("GND in the session: {gnd}");
+    assert!(
+        gnd["min_width_mm"].as_f64().unwrap() >= 0.5 - 1e-6,
+        "every GND track is as wide as its net class says: {gnd}"
+    );
+    let applied = apply_board(&mut mcp, &id, &plan, &key("gnd")).await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    mcp.call("pcb_close", json!({ "session_id": id, "discard_unsaved": true }))
         .await;
 }
 

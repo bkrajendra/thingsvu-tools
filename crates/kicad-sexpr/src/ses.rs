@@ -108,6 +108,72 @@ pub fn summarize(text: &str) -> Result<SesSummary, SesError> {
     Ok(out)
 }
 
+/// One straight track of a session, in the session's units (tenths of a micrometre for
+/// `(resolution um 10)`), y up.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SesSegment {
+    pub net: String,
+    pub layer: String,
+    pub width: i64,
+    pub a: (i64, i64),
+    pub b: (i64, i64),
+}
+
+/// A via of a session.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SesVia {
+    pub net: String,
+    pub at: (i64, i64),
+}
+
+/// Every straight track and every via of a session, and the units per millimetre it uses.
+pub fn items(text: &str) -> Result<(Vec<SesSegment>, Vec<SesVia>, f64), SesError> {
+    let root = parse(text)?;
+    if root.head() != Some("session") {
+        return Err(SesError::NotASession);
+    }
+    let Some(routes) = root.child("routes") else {
+        return Ok((vec![], vec![], 10_000.0));
+    };
+    let scale = per_mm(routes.child("resolution"));
+    let (mut segments, mut vias) = (Vec::new(), Vec::new());
+    if let Some(out) = routes.child("network_out") {
+        for net in out.children("net") {
+            let name = net.arg_text(0).unwrap_or_default().to_owned();
+            for wire in net.children("wire") {
+                let Some(path) = wire.child("path") else { continue };
+                let layer = path.arg_text(0).unwrap_or_default().to_owned();
+                let width = path.arg_f64(1).unwrap_or(0.0).round() as i64;
+                let coords: Vec<f64> = (2..).map_while(|i| path.arg_f64(i)).collect();
+                let points: Vec<(i64, i64)> = coords
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| (c[0].round() as i64, c[1].round() as i64))
+                    .collect();
+                for w in points.windows(2) {
+                    segments.push(SesSegment {
+                        net: name.clone(),
+                        layer: layer.clone(),
+                        width,
+                        a: w[0],
+                        b: w[1],
+                    });
+                }
+            }
+            for via in net.children("via") {
+                if let (Some(x), Some(y)) = (via.arg_f64(1), via.arg_f64(2)) {
+                    vias.push(SesVia {
+                        net: name.clone(),
+                        at: (x.round() as i64, y.round() as i64),
+                    });
+                }
+            }
+        }
+    }
+    Ok((segments, vias, scale))
+}
+
 /// Raises the width of every wire narrower than `min_mm` to `min_mm`, and returns the new text and
 /// how many wires were changed. The router is told the minimum first (see `dsn`), so this is the
 /// safety net for the few tracks it narrows anyway.
@@ -180,6 +246,30 @@ mod tests {
         );
         assert_eq!(gnd.layers, vec!["B.Cu".to_owned()]);
         assert_eq!((s.segments, s.vias), (4, 1));
+    }
+
+    #[test]
+    fn tracks_and_vias_are_listed_for_a_comparison() {
+        let (segments, vias, scale) = items(SES).unwrap();
+        assert_eq!(scale, 10_000.0);
+        assert_eq!(segments.len(), 4);
+        assert_eq!(
+            segments[0],
+            SesSegment {
+                net: "/VBUS".into(),
+                layer: "F.Cu".into(),
+                width: 2000,
+                a: (1020000, -920000),
+                b: (1031517, -920000)
+            }
+        );
+        assert_eq!(
+            vias,
+            [SesVia {
+                net: "GND".into(),
+                at: (0, 0)
+            }]
+        );
     }
 
     #[test]

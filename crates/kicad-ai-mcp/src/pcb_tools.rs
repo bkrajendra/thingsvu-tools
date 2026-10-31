@@ -369,9 +369,22 @@ pub struct PcbAutorouteArgs {
     /// Most routing passes (default 20, 1 to 200).
     #[serde(default)]
     pub passes: Option<u32>,
-    /// Stop the router after this many seconds (default 120, 10 to 900).
+    /// Stop the router after this many seconds (default 120, 10 to 900). Its processes are all
+    /// ended when the time is up.
     #[serde(default)]
     pub time_limit_s: Option<u64>,
+    /// Route only these nets; every other net is left as it is (its tracks stay, its pads are
+    /// obstacles). Default: every net.
+    #[serde(default)]
+    pub nets: Vec<String>,
+    /// Do not route these nets (they stay as they are).
+    #[serde(default)]
+    pub exclude_nets: Vec<String>,
+    /// Tracks and vias already on the board stay as they are and the router routes what is left
+    /// (default true). With false the router starts the nets it routes from nothing: their
+    /// unlocked tracks and vias are ripped up and drawn again (locked ones always stay).
+    #[serde(default)]
+    pub keep_existing: Option<bool>,
 }
 
 /// A routed session waiting to be imported.
@@ -1901,7 +1914,7 @@ Apply with pcb_apply_plan; the attributes are read back."
 
     #[tool(
         name = "pcb_autoroute_plan",
-        description = "Plan routing the whole board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nA wire the router draws narrower than the board's minimum track width is widened to it (the plan says how many), \\nand vias that join fewer than two layers are removed after the import. Nothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move. \\nThis is the tool for complex routing: multi-pad nets and anything that must find a way around parts. session_status says whether Freerouting is configured."
+        description = "Plan routing the board with Freerouting, the optional external autorouter \\n(only when configured: install.ps1 -WithFreerouting, or --freerouting <path>; the server never downloads it).\\nThe live board is exported as Specctra DSN (its net classes and rules go with it), routed in a separate \\nheadless process with a pass and time limit (default 20 passes, 120 s; no network calls), and the session \\nis summarized: per net the segments, vias, length, layers, and narrowest track, Freerouting's own unrouted \\nand violation counts, and the unlocked tracks and vias the import will replace (locked ones are kept). \\nA wire the router draws narrower than the board's minimum track width is widened to it (the plan says how many), \\nand vias that join fewer than two layers are removed after the import. Nothing changes. Apply with pcb_apply_plan: KiCad imports the session, and the board is read back and \\nchecked with DRC before and after; no footprint may move. \\nnets routes only those nets and exclude_nets leaves some alone (their tracks stay); keep_existing (default true) keeps every track and via already drawn and routes what is left, false rips up the unlocked ones of the nets it routes first (locked tracks always stay); net classes (pcb_rules_plan) give nets their widths; the time limit ends the router and everything it started. \\nThis is the tool for complex routing: multi-pad nets and anything that must find a way around parts. session_status says whether Freerouting is configured."
     )]
     pub async fn pcb_autoroute_plan(&self, Parameters(args): Parameters<PcbAutorouteArgs>) -> CallToolResult {
         let cid = envelope::correlation_id();
@@ -1953,6 +1966,47 @@ Apply with pcb_apply_plan; the attributes are read back."
                     )
                 })?;
             let min_width = mm(rules.min_track_width.0);
+            // Which nets the router is asked for, and what it may rip up.
+            let mut dsn_text = std::fs::read_to_string(&dsn)
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the exported board: {e}")))?;
+            for n in args.nets.iter().chain(&args.exclude_nets) {
+                if !data.nets.contains(n) {
+                    return Err(bad_arg(format!("net '{n}' is not on the board (use pcb_list_nets)")));
+                }
+            }
+            let in_dsn = kicad_sexpr::dsn::network_nets(&dsn_text);
+            let routed: Vec<String> = in_dsn
+                .iter()
+                .filter(|n| (args.nets.is_empty() || args.nets.contains(n)) && !args.exclude_nets.contains(n))
+                .cloned()
+                .collect();
+            if routed.is_empty() {
+                return Err(bad_arg(
+                    "no net is left to route (a net with one pad has nothing to connect; check nets and exclude_nets)",
+                ));
+            }
+            let left_alone: Vec<String> = in_dsn.iter().filter(|n| !routed.contains(n)).cloned().collect();
+            dsn_text = kicad_sexpr::dsn::without_pins_of(&dsn_text, &left_alone).0;
+            let keep_existing = args.keep_existing.unwrap_or(true);
+            let mut ripped = (0usize, 0usize);
+            if !keep_existing {
+                let per_nm = kicad_sexpr::dsn::units_per_mm(&dsn_text) / 1e6;
+                let locked = |item: &kicad_sexpr::dsn::WiringItem| locked_in_dsn(item, &data, per_nm);
+                let keep = |item: &kicad_sexpr::dsn::WiringItem| !routed.contains(&item.net) || locked(item);
+                for item in kicad_sexpr::dsn::wiring_items(&dsn_text) {
+                    if !keep(&item) {
+                        if item.is_via {
+                            ripped.1 += 1;
+                        } else {
+                            ripped.0 += 1;
+                        }
+                    }
+                }
+                dsn_text = kicad_sexpr::dsn::without_wiring(&dsn_text, keep).0;
+            }
+            std::fs::write(&dsn, &dsn_text)
+                .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot write {}: {e}", dsn.display())))?;
+            let scope = (routed, left_alone, keep_existing, ripped);
             let run = router
                 .route(&dsn, &ses, passes, Duration::from_secs(limit))
                 .await
@@ -1974,10 +2028,12 @@ Apply with pcb_apply_plan; the attributes are read back."
             }
             let summary = kicad_sexpr::ses::summarize(&widened_text).map_err(read_err)?;
             let width_note = (min_width, widened);
-            Ok::<_, ToolError>((data, dir, ses, run, summary, width_note))
+            // What the session does to the tracks and vias that are there.
+            let changes = session_changes(&data, &widened_text)?;
+            Ok::<_, ToolError>((data, dir, ses, run, summary, width_note, scope, changes))
         }
         .await;
-        let (data, dir, ses, run, summary, (min_width, widened)) = match result {
+        let (data, dir, ses, run, summary, (min_width, widened), scope, changes) = match result {
             Ok(r) => r,
             Err(e) => return envelope::error(&cid, &e),
         };
@@ -1996,14 +2052,22 @@ Apply with pcb_apply_plan; the attributes are read back."
         }
         if widened > 0 {
             warnings.push(format!(
-                "{widened} wire(s) came back narrower than the board minimum of {min_width:.2} mm and were widened to it;                  DRC after applying checks their clearance"
+                "{widened} wire(s) came back narrower than the board minimum of {min_width:.2} mm and were widened to it; \
+                 DRC after applying checks their clearance"
             ));
         }
-        let replaced_tracks = data.tracks.iter().filter(|t| !t.locked).count();
-        let replaced_vias = data.vias.len();
+        let (routed_nets, left_alone, keep_existing, ripped) = scope;
+        let (replaced_tracks, replaced_vias) = (changes.tracks_replaced, changes.vias_replaced);
         if replaced_tracks + replaced_vias > 0 {
             warnings.push(format!(
-                "the import replaces {replaced_tracks} unlocked track(s) and {replaced_vias} via(s); lock tracks in KiCad to keep them"
+                "the import replaces {replaced_tracks} unlocked track(s) and {replaced_vias} via(s) with the router's; \
+                 lock the ones to keep in KiCad (pcb_track_edit_plan lock), or name only the nets to route (nets)"
+            ));
+        }
+        if !left_alone.is_empty() {
+            warnings.push(format!(
+                "{} net(s) are left alone: their tracks stay and their pads are obstacles",
+                left_alone.len()
             ));
         }
         let plan_id = self.next_pcb_plan_id();
@@ -2014,7 +2078,17 @@ Apply with pcb_apply_plan; the attributes are read back."
             "router": run,
             "session": summary,
             "minimum_width": { "mm": min_width, "wires_widened": widened },
-            "replaces": { "tracks": replaced_tracks, "vias": replaced_vias, "locked_tracks_kept": data.tracks.len() - replaced_tracks },
+            "routes": {
+                "nets": routed_nets,
+                "left_alone": left_alone,
+                "keep_existing": keep_existing,
+                "ripped_up": { "tracks": ripped.0, "vias": ripped.1 },
+            },
+            "replaces": {
+                "tracks": replaced_tracks, "vias": replaced_vias,
+                "unlocked_tracks_identical": changes.tracks_identical,
+                "locked_tracks_kept": data.tracks.iter().filter(|t| t.locked).count(),
+            },
             "checkpoint": if replaced_tracks + replaced_vias > 0 {
                 Some("the import replaces tracks: apply with checkpoint: \"before the autoroute\" (or call checkpoint_create) to be able to take it back")
             } else { None },
@@ -2556,6 +2630,80 @@ fn footprint_detail_json(d: &kicad_domain::board_detail::FootprintDetail) -> ser
         "texts": d.texts.iter().map(text_detail_json).collect::<Vec<_>>(),
         "other_graphics_by_layer": d.graphics,
     })
+}
+
+/// Is this track or via of the DSN one the board has locked? (Locked tracks are written like the
+/// others, as `protect`.)
+fn locked_in_dsn(item: &kicad_sexpr::dsn::WiringItem, board: &Board, per_nm: f64) -> bool {
+    let unit = |p: Point| {
+        (
+            (p.x.0 as f64 * per_nm).round() as i64,
+            (-(p.y.0 as f64) * per_nm).round() as i64,
+        )
+    };
+    let near = |a: (i64, i64), b: (i64, i64)| (a.0 - b.0).abs() <= 2 && (a.1 - b.1).abs() <= 2;
+    if item.is_via {
+        return board
+            .vias
+            .iter()
+            .any(|v| v.locked && v.net == item.net && item.points.first().is_some_and(|p| near(unit(v.at), *p)));
+    }
+    item.points.windows(2).all(|w| {
+        board.tracks.iter().any(|t| {
+            t.locked
+                && t.net == item.net
+                && t.layer == item.layer
+                && ((near(unit(t.start), w[0]) && near(unit(t.end), w[1]))
+                    || (near(unit(t.start), w[1]) && near(unit(t.end), w[0])))
+        })
+    })
+}
+
+/// What a routed session does to the unlocked tracks and vias that are on the board now: the ones
+/// it writes again exactly as they are, and the ones it replaces with others.
+struct SessionChanges {
+    tracks_identical: usize,
+    tracks_replaced: usize,
+    vias_replaced: usize,
+}
+
+fn session_changes(board: &Board, ses_text: &str) -> Result<SessionChanges, ToolError> {
+    let (segments, vias, scale) = kicad_sexpr::ses::items(ses_text)
+        .map_err(|e| ToolError::new(ErrorCode::KicadError, format!("cannot read the session: {e}")))?;
+    let per_nm = scale / 1e6;
+    let unit = |p: Point| {
+        (
+            (p.x.0 as f64 * per_nm).round() as i64,
+            (-(p.y.0 as f64) * per_nm).round() as i64,
+        )
+    };
+    let near = |a: (i64, i64), b: (i64, i64)| (a.0 - b.0).abs() <= 2 && (a.1 - b.1).abs() <= 2;
+    let mut out = SessionChanges {
+        tracks_identical: 0,
+        tracks_replaced: 0,
+        vias_replaced: 0,
+    };
+    for t in board.tracks.iter().filter(|t| !t.locked) {
+        let (a, b) = (unit(t.start), unit(t.end));
+        let same = segments.iter().any(|s| {
+            s.net == t.net
+                && s.layer == t.layer
+                && (s.width - (t.width.0 as f64 * per_nm).round() as i64).abs() <= 2
+                && ((near(s.a, a) && near(s.b, b)) || (near(s.a, b) && near(s.b, a)))
+        });
+        if same {
+            out.tracks_identical += 1;
+        } else {
+            out.tracks_replaced += 1;
+        }
+    }
+    for v in board.vias.iter().filter(|v| !v.locked) {
+        let at = unit(v.at);
+        if !vias.iter().any(|s| s.net == v.net && near(s.at, at)) {
+            out.vias_replaced += 1;
+        }
+    }
+    Ok(out)
 }
 
 fn track_selector(s: &TrackSelectArg) -> Result<track_edit::Selector, ToolError> {
