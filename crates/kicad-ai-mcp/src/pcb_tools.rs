@@ -180,6 +180,10 @@ pub struct PcbApplyArgs {
     /// such a change is rolled back. (Not used for an update from the schematic.)
     #[serde(default)]
     pub keep_if_unverified: bool,
+    /// Take a checkpoint of the project first, with this label (see checkpoint_create), so the
+    /// change can be taken back with checkpoint_restore. Use it for anything that deletes.
+    #[serde(default)]
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1564,10 +1568,17 @@ Apply with pcb_apply_plan; the attributes are read back."
                 }
             }
             let (plan, notes) = track_edit::plan_track_edit(&data, &select, action, cleanup)?;
+            let deletes = plan
+                .operations
+                .iter()
+                .any(|o| matches!(o, BoardOp::RemoveTrack { .. } | BoardOp::RemoveVia { .. }));
             let extras = serde_json::json!({
                 "per_net": per_net(&plan),
                 "skipped_locked": notes.skipped_locked,
                 "already_as_asked": notes.unchanged,
+                "checkpoint": if deletes {
+                    Some("this deletes copper: apply with checkpoint: \"before the rip-up\" (or call checkpoint_create) to be able to take it back with checkpoint_restore")
+                } else { None },
             });
             Ok::<_, ToolError>((plan, extras, fingerprint(&data)))
         }
@@ -2004,6 +2015,9 @@ Apply with pcb_apply_plan; the attributes are read back."
             "session": summary,
             "minimum_width": { "mm": min_width, "wires_widened": widened },
             "replaces": { "tracks": replaced_tracks, "vias": replaced_vias, "locked_tracks_kept": data.tracks.len() - replaced_tracks },
+            "checkpoint": if replaced_tracks + replaced_vias > 0 {
+                Some("the import replaces tracks: apply with checkpoint: \"before the autoroute\" (or call checkpoint_create) to be able to take it back")
+            } else { None },
             "warnings": warnings,
             "note": "Nothing has changed. Apply with pcb_apply_plan after the user confirms, then pcb_save.",
         });
@@ -2030,9 +2044,37 @@ Apply with pcb_apply_plan; the attributes are read back."
 
     #[tool(
         name = "pcb_apply_plan",
-        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_track_edit_plan, pcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move): \\nthe zones are refilled first, the counts by type are given before and after, and only the violations that are new are listed. A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result."
+        description = "Apply a board plan (pcb_update_from_schematic_plan, pcb_outline_plan, pcb_move_plan, pcb_place_plan, \\npcb_footprint_attrs_plan, pcb_route_plan, pcb_zone_plan, \\npcb_track_edit_plan, pcb_autoroute_plan) \\nafter the user has reviewed it (confirm: true). Refused if the board changed since planning. An update runs \\nthe netlist import, then checks that every footprint of the schematic is there and every pad is on the net \\nthe netlist gives it; an outline, a move, a placement, a route, or a pour is one change (one undo step in the editor) and is read back: \\nthe outline, every footprint's place, turn, side, and lock, every pad's place and net, and DRC before and after (not for a move): \\nthe zones are refilled first, the counts by type are given before and after, and only the violations that are new are listed. A change that fails \\nthese checks is rolled back and the board read again to confirm it is as it was, unless \\nkeep_if_unverified is true. A headless board is not saved (use pcb_save); in the editor the change appears live and can be \\nundone there. Repeating the same idempotency_key returns the earlier result. With checkpoint: a label, the project is kept first (checkpoint_create), so a change that deletes can be taken back."
     )]
     pub async fn pcb_apply_plan(&self, Parameters(args): Parameters<PcbApplyArgs>) -> CallToolResult {
+        let Some(label) = args.checkpoint.clone().filter(|_| args.confirm) else {
+            return self.apply_plan_core(args).await;
+        };
+        // The way back is made first, once the request is known to be a real one.
+        let cid = envelope::correlation_id();
+        let board = match self.board(&args.session_id).await {
+            Ok(b) => b,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        if let Err(e) = self.refuse_if_read_only() {
+            return envelope::error(&cid, &e);
+        }
+        let checkpoint = match self.checkpoint_before_apply(&board, &label).await {
+            Ok(c) => c,
+            Err(e) => return envelope::error(&cid, &e),
+        };
+        let mut result = self.apply_plan_core(args).await;
+        if let Some(serde_json::Value::Object(top)) = result.structured_content.as_mut() {
+            if let Some(serde_json::Value::Object(body)) = top.get_mut("result") {
+                body.insert("checkpoint".into(), checkpoint);
+            }
+            let value = serde_json::Value::Object(top.clone());
+            result.content = vec![rmcp::model::ContentBlock::text(value.to_string())];
+        }
+        result
+    }
+
+    async fn apply_plan_core(&self, args: PcbApplyArgs) -> CallToolResult {
         let cid = envelope::correlation_id();
         if let Err(e) = self.refuse_if_read_only() {
             return envelope::error(&cid, &e);

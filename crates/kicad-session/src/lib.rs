@@ -8,6 +8,7 @@
 mod any;
 pub mod board;
 mod capability_map;
+pub mod checkpoint;
 mod design;
 mod errors;
 mod file;
@@ -22,6 +23,7 @@ mod schematic;
 mod session;
 
 pub use any::AnySession;
+pub use board::rules_from_project;
 pub use board::{BoardSession, BoardSnapshot, BoardStatus, EditReport, ImportReport, RestoreReport};
 pub use capability_map::capabilities_from_probe;
 pub use errors::from_ipc_error;

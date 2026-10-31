@@ -107,6 +107,10 @@ async fn lists_tools_and_returns_envelopes() {
             "bom_export",
             "bom_get",
             "bom_review",
+            "checkpoint_create",
+            "checkpoint_diff",
+            "checkpoint_list",
+            "checkpoint_restore",
             "fp_get",
             "fp_search",
             "pcb_apply_plan",
@@ -3624,6 +3628,251 @@ async fn live_schematic_freshness_reload_and_read_only() {
     assert_eq!(bad["ok"], false, "{bad}");
     std::fs::remove_file(&lock).unwrap();
     mcp.call("session_close", json!({ "session_id": rid })).await;
+}
+
+/// Phase 14.6: a checkpoint keeps the project (including a live board's unsaved changes); a
+/// rip-up applied with `checkpoint` can be taken back; the diff says what changed in parts, nets,
+/// tracks, and rules; a restore refuses over unsaved changes, takes its own checkpoint first, and
+/// reloads the sessions.
+#[tokio::test]
+async fn live_checkpoints_keep_diff_and_restore() {
+    if std::env::var("KICAD_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set KICAD_LIVE=1");
+        return;
+    }
+    let pcb = board_fixture("checkpoint", false);
+    let mut mcp = Mcp::start().await;
+    let key = |n: &str| format!("pcb-checkpoint-{n}-{}", std::process::id());
+    let opened = mcp
+        .call("pcb_open", json!({ "pcb_path": pcb, "provider": "headless" }))
+        .await;
+    let id = opened["result"]["session_id"].clone();
+    let outline = mcp
+        .call(
+            "pcb_outline_plan",
+            json!({ "session_id": id, "width_mm": 36, "height_mm": 28, "origin": { "x_mm": 100, "y_mm": 80 } }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &outline, &key("outline")).await["result"]["verified"],
+        true
+    );
+    let place = mcp
+        .call(
+            "pcb_place_plan",
+            json!({ "session_id": id, "edge": [{ "reference": "J1", "edge": "left" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &place, &key("place")).await["result"]["verified"],
+        true
+    );
+    // Net rules and a few tracks, saved: the project as the user knows it.
+    let rules = mcp
+        .call(
+            "pcb_rules_plan",
+            json!({ "session_id": id, "net_classes": [{ "name": "Power", "track_width_mm": 0.5 }],
+                    "assign": [{ "net": "GND", "class": "Power" }] }),
+        )
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &rules, &key("rules")).await["result"]["verified"],
+        true
+    );
+    let nets = mcp.call("pcb_list_nets", json!({ "session_id": id })).await;
+    let mut routes = Vec::new();
+    for (_, net) in nets["result"]["nets"].as_object().unwrap() {
+        let pads = net["pads"].as_array().unwrap();
+        if pads.len() == 2 {
+            let route = json!({ "points": [{ "pad": pads[0] }, { "pad": pads[1] }] });
+            let one = mcp
+                .call("pcb_route_plan", json!({ "session_id": id, "routes": [route.clone()] }))
+                .await;
+            if one["ok"] == true {
+                routes.push(route);
+            }
+        }
+    }
+    let plan = mcp
+        .call("pcb_route_plan", json!({ "session_id": id, "routes": routes }))
+        .await;
+    assert_eq!(
+        apply_board(&mut mcp, &id, &plan, &key("route")).await["result"]["verified"],
+        true
+    );
+    assert_eq!(mcp.call("pcb_save", json!({ "session_id": id })).await["ok"], true);
+    let tracks_before = mcp.call("pcb_list_tracks", json!({ "session_id": id })).await["result"]["track_count"]
+        .as_u64()
+        .unwrap();
+    assert!(tracks_before > 2);
+
+    // A checkpoint by hand, and the list.
+    let first = mcp
+        .call(
+            "checkpoint_create",
+            json!({ "session_id": id, "label": "routed and saved" }),
+        )
+        .await;
+    assert_eq!(first["ok"], true, "{first}");
+    let first_id = first["result"]["checkpoint"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(first["result"]["checkpoint"]["unsaved_included"], false, "{first}");
+    let files = first["result"]["checkpoint"]["files"].to_string();
+    assert!(files.contains("kicad_pcb") && files.contains("kicad_pro"), "{first}");
+    let none = mcp.call("checkpoint_create", json!({ "label": "no target" })).await;
+    assert_eq!(none["ok"], false, "{none}");
+    let bad_label = mcp
+        .call("checkpoint_create", json!({ "session_id": id, "label": "x\ny" }))
+        .await;
+    assert_eq!(bad_label["ok"], false, "{bad_label}");
+
+    // Identical to the project now.
+    let same = mcp
+        .call("checkpoint_diff", json!({ "session_id": id, "checkpoint": first_id }))
+        .await;
+    assert_eq!(same["result"]["identical"], true, "{same}");
+
+    // A rip-up with a checkpoint taken by the apply.
+    let rip = mcp
+        .call(
+            "pcb_track_edit_plan",
+            json!({ "session_id": id, "action": "delete", "select": { "all": true } }),
+        )
+        .await;
+    assert!(
+        rip["result"]["checkpoint"].as_str().unwrap().contains("checkpoint"),
+        "{rip}"
+    );
+    let applied = mcp
+        .call(
+            "pcb_apply_plan",
+            json!({ "session_id": id, "plan_id": rip["result"]["plan_id"], "confirm": true,
+                    "idempotency_key": key("rip"), "checkpoint": "before the rip-up" }),
+        )
+        .await;
+    assert_eq!(applied["result"]["verified"], true, "{applied}");
+    assert_eq!(applied["result"]["checkpoint"]["unsaved_included"], false, "{applied}");
+    assert_eq!(
+        mcp.call("pcb_list_tracks", json!({ "session_id": id })).await["result"]["track_count"],
+        0
+    );
+
+    // The diff sees the unsaved rip-up (the file on disk still has the tracks); `latest` is the
+    // one the apply took, with the tracks in it.
+    let latest = mcp
+        .call("checkpoint_diff", json!({ "session_id": id, "checkpoint": "latest" }))
+        .await;
+    assert_eq!(latest["result"]["identical"], false, "{latest}");
+    println!("DIFF {}", latest["result"]["differences"]);
+    let diff = mcp
+        .call("checkpoint_diff", json!({ "session_id": id, "checkpoint": first_id }))
+        .await;
+    assert_eq!(diff["result"]["identical"], false, "{diff}");
+    let board_lines = diff["result"]["differences"]["board"].to_string();
+    assert!(board_lines.contains("tracks removed"), "{diff}");
+    assert!(
+        diff["result"]["differences"]["nets"]
+            .to_string()
+            .contains("track(s), was"),
+        "{diff}"
+    );
+
+    // Restore refuses over the unsaved rip-up, and for a ghost id or without confirm.
+    let refused = mcp
+        .call(
+            "checkpoint_restore",
+            json!({ "session_id": id, "checkpoint": first_id, "confirm": true }),
+        )
+        .await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]["message"].as_str().unwrap().contains("unsaved"),
+        "{refused}"
+    );
+    let unconfirmed = mcp
+        .call(
+            "checkpoint_restore",
+            json!({ "session_id": id, "checkpoint": first_id, "confirm": false }),
+        )
+        .await;
+    assert_eq!(unconfirmed["ok"], false, "{unconfirmed}");
+    // Saved, then restored: the tracks are back, the session is reloaded, and the state before
+    // the restore is itself a checkpoint.
+    assert_eq!(mcp.call("pcb_save", json!({ "session_id": id })).await["ok"], true);
+    let ghost = mcp
+        .call(
+            "checkpoint_restore",
+            json!({ "session_id": id, "checkpoint": "nope", "confirm": true }),
+        )
+        .await;
+    assert_eq!(ghost["ok"], false, "{ghost}");
+    let restored = mcp
+        .call(
+            "checkpoint_restore",
+            json!({ "session_id": id, "checkpoint": first_id, "confirm": true }),
+        )
+        .await;
+    assert_eq!(restored["ok"], true, "{restored}");
+    assert!(
+        restored["result"]["files_written"].to_string().contains("kicad_pcb"),
+        "{restored}"
+    );
+    assert_eq!(restored["result"]["sessions_reloaded"], json!([id]), "{restored}");
+    let before_id = restored["result"]["checkpoint_of_the_state_before"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        mcp.call("pcb_list_tracks", json!({ "session_id": id })).await["result"]["track_count"],
+        tracks_before,
+        "the tracks are back in the open session"
+    );
+    let info = mcp.call("pcb_info", json!({ "session_id": id })).await;
+    assert_eq!(info["result"]["status"]["unsaved_changes"], false, "{info}");
+    let rules = mcp.call("pcb_rules", json!({ "session_id": id })).await;
+    assert!(
+        rules["result"]["net_classes"].to_string().contains("Power"),
+        "the rules are the checkpoint's: {rules}"
+    );
+
+    // And the restore can be undone.
+    let listing = mcp.call("checkpoint_list", json!({ "session_id": id })).await;
+    assert_eq!(listing["result"]["count"], 3, "{listing}");
+    let undo = mcp
+        .call(
+            "checkpoint_restore",
+            json!({ "session_id": id, "checkpoint": before_id, "confirm": true }),
+        )
+        .await;
+    assert_eq!(undo["ok"], true, "{undo}");
+    assert_eq!(
+        mcp.call("pcb_list_tracks", json!({ "session_id": id })).await["result"]["track_count"],
+        0,
+        "the rip-up is back"
+    );
+
+    // An editor that has the files open blocks a restore; with a project path and no session.
+    mcp.call("pcb_close", json!({ "session_id": id })).await;
+    let lock = std::path::Path::new(&pcb).with_file_name(format!(
+        "~{}.lck",
+        std::path::Path::new(&pcb).file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&lock, "{}").unwrap();
+    let blocked = mcp
+        .call(
+            "checkpoint_restore",
+            json!({ "project_path": pcb, "checkpoint": first_id, "confirm": true }),
+        )
+        .await;
+    assert_eq!(blocked["error"]["code"], "DOCUMENT_OPEN_ELSEWHERE", "{blocked}");
+    std::fs::remove_file(&lock).unwrap();
+    let by_path = mcp
+        .call(
+            "checkpoint_diff",
+            json!({ "project_path": pcb, "checkpoint": first_id, "against": before_id }),
+        )
+        .await;
+    assert_eq!(by_path["ok"], true, "{by_path}");
+    assert_eq!(by_path["result"]["identical"], false, "{by_path}");
 }
 
 /// Against a real KiCad 11 PCB editor: the board routed by Freerouting, after a plan that shows

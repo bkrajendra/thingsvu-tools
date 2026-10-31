@@ -30,6 +30,7 @@ mod edit;
 mod reload;
 mod rules;
 pub use edit::{BoardSnapshot, EditReport, RestoreReport, SessionImport};
+pub use rules::rules_from_project;
 
 /// What `pcb_update_from_schematic` reports, from a dry run or the real import.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

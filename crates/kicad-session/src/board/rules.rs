@@ -416,47 +416,7 @@ impl BoardSession {
     }
 
     fn read_rules_file(&self) -> Result<RulesState, ToolError> {
-        let pro = self.read_project()?;
-        let mm = |v: &Value| v.as_f64().and_then(|x| Nm::from_mm(x).ok());
-        let mut state = RulesState::default();
-        for c in pro["net_settings"]["classes"].as_array().into_iter().flatten() {
-            let mut values = BTreeMap::new();
-            for (key, field) in CLASS_KEYS {
-                if let Some(v) = mm(&c[*key]).filter(|v| v.0 > 0) {
-                    values.insert(*field, v);
-                }
-            }
-            state.classes.push(ClassState {
-                name: c["name"].as_str().unwrap_or_default().to_owned(),
-                priority: c["priority"].as_i64().map(|p| p as i32),
-                values,
-            });
-        }
-        if let Some(map) = pro["net_settings"]["netclass_assignments"].as_object() {
-            for (net, v) in map {
-                let classes: Vec<String> = match v {
-                    Value::String(s) => vec![s.clone()],
-                    Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-                    _ => vec![],
-                };
-                state.assignments.insert(net.clone(), classes);
-            }
-        }
-        for p in pro["net_settings"]["netclass_patterns"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if let (Some(pattern), Some(class)) = (p["pattern"].as_str(), p["netclass"].as_str()) {
-                state.patterns.push((pattern.to_owned(), class.to_owned()));
-            }
-        }
-        for (key, field) in MIN_KEYS {
-            if let Some(v) = mm(&pro["board"]["design_settings"]["rules"][*key]) {
-                state.minimums.insert(*field, v);
-            }
-        }
-        Ok(state)
+        Ok(rules_from_project(&self.read_project()?))
     }
 
     async fn apply_rules_file(&self, plan: &RulesPlan) -> Result<(), ToolError> {
@@ -617,6 +577,50 @@ impl BoardSession {
     pub fn is_file_session(&self) -> bool {
         self.provider == Provider::File
     }
+}
+
+/// The rules a project file (`.kicad_pro`, read as JSON) holds.
+pub fn rules_from_project(pro: &Value) -> RulesState {
+    let mm = |v: &Value| v.as_f64().and_then(|x| Nm::from_mm(x).ok());
+    let mut state = RulesState::default();
+    for c in pro["net_settings"]["classes"].as_array().into_iter().flatten() {
+        let mut values = BTreeMap::new();
+        for (key, field) in CLASS_KEYS {
+            if let Some(v) = mm(&c[*key]).filter(|v| v.0 > 0) {
+                values.insert(*field, v);
+            }
+        }
+        state.classes.push(ClassState {
+            name: c["name"].as_str().unwrap_or_default().to_owned(),
+            priority: c["priority"].as_i64().map(|p| p as i32),
+            values,
+        });
+    }
+    if let Some(map) = pro["net_settings"]["netclass_assignments"].as_object() {
+        for (net, v) in map {
+            let classes: Vec<String> = match v {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
+                _ => vec![],
+            };
+            state.assignments.insert(net.clone(), classes);
+        }
+    }
+    for p in pro["net_settings"]["netclass_patterns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(pattern), Some(class)) = (p["pattern"].as_str(), p["netclass"].as_str()) {
+            state.patterns.push((pattern.to_owned(), class.to_owned()));
+        }
+    }
+    for (key, field) in MIN_KEYS {
+        if let Some(v) = mm(&pro["board"]["design_settings"]["rules"][*key]) {
+            state.minimums.insert(*field, v);
+        }
+    }
+    state
 }
 
 const CLASS_KEYS: &[(&str, ClassField)] = &[

@@ -147,6 +147,71 @@ pub fn describe_design_changes(from: &SchematicDesign, to: &SchematicDesign) -> 
     lines
 }
 
+/// The same for design rules: classes, assignments, patterns, and minimums.
+pub fn describe_rules_changes(from: &crate::rules::RulesState, to: &crate::rules::RulesState) -> Vec<String> {
+    use crate::rules::{field_name, min_name};
+    let mm = |v: crate::geometry::Nm| format!("{} mm", (v.to_mm() * 1000.0).round() / 1000.0);
+    let mut lines = Vec::new();
+    for c in &to.classes {
+        match from.class(&c.name) {
+            None => lines.push(format!("net class '{}' added", c.name)),
+            Some(old) => {
+                for (f, v) in &c.values {
+                    match old.values.get(f) {
+                        Some(o) if o == v => {}
+                        Some(o) => lines.push(format!(
+                            "class '{}' {} {} -> {}",
+                            c.name,
+                            field_name(*f),
+                            mm(*o),
+                            mm(*v)
+                        )),
+                        None => lines.push(format!("class '{}' {} set to {}", c.name, field_name(*f), mm(*v))),
+                    }
+                }
+                for f in old.values.keys().filter(|f| !c.values.contains_key(*f)) {
+                    lines.push(format!("class '{}' {} cleared", c.name, field_name(*f)));
+                }
+            }
+        }
+    }
+    for c in from.classes.iter().filter(|c| to.class(&c.name).is_none()) {
+        lines.push(format!("net class '{}' removed", c.name));
+    }
+    for (net, class) in &to.assignments {
+        match from.assignments.get(net) {
+            Some(o) if o == class => {}
+            Some(o) => lines.push(format!("net {net} moved from {} to {}", o.join(", "), class.join(", "))),
+            None => lines.push(format!("net {net} assigned to {}", class.join(", "))),
+        }
+    }
+    for net in from.assignments.keys().filter(|n| !to.assignments.contains_key(*n)) {
+        lines.push(format!("net {net} no longer assigned"));
+    }
+    for (p, k) in &to.patterns {
+        match from.patterns.iter().find(|(q, _)| q == p) {
+            Some((_, o)) if o == k => {}
+            Some((_, o)) => lines.push(format!("pattern {p} moved from {o} to {k}")),
+            None => lines.push(format!("pattern {p} added for {k}")),
+        }
+    }
+    for (p, _) in from
+        .patterns
+        .iter()
+        .filter(|(p, _)| !to.patterns.iter().any(|(q, _)| q == p))
+    {
+        lines.push(format!("pattern {p} removed"));
+    }
+    for (f, v) in &to.minimums {
+        match from.minimums.get(f) {
+            Some(o) if o == v => {}
+            Some(o) => lines.push(format!("minimum {} {} -> {}", min_name(*f), mm(*o), mm(*v))),
+            None => lines.push(format!("minimum {} set to {}", min_name(*f), mm(*v))),
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +236,53 @@ mod tests {
             courtyard: None,
             courtyard_local: None,
         }
+    }
+
+    #[test]
+    fn rules_that_differ_are_described() {
+        use crate::rules::{apply_op, ClassField, ClassState, MinField, RuleOp, RulesState};
+        let mut from = RulesState::default();
+        from.classes.push(ClassState {
+            name: "Default".into(),
+            priority: Some(i32::MAX),
+            values: Default::default(),
+        });
+        let mut to = from.clone();
+        let nm = |v: f64| Nm::from_mm(v).unwrap();
+        for op in [
+            RuleOp::ClassSet {
+                name: "Default".into(),
+                field: ClassField::TrackWidth,
+                value: nm(0.25),
+            },
+            RuleOp::ClassAdd {
+                name: "Power".into(),
+                priority: 0,
+            },
+            RuleOp::Assign {
+                net: "GND".into(),
+                class: "Power".into(),
+            },
+            RuleOp::MinSet {
+                field: MinField::TrackWidth,
+                value: nm(0.15),
+            },
+        ] {
+            apply_op(&mut to, &op);
+        }
+        let lines = describe_rules_changes(&from, &to);
+        assert_eq!(
+            lines,
+            [
+                "class 'Default' track width set to 0.25 mm",
+                "net class 'Power' added",
+                "net GND assigned to Power",
+                "minimum track width set to 0.15 mm"
+            ]
+        );
+        assert!(describe_rules_changes(&to, &to).is_empty());
+        let back = describe_rules_changes(&to, &from);
+        assert!(back.iter().any(|l| l.contains("'Power' removed")), "{back:?}");
     }
 
     #[test]
